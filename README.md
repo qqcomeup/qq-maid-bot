@@ -108,7 +108,7 @@ make run-llm
 make run
 ```
 
-`make run` 当前等价于 `make run-gateway`。完整配置、部署、目录和开发说明请查看 [README-dev.md](./README-dev.md)。
+`make run` 当前等价于 `make run-gateway`。LLM 服务说明见 [qq-maid-llm/README.md](./qq-maid-llm/README.md)，完整配置、部署、目录和开发说明请从 [README-dev.md](./README-dev.md) 进入。
 
 ## 常用指令示例
 
@@ -144,7 +144,7 @@ make run
 - 私有配置和运行数据应放在仓库外，或放在被 `.gitignore` 忽略的目录中。
 - 诊断和日志默认应保持脱敏；临时开启 verbose 日志后，排障结束应关闭。
 
-更多配置和运行目录说明见 [README-dev.md](./README-dev.md) 与 [runtime/README.md](./runtime/README.md)。
+更多配置和运行目录说明见 [runtime/README.md](./runtime/README.md)。
 
 ## Roadmap
 
@@ -156,7 +156,8 @@ make run
 
 ## 文档导航
 
-- 开发与部署文档：[README-dev.md](./README-dev.md)
+- 开发维护文档：[README-dev.md](./README-dev.md)
+- LLM 服务文档：[qq-maid-llm/README.md](./qq-maid-llm/README.md)
 - Gateway 文档：[qq-maid-gateway-rs/README.md](./qq-maid-gateway-rs/README.md)
 - 运行目录说明：[runtime/README.md](./runtime/README.md)
 - 配置模板：[runtime/.env.example](./runtime/.env.example)

@@ -28,6 +28,13 @@ qq-maid-llm RSS scheduler
 - 本机内部 `/internal/push` 供 LLM RSS 调度主动推送，默认只监听 `127.0.0.1`，可通过共享 token 限制调用方。
 - 不做频道、频道私信、Ark、Embed、Keyboard、多租户或旧接入层兼容。
 
+## 开发边界
+
+- QQ 平台字段解析、intent、白名单、消息去重和发送分支优先放在本目录维护。
+- 普通聊天、查询、天气、翻译、session、todo、memory、RSS 指令和 prompt 组装放在 `qq-maid-llm/`。
+- gateway 调用 LLM 时只走 `QQ_MAID_RESPOND_URL` 指向的 `/v1/respond`，不要重新引入旧 `/query`、HTTP `/memory` 或 `/v1/chat` 调用路径。
+- `/internal/push` 是给 LLM RSS 调度使用的本机内部出口，生产环境应保持本机监听，并按需配置 `QQ_MAID_PUSH_TOKEN` / `RSS_PUSH_TOKEN` 共享 token。
+
 ## 配置
 
 从仓库根目录复制模板并填入真实配置：
@@ -111,6 +118,8 @@ make run
 ```
 
 `make run` 当前等价于 `make run-gateway`。
+
+部署后的控制脚本、真实 `.env` 位置、日志目录和运行产物说明见 [runtime/README.md](../runtime/README.md)。
 
 ## 检查
 

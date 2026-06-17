@@ -14,20 +14,74 @@ runtime/
 ├── llmctl.sh                        # 部署后的 LLM 控制脚本，不提交
 ├── gatewayctl.sh                    # 部署后的 gateway 控制脚本，不提交
 ├── README.md                        # 本文件
-└── config/
-    ├── .env                         # 推荐真实环境变量文件，不提交
-    ├── world.example.md             # 可提交的 WORLD_FILE 模板
-    ├── world.md                     # 可选世界观文件，路径由 WORLD_FILE 指定，不提交
-    ├── member_id_mapping.example.json
-    ├── member_id_mapping.json       # 本地私有成员编号映射，不提交
-    └── prompts/
-        ├── *.example.md             # 可提交的通用模板
-        ├── maid_system.md           # 本地私有系统提示词，不提交
-        ├── mode_rules.md            # 本地私有模式规则，不提交
-        └── session_context.md       # 本地私有会话上下文规则，不提交
+├── config/
+│   ├── .env                         # 推荐真实环境变量文件，不提交
+│   ├── world.example.md             # 可提交的 WORLD_FILE 模板
+│   ├── world.md                     # 可选世界观文件，路径由 WORLD_FILE 指定，不提交
+│   ├── member_id_mapping.example.json
+│   ├── member_id_mapping.json       # 本地私有成员编号映射，不提交
+│   └── prompts/
+│       ├── *.example.md             # 可提交的通用模板
+│       ├── maid_system.md           # 本地私有系统提示词，不提交
+│       ├── mode_rules.md            # 本地私有模式规则，不提交
+│       └── session_context.md       # 本地私有会话上下文规则，不提交
+├── data/
+│   └── storage/
+│       └── app.db                   # 默认 SQLite 数据库，不提交
+├── logs/                            # 控制脚本日志目录，不提交
+└── run/                             # pid 等运行状态，不提交
 ```
 
-## 各文件说明
+## 快速配置
+
+从仓库根目录复制模板：
+
+```bash
+cp runtime/.env.example runtime/config/.env
+```
+
+编辑 `runtime/config/.env`，填写 QQ 官方机器人、模型 provider、天气和 RSS 等必要配置。公开仓库只包含源码和 `.example` 模板；真实 `.env`、prompt、世界观、成员映射、SQLite、日志、pid 和聊天记录都不要提交。
+
+未显式配置 `PROMPT_DIR` 时，LLM 会使用默认 `config/prompts`。默认目录缺少真实 prompt 文件时，当前实现会回退到内置通用 prompt；显式配置 `PROMPT_DIR` 后，缺文件或空文件会作为配置错误处理。
+
+## 配置加载顺序
+
+`scripts/llmctl.sh` 和 `scripts/gatewayctl.sh` 部署后会复制为运行目录下的 `llmctl.sh` 与 `gatewayctl.sh`。控制脚本只 source 第一个存在的配置文件：
+
+1. 显式 `LLM_ENV_FILE` / `GATEWAY_ENV_FILE`
+2. `runtime/config/.env`
+3. `runtime/.env`
+
+Rust 进程自身会按当前工作目录尝试加载 `config/.env` 再加载 `.env`。`make run-llm`、`make run-gateway` 和部署控制脚本都会以 `runtime/` 作为工作目录启动，因此默认相对路径都按 `runtime/` 解析。
+
+`dotenvy` 默认不覆盖已存在的环境变量：进程环境变量优先，先加载的 dotenv 文件会保留同名变量，后续文件只补充缺失项。
+
+常用外部路径变量：
+
+- `PROMPT_DIR`：包含 `maid_system.md`、`mode_rules.md`、`session_context.md` 的目录。
+- `WORLD_FILE`：可选世界观文件；留空表示不注入世界观，配置后文件必须存在、可读且非空。
+- `MEMBER_ID_MAPPING_FILE`：成员编号映射 JSON。文件不存在时按空映射处理；JSON 语法错误会启动失败。
+- `APP_DB_FILE`：通用 SQLite 文件路径，承载 Session、待办、长期记忆、RSS / Atom 订阅及 RSS 去重状态。
+
+推荐把公开源码、私有配置和运行数据分开，例如：
+
+```text
+/opt/qqbot/
+├── app/       # 公开源码仓库
+├── private/   # 私有配置仓库或本机私有目录，不公开
+└── data/      # SQLite、日志、pid 等运行产物，不进任何 Git 仓库
+```
+
+对应配置示例：
+
+```env
+PROMPT_DIR=/opt/qqbot/private/config/prompts
+MEMBER_ID_MAPPING_FILE=/opt/qqbot/private/config/member_id_mapping.json
+WORLD_FILE=/opt/qqbot/private/config/world.md
+APP_DB_FILE=/opt/qqbot/data/app.db
+```
+
+## 文件说明
 
 ### `config/.env` / `.env`
 
@@ -46,6 +100,8 @@ cp runtime/.env.example runtime/config/.env
 - `WORLD_FILE`：可选世界观文件；留空表示按通用助手运行。
 - `MEMBER_ID_MAPPING_FILE`：成员编号映射 JSON 文件。
 - `APP_DB_FILE`：运行数据库文件，应放在不进 Git 的数据目录。
+
+完整字段以 [`.env.example`](./.env.example) 为准。
 
 ### `config/member_id_mapping.json`
 
@@ -87,6 +143,101 @@ cp runtime/.env.example runtime/config/.env
 - 如何判断当前说话者
 - 短句（"对啊""继续""给 codex"）优先理解为补充而非新话题
 - slash 指令已由程序处理，不要假装执行
+
+## 运行数据
+
+默认运行产物：
+
+```text
+runtime/
+├── data/
+│   └── storage/
+│       └── app.db
+├── logs/
+├── run/
+├── qq-maid-llm
+└── qq-maid-gateway-rs
+```
+
+Session、待办、长期记忆、RSS / Atom 订阅和 RSS 去重状态均保存在 `APP_DB_FILE` 指向的通用 SQLite 文件中。旧版 Session JSON 目录和旧版 Memory JSONL 文件不再读取，也不会自动迁移；本地如残留旧目录或旧文件，只作为历史运行产物处理。
+
+长期记忆只能通过明确记忆指令生成草稿，并由用户确认后写入。普通聊天不要自动写长期记忆。RSS 通过 `/rss` 或 `/订阅` 管理，首次添加订阅只建立当前条目基线，不主动推送历史文章；后续轮询由 `qq-maid-llm` 调用 gateway 的本机内部 push 入口发送到对应私聊或群聊目标。
+
+配置、prompt、世界观、成员映射、日志、pid、release 二进制和 gateway WebSocket 临时状态不属于 `APP_DB_FILE` 承载范围。
+
+## 构建和部署
+
+从仓库根目录构建 release 二进制：
+
+```bash
+make build
+```
+
+本地构建产物位于：
+
+```text
+target/release/qq-maid-llm
+target/release/qq-maid-gateway-rs
+```
+
+发布到脚本配置的远端服务器：
+
+```bash
+./scripts/deploy.sh
+```
+
+脚本会构建 release 二进制、上传到远端 `runtime/` 目录，并重启远端服务。远端运行目录结构：
+
+```text
+runtime/
+├── qq-maid-llm
+├── qq-maid-gateway-rs
+├── llmctl.sh
+├── gatewayctl.sh
+├── diagnose-network.sh
+└── config/
+```
+
+服务器上可把真实 `.env` 放到 `runtime/.env` 或 `runtime/config/.env`，并在其中把 `PROMPT_DIR`、`MEMBER_ID_MAPPING_FILE`、`WORLD_FILE`、`APP_DB_FILE` 指向外部私有配置或运行数据目录，再执行：
+
+```bash
+cd runtime
+./llmctl.sh start
+./gatewayctl.sh start
+```
+
+如果服务器上仍保留旧 `llm/` 运行目录，首次切换前需要先按旧路径停掉旧进程或迁移 pid / log / `.env` 等运行文件，避免新旧目录同时拉起服务。
+
+## 控制脚本和诊断
+
+常用控制命令：
+
+```bash
+./llmctl.sh start
+./llmctl.sh stop
+./llmctl.sh status
+./llmctl.sh health
+./llmctl.sh logs
+
+./gatewayctl.sh start
+./gatewayctl.sh stop
+./gatewayctl.sh status
+./gatewayctl.sh logs
+```
+
+诊断脚本可从仓库根目录执行：
+
+```bash
+make diagnose
+```
+
+也可在部署后的运行目录执行：
+
+```bash
+./diagnose-network.sh
+```
+
+诊断输出只应展示 secret 是否存在、脱敏后的 ID / URL、代理和公网出口检查结果，不应打印完整 token、AppSecret、API Key、openid、群 ID 或聊天内容。
 
 ## 联动关系
 
