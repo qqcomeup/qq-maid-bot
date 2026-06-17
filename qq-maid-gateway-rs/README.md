@@ -129,7 +129,7 @@ make run
 make test-gateway
 ```
 
-等价于：
+该命令会先检查 `qq-maid-common/`，再检查 gateway。gateway 自身检查等价于：
 
 ```bash
 cargo fmt -p qq-maid-gateway-rs -- --check

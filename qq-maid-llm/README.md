@@ -34,10 +34,10 @@ qq-maid-llm/src/
 │   ├── todo.rs          # Todo 领域逻辑
 │   └── weather/         # 天气执行器
 ├── storage/             # SQLite、migration、session/memory/todo/rss 持久化
-└── util/                # 时间上下文、SSE、指标等通用工具
+└── util/                # SSE、指标，以及 time_context 兼容 re-export
 ```
 
-`runtime/respond.rs` 是 `/v1/respond` facade 后的统一业务入口；具体 flow 在 `runtime/respond/` 下维护。通用日期边界解析优先复用 `util/time_context.rs`，不要在具体命令里重复实现。
+`runtime/respond.rs` 是 `/v1/respond` facade 后的统一业务入口；具体 flow 在 `runtime/respond/` 下维护。通用日期、时间和时区语义优先复用 `qq-maid-common/src/time_context.rs`；LLM 内部可继续通过 `util/time_context.rs` 兼容入口引用，不要在具体命令里重复实现。
 
 ## HTTP 接口
 
@@ -123,6 +123,8 @@ make build-llm
 ```bash
 make test-llm
 ```
+
+`make test-llm` 会同时检查 `qq-maid-common/`，因为 LLM 的时间上下文等工具通过 common 复用。
 
 跨 LLM / gateway、提交前或涉及 workspace 依赖时执行：
 

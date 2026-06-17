@@ -16,7 +16,7 @@ use crate::{
         types::{ChatMessage, ChatRequest, ChatRole},
     },
     runtime::session::redact_sensitive_text,
-    util::time_context::request_time_context,
+    util::time_context::{RequestTimeContext, request_time_context},
 };
 
 use super::{
@@ -287,9 +287,20 @@ pub fn with_request_time_context(messages: Vec<ChatMessage>) -> Vec<ChatMessage>
     }
 
     let mut enriched = Vec::with_capacity(messages.len() + 1);
-    enriched.push(ChatMessage::system(request_time_context().llm_prompt()));
+    enriched.push(ChatMessage::system(llm_time_context_prompt(
+        &request_time_context(),
+    )));
     enriched.extend(messages);
     enriched
+}
+
+fn llm_time_context_prompt(ctx: &RequestTimeContext) -> String {
+    format!(
+        "请求时间上下文：\n当前本地日期：{}\n当前本地时间：{}\n当前时区：{}\n\n要求：\n- 不要自行猜测当前日期。\n- 必须按程序传入的 current_date 和 timezone 理解相对时间。",
+        ctx.current_date(),
+        ctx.current_time(),
+        ctx.timezone()
+    )
 }
 
 /// 判断消息列表中是否已包含时间上下文系统消息。
@@ -648,6 +659,7 @@ pub fn response_from_output(output: RespondOutput) -> RespondResponse {
 mod tests {
     use super::*;
     use crate::{provider::types::TokenUsage, util::metrics::LlmMetrics};
+    use chrono::TimeZone;
 
     #[test]
     fn strip_markdown_removes_chat_decoration() {
@@ -721,6 +733,21 @@ mod tests {
         assert!(messages[0].content.contains("当前时区：Asia/Shanghai"));
         assert!(messages[0].content.contains("不要自行猜测当前日期"));
         assert_eq!(messages[1].content, "角色设定");
+    }
+
+    #[test]
+    fn llm_time_context_prompt_is_built_in_llm_layer() {
+        let offset = crate::util::time_context::shanghai_offset();
+        let ctx = RequestTimeContext::from_datetime(
+            offset.with_ymd_and_hms(2026, 6, 9, 18, 40, 0).unwrap(),
+        );
+
+        let prompt = llm_time_context_prompt(&ctx);
+
+        assert!(prompt.contains("当前本地日期：2026-06-09"));
+        assert!(prompt.contains("当前本地时间：2026-06-09 18:40:00"));
+        assert!(prompt.contains("当前时区：Asia/Shanghai"));
+        assert!(prompt.contains("不要自行猜测当前日期"));
     }
 
     #[test]

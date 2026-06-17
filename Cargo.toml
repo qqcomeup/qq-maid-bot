@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "qq-maid-common",
     "qq-maid-gateway-rs",
     "qq-maid-llm",
 ]

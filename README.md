@@ -44,6 +44,7 @@
 
 - `qq-maid-gateway-rs/` 专注 QQ 事件接收、消息转换、回复发送、`/ping` 诊断和本机主动推送入口。
 - `qq-maid-llm/` 负责 `/v1/respond`、普通聊天、查询、天气、翻译、会话、长期记忆、Todo、RSS 和模型 provider 调用。
+- `qq-maid-common/` 只放两个服务共享的基础工具，例如时间、日期和时区处理，不承载业务 flow。
 
 Gateway 与 LLM 服务职责分层清晰，后续扩展 QQ 接入层或业务能力时更容易定位边界。
 

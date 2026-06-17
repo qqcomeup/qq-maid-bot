@@ -1,0 +1,11 @@
+[package]
+name = "qq-maid-common"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# 日期时间处理，统一提供北京时间展示和相对日期解析。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 中文自然语言日期表达解析。
+regex = "1"

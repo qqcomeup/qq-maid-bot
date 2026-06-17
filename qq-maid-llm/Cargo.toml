@@ -26,6 +26,8 @@ html2text = "0.17.1"
 regex = "1"
 # HTTP 客户端（使用 rustls 而非 openssl）
 reqwest = { version = "0.13", default-features = false, features = ["gzip", "json", "rustls"] }
+# gateway 与 LLM 共享的无业务状态基础工具。
+qq-maid-common = { path = "../qq-maid-common" }
 # LLM 调用框架（Rig）
 # 0.38.2 修复了 OpenAI Responses 流式返回中新字段/可选字段的兼容问题，
 # 避免合法 SSE 事件在本地被误判为反序列化失败后退化到空回复或额外 fallback。

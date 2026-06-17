@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -10,6 +10,9 @@ use super::{
 use crate::{
     auth::{AccessTokenManager, AccessTokenSnapshot, AccessTokenSnapshotState},
     config::AppConfig,
+};
+use qq_maid_common::time_context::{
+    format_diagnostic_time_for_display, now_diagnostic_time_for_display, now_unix_seconds_marker,
 };
 
 const LLM_HEALTHZ_TIMEOUT: Duration = Duration::from_millis(800);
@@ -56,7 +59,7 @@ struct LlmHealthSnapshot {
 
 impl GatewayRuntimeStatus {
     pub fn new() -> Self {
-        let started_at = current_unix_seconds_text();
+        let started_at = now_unix_seconds_marker();
         Self {
             pid: std::process::id(),
             instance_id: format!("gateway-{}-{started_at}", std::process::id()),
@@ -82,30 +85,30 @@ impl GatewayRuntimeStatus {
 
     pub fn record_gateway_connected(&self) {
         self.update_state(|state| {
-            state.last_gateway_connected_at = Some(current_unix_seconds_text())
+            state.last_gateway_connected_at = Some(now_unix_seconds_marker())
         });
     }
 
     pub fn record_ready(&self) {
-        self.update_state(|state| state.last_ready_at = Some(current_unix_seconds_text()));
+        self.update_state(|state| state.last_ready_at = Some(now_unix_seconds_marker()));
     }
 
     pub fn record_resumed(&self) {
-        self.update_state(|state| state.last_resumed_at = Some(current_unix_seconds_text()));
+        self.update_state(|state| state.last_resumed_at = Some(now_unix_seconds_marker()));
     }
 
     pub fn record_heartbeat_ack(&self) {
-        self.update_state(|state| state.last_heartbeat_ack_at = Some(current_unix_seconds_text()));
+        self.update_state(|state| state.last_heartbeat_ack_at = Some(now_unix_seconds_marker()));
     }
 
     pub fn record_reconnect(&self) {
-        self.update_state(|state| state.last_reconnect_at = Some(current_unix_seconds_text()));
+        self.update_state(|state| state.last_reconnect_at = Some(now_unix_seconds_marker()));
     }
 
     pub fn record_invalid_session(&self, can_resume: bool) {
         self.update_state(|state| {
             state.last_invalid_session = Some(InvalidSessionSnapshot {
-                at: current_unix_seconds_text(),
+                at: now_unix_seconds_marker(),
                 can_resume,
             });
         });
@@ -113,33 +116,29 @@ impl GatewayRuntimeStatus {
 
     pub fn record_c2c_message_received(&self, message: &C2cMessage) {
         self.update_state(|state| {
-            state.last_c2c_received_at = Some(current_unix_seconds_text());
+            state.last_c2c_received_at = Some(now_unix_seconds_marker());
             state.last_c2c_message_id = Some(mask_identifier(&message.message_id));
         });
     }
 
     pub fn record_qq_send_success(&self) {
-        self.update_state(|state| {
-            state.last_qq_send_success_at = Some(current_unix_seconds_text())
-        });
+        self.update_state(|state| state.last_qq_send_success_at = Some(now_unix_seconds_marker()));
     }
 
     pub fn record_qq_send_failure(&self, summary: impl Into<String>) {
         self.update_state(|state| {
-            state.last_qq_send_failure_at = Some(current_unix_seconds_text());
+            state.last_qq_send_failure_at = Some(now_unix_seconds_marker());
             state.last_qq_send_failure_summary = Some(compact_summary(summary.into()));
         });
     }
 
     pub fn record_respond_success(&self) {
-        self.update_state(|state| {
-            state.last_respond_success_at = Some(current_unix_seconds_text())
-        });
+        self.update_state(|state| state.last_respond_success_at = Some(now_unix_seconds_marker()));
     }
 
     pub fn record_respond_failure(&self, summary: impl Into<String>) {
         self.update_state(|state| {
-            state.last_respond_failure_at = Some(current_unix_seconds_text());
+            state.last_respond_failure_at = Some(now_unix_seconds_marker());
             state.last_respond_failure_summary = Some(compact_summary(summary.into()));
         });
     }
@@ -189,7 +188,13 @@ fn render_c2c_ping_reply(
     let invalid_session = snapshot
         .last_invalid_session
         .as_ref()
-        .map(|item| format!("{} can_resume={}", item.at, bool_text(item.can_resume)))
+        .map(|item| {
+            format!(
+                "{} can_resume={}",
+                format_diagnostic_time_for_display(&item.at),
+                bool_text(item.can_resume)
+            )
+        })
         .unwrap_or_else(|| "无".to_owned());
     let state_error = snapshot.state_error.as_deref().unwrap_or("无");
 
@@ -199,32 +204,35 @@ fn render_c2c_ping_reply(
         "概览".to_owned(),
         "- Gateway：OK".to_owned(),
         format!("- LLM healthz：{}", llm_health.status),
-        format!("- 当前时间：{}", current_unix_seconds_text()),
+        format!("- 当前时间：{}", now_diagnostic_time_for_display()),
         format!("- pid：{}", runtime.pid),
         format!("- 运行时长：{}", runtime.uptime_text()),
         String::new(),
         "Gateway".to_owned(),
         format!("- instance：{}", runtime.instance_id),
-        format!("- started_at：{}", runtime.started_at),
+        format!(
+            "- started_at：{}",
+            format_diagnostic_time_for_display(&runtime.started_at)
+        ),
         format!(
             "- websocket connected：{}",
-            option_text(snapshot.last_gateway_connected_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_gateway_connected_at.as_deref())
         ),
         format!(
             "- READY：{}",
-            option_text(snapshot.last_ready_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_ready_at.as_deref())
         ),
         format!(
             "- RESUMED：{}",
-            option_text(snapshot.last_resumed_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_resumed_at.as_deref())
         ),
         format!(
             "- heartbeat ack：{}",
-            option_text(snapshot.last_heartbeat_ack_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_heartbeat_ack_at.as_deref())
         ),
         format!(
             "- reconnect：{}",
-            option_text(snapshot.last_reconnect_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_reconnect_at.as_deref())
         ),
         format!("- invalid session：{invalid_session}"),
         format!("- 状态读取错误：{state_error}"),
@@ -238,11 +246,11 @@ fn render_c2c_ping_reply(
         format!("- 当前 scope_key：{}", mask_scope_key(&current_scope)),
         format!(
             "- 当前消息时间：{}",
-            option_text(message.timestamp.as_deref())
+            diagnostic_time_option_text(message.timestamp.as_deref())
         ),
         format!(
             "- 最近收到：{}",
-            option_text(snapshot.last_c2c_received_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_c2c_received_at.as_deref())
         ),
         format!(
             "- 最近消息 id：{}",
@@ -253,11 +261,11 @@ fn render_c2c_ping_reply(
         "发送".to_owned(),
         format!(
             "- 最近 QQ 发送成功：{}",
-            option_text(snapshot.last_qq_send_success_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_qq_send_success_at.as_deref())
         ),
         format!(
             "- 最近 QQ 发送失败：{}",
-            option_text(snapshot.last_qq_send_failure_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_qq_send_failure_at.as_deref())
         ),
         format!(
             "- 失败摘要：{}",
@@ -270,11 +278,11 @@ fn render_c2c_ping_reply(
         format!("- healthz：{}", llm_health.status),
         format!(
             "- 最近 respond 成功：{}",
-            option_text(snapshot.last_respond_success_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_respond_success_at.as_deref())
         ),
         format!(
             "- 最近 respond 失败：{}",
-            option_text(snapshot.last_respond_failure_at.as_deref())
+            diagnostic_time_option_text(snapshot.last_respond_failure_at.as_deref())
         ),
         format!(
             "- 失败摘要：{}",
@@ -390,6 +398,13 @@ fn option_text(value: Option<&str>) -> &str {
     value.filter(|text| !text.trim().is_empty()).unwrap_or("无")
 }
 
+fn diagnostic_time_option_text(value: Option<&str>) -> String {
+    value
+        .filter(|text| !text.trim().is_empty())
+        .map(format_diagnostic_time_for_display)
+        .unwrap_or_else(|| "无".to_owned())
+}
+
 fn bool_text(value: bool) -> &'static str {
     if value { "enabled" } else { "disabled" }
 }
@@ -401,14 +416,6 @@ fn compact_summary(summary: String) -> String {
         compact.push_str("...");
     }
     compact
-}
-
-fn current_unix_seconds_text() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    format!("unix:{seconds}")
 }
 
 #[cfg(test)]
@@ -554,6 +561,14 @@ mod tests {
         assert!(reply.contains("LLM"));
         assert!(reply.contains("配置"));
         assert!(reply.contains("LLM healthz：ok(status=200)"));
+        assert!(reply.contains("当前时间："));
+        assert!(reply.contains("+08:00 (unix:"));
+        assert!(reply.contains("started_at：1970-01-01 08:00:01 +08:00 (unix:1)"));
+        assert!(reply.contains("当前消息时间：2026-06-10 12:00:00 +08:00"));
+        assert!(!reply.contains("当前消息时间：2026-06-10T12:00:00+08:00"));
+        assert!(!reply.contains("最近收到：unix:"));
+        assert!(!reply.contains("最近 respond 失败：unix:"));
+        assert!(!reply.contains("最近 QQ 发送失败：unix:"));
         assert!(reply.contains("respond query：debug=1&token=***&timeout=800"));
         assert!(reply.contains("当前用户：******123456"));
         assert!(reply.contains("当前 scope_key：private:******123456"));

@@ -1497,6 +1497,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qq-maid-common"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "regex",
+]
+
+[[package]]
 name = "qq-maid-gateway-rs"
 version = "0.1.0"
 dependencies = [
@@ -1504,6 +1512,7 @@ dependencies = [
  "axum",
  "dotenvy",
  "futures-util",
+ "qq-maid-common",
  "reqwest",
  "serde",
  "serde_json",
@@ -1528,6 +1537,7 @@ dependencies = [
  "futures",
  "html2text",
  "http-body-util",
+ "qq-maid-common",
  "regex",
  "reqwest",
  "rig-core",

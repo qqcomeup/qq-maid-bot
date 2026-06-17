@@ -1,11 +1,12 @@
 LLM_DIR := qq-maid-llm
 GATEWAY_DIR := qq-maid-gateway-rs
+COMMON_DIR := qq-maid-common
 
 # status 只统计 Git 已跟踪的 Rust 源码。
 # 不统计 target/、脚本、配置、README、Makefile。
-STATUS_RUST_PATHS := ':(glob)$(LLM_DIR)/**/*.rs' ':(glob)$(GATEWAY_DIR)/**/*.rs'
+STATUS_RUST_PATHS := ':(glob)$(COMMON_DIR)/**/*.rs' ':(glob)$(LLM_DIR)/**/*.rs' ':(glob)$(GATEWAY_DIR)/**/*.rs'
 
-.PHONY: help status build build-llm build-gateway deploy run run-llm run-gateway test test-llm test-gateway rust-fmt rust-test gateway-fmt gateway-test gateway-check clean doctor diagnose
+.PHONY: help status build build-llm build-gateway deploy run run-llm run-gateway test test-common test-llm test-gateway common-fmt common-test common-check rust-fmt rust-test rust-check gateway-fmt gateway-test gateway-check clean doctor diagnose
 
 help:
 	@echo "make status        查看项目状态和 Rust 源码行数"
@@ -17,8 +18,9 @@ help:
 	@echo "make run-llm       启动 Rust LLM 服务"
 	@echo "make run-gateway   启动 Rust QQ C2C gateway"
 	@echo "make test          运行根目录 Cargo workspace 的 fmt、test 和 check"
-	@echo "make test-llm      运行 Rust LLM fmt check 和测试"
-	@echo "make test-gateway  运行 Rust QQ C2C gateway fmt、测试和 check"
+	@echo "make test-common   运行 Rust common fmt check、测试和 check"
+	@echo "make test-llm      运行 Rust common 和 LLM fmt check、测试和 check"
+	@echo "make test-gateway  运行 Rust common 和 QQ C2C gateway fmt、测试和 check"
 	@echo "make diagnose      运行网络和环境诊断脚本"
 	@echo "make clean         清理根目录 Cargo workspace 构建产物"
 
@@ -60,9 +62,20 @@ test:
 	cargo test --workspace
 	cargo check --workspace
 
-test-llm:
-	$(MAKE) rust-fmt
-	$(MAKE) rust-test
+test-common: common-fmt common-test common-check
+
+test-llm: common-fmt rust-fmt common-test rust-test common-check rust-check
+
+test-gateway: common-fmt gateway-fmt common-test gateway-test common-check gateway-check
+
+common-fmt:
+	cargo fmt -p qq-maid-common -- --check
+
+common-test:
+	cargo test -p qq-maid-common
+
+common-check:
+	cargo check -p qq-maid-common
 
 rust-fmt:
 	cargo fmt -p qq-maid-llm -- --check
@@ -70,7 +83,8 @@ rust-fmt:
 rust-test:
 	cargo test -p qq-maid-llm
 
-test-gateway: gateway-fmt gateway-test gateway-check
+rust-check:
+	cargo check -p qq-maid-llm
 
 gateway-fmt:
 	cargo fmt -p qq-maid-gateway-rs -- --check

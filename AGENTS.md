@@ -17,6 +17,7 @@
 
 * `qq-maid-gateway-rs/`：Rust QQ 官方 gateway 接入层，负责 QQ 事件、消息转换、白名单、本地 `/ping` 和回复发送。
 * `qq-maid-llm/`：Rust LLM 服务，负责 `/v1/respond`、查询、记忆、session、todo、命令、prompt 和 provider 调用。
+* `qq-maid-common/`：Rust 共享基础工具，只放 gateway 和 LLM 都需要、且不依赖业务状态的通用逻辑。
 * `runtime/`：服务器部署运行目录，只放 release 二进制、运行配置和运行产物。
 * `scripts/`：部署、进程控制和诊断脚本源码。
 
@@ -99,7 +100,7 @@ Rust HTTP 层只公开：
 
 通用逻辑优先复用，不要在具体命令里重复实现。
 
-例如日期边界解析优先复用 `util/time_context.rs`。
+例如日期、时间和时区语义优先复用 `qq-maid-common/src/time_context.rs`；LLM 内部原 `util/time_context.rs` 仅作为兼容入口保留。
 
 ### 注释规则
 
@@ -178,6 +179,7 @@ make diagnose
 
 * 修改 Rust LLM：至少执行 `make test-llm`。
 * 修改 Rust gateway：至少执行 `make test-gateway`。
+* 修改 Rust common：至少执行 `make test-common`；若影响 LLM 或 gateway 调用方，再执行对应模块测试。
 * 跨 LLM / gateway 或提交前：执行 `make test`。
 * 修改 `scripts/*.sh`：至少执行 `bash -n` 对应脚本。
 * 涉及诊断入口时执行 `make diagnose`。
