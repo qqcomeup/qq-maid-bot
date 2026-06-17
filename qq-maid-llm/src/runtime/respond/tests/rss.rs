@@ -62,6 +62,8 @@ async fn rss_add_records_baseline_without_pending_push() {
 
     assert_eq!(response.command.as_deref(), Some("rss_add"));
     let text = response.text.unwrap();
+    assert!(!text.starts_with("null"));
+    assert!(!text.contains("null已"));
     assert!(text.contains("已添加 RSS 订阅"));
     assert!(text.contains("不会推送历史文章"));
     let subscriptions = service.rss_store.list_by_scope("group:g1").unwrap();
@@ -104,6 +106,10 @@ async fn rss_list_and_delete_use_current_scope_only() {
 
     let deleted = service.respond(message("/rss delete 1")).await.unwrap();
     assert_eq!(deleted.command.as_deref(), Some("rss_delete"));
+    let delete_text = deleted.text.unwrap();
+    assert!(!delete_text.starts_with("null"));
+    assert!(!delete_text.contains("null已"));
+    assert!(delete_text.contains("已删除 RSS 订阅：群订阅"));
     assert!(
         service
             .rss_store
@@ -115,4 +121,23 @@ async fn rss_list_and_delete_use_current_scope_only() {
         service.rss_store.list_by_scope("private:u2").unwrap().len(),
         1
     );
+}
+
+#[tokio::test]
+async fn rss_add_ignores_placeholder_null_custom_name() {
+    let (service, _) = test_service_with_base();
+    let url = spawn_feed_server(FEED);
+
+    let response = service
+        .respond(message(&format!("/rss add {url} null")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.command.as_deref(), Some("rss_add"));
+    let text = response.text.unwrap();
+    assert!(!text.starts_with("null"));
+    assert!(!text.contains("null已"));
+    assert!(text.contains("已添加 RSS 订阅：Fixture Feed"));
+    let subscriptions = service.rss_store.list_by_scope("group:g1").unwrap();
+    assert_eq!(subscriptions[0].title, "Fixture Feed");
 }

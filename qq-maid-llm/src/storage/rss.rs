@@ -15,12 +15,12 @@ use crate::{
     util::time_context::now_iso_cn,
 };
 
-/// RSS schema migration，由应用启动时的通用数据库初始化流程统一执行。
+/// RSS 订阅表 schema，由应用启动时的通用数据库初始化流程统一执行。
 ///
 /// SQL 保持 `IF NOT EXISTS`，保证空库首次启动和重复启动都安全；
-/// 这里不删除、不重建现有 RSS 表，避免破坏已保存的订阅和去重状态。
-pub const RSS_SCHEMA_V1: SqliteMigration = SqliteMigration {
-    name: "rss_schema_v1",
+/// 这里不删除、不重建订阅表，避免破坏已保存的 RSS 订阅。
+pub const RSS_SUBSCRIPTIONS_SCHEMA: SqliteMigration = SqliteMigration {
+    name: "rss_subscriptions_schema",
     sql: "CREATE TABLE IF NOT EXISTS rss_subscriptions (
             id TEXT PRIMARY KEY,
             target_type TEXT NOT NULL,
@@ -40,7 +40,48 @@ pub const RSS_SCHEMA_V1: SqliteMigration = SqliteMigration {
             ON rss_subscriptions(scope_key, url);
         CREATE INDEX IF NOT EXISTS idx_rss_sub_enabled
             ON rss_subscriptions(enabled, last_checked_at);
-        CREATE TABLE IF NOT EXISTS rss_seen_items (
+        ",
+};
+
+/// RSS 条目状态表。
+///
+/// 用 `(subscription_id, item_key)` 固定同一逻辑条目，再用 `revision_hash`
+/// 记录当前内容版本，从而识别 Atom entry 的状态更新。
+pub const RSS_ITEM_STATES_SCHEMA: SqliteMigration = SqliteMigration {
+    name: "rss_item_states_schema",
+    sql:
+        "CREATE TABLE IF NOT EXISTS rss_item_states (
+            subscription_id TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            revision_hash TEXT NOT NULL,
+            title TEXT NOT NULL,
+            link TEXT,
+            published_at TEXT,
+            updated_at TEXT,
+            summary TEXT,
+            source_order INTEGER NOT NULL DEFAULT 0,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            pushed_at TEXT,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            PRIMARY KEY(subscription_id, item_key),
+            FOREIGN KEY(subscription_id) REFERENCES rss_subscriptions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_rss_item_states_pending
+            ON rss_item_states(subscription_id, pushed_at, failed_count, updated_at, published_at);",
+};
+
+const LEGACY_REVISION_PREFIX: &str = "legacy:";
+
+/// 迁移并清理旧版 RSS 条目表。
+///
+/// `rss_seen_items` 已不再承载运行时语义，最终必须删除；但旧库可能只在这张表里
+/// 记录了“已见历史条目”。先写入 legacy revision，再删除旧表，可避免升级后把历史
+/// feed 全量当成新更新推送。
+pub const RSS_LEGACY_SEEN_ITEMS_MIGRATION: SqliteMigration = SqliteMigration {
+    name: "rss_legacy_seen_items_migration",
+    sql: "CREATE TABLE IF NOT EXISTS rss_seen_items (
             subscription_id TEXT NOT NULL,
             fingerprint TEXT NOT NULL,
             item_key TEXT NOT NULL,
@@ -56,11 +97,60 @@ pub const RSS_SCHEMA_V1: SqliteMigration = SqliteMigration {
             PRIMARY KEY(subscription_id, fingerprint),
             FOREIGN KEY(subscription_id) REFERENCES rss_subscriptions(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_rss_seen_pending
-            ON rss_seen_items(subscription_id, pushed_at, failed_count, published_at);",
+        INSERT OR IGNORE INTO rss_item_states (
+            subscription_id, item_key, revision_hash, title, link,
+            published_at, updated_at, summary, source_order, first_seen_at,
+            last_seen_at, pushed_at, failed_count, last_error
+        )
+        SELECT
+            subscription_id,
+            item_key,
+            'legacy:' || fingerprint,
+            title,
+            link,
+            published_at,
+            published_at,
+            summary,
+            source_order,
+            first_seen_at,
+            COALESCE(pushed_at, first_seen_at),
+            pushed_at,
+            failed_count,
+            last_error
+        FROM rss_seen_items
+        ORDER BY COALESCE(pushed_at, first_seen_at) DESC, first_seen_at DESC;
+        DROP TABLE IF EXISTS rss_seen_items;",
 };
 
-pub const RSS_MIGRATIONS: &[SqliteMigration] = &[RSS_SCHEMA_V1];
+/// 一次性清理旧 revision 逻辑已经排入的 RSS 待推送队列。
+///
+/// 2026-06-18 前后的开发版本会把 Statuspage 组件列表顺序抖动误判成大量更新。
+/// 这里只在当前库第一次看到该 marker 时重设已存在的 pending，避免部署后继续刷屏；
+/// marker 写入后，后续真实推送失败产生的 pending 仍按原重试语义保留。
+pub const RSS_PENDING_REBASELINE_MIGRATION: SqliteMigration = SqliteMigration {
+    name: "rss_pending_rebaseline_20260618",
+    sql: "CREATE TABLE IF NOT EXISTS rss_internal_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
+        UPDATE rss_item_states
+        SET pushed_at = COALESCE(last_seen_at, first_seen_at),
+            last_error = NULL
+        WHERE pushed_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM rss_internal_migrations
+              WHERE name = 'rss_pending_rebaseline_20260618'
+          );
+        INSERT OR IGNORE INTO rss_internal_migrations (name, applied_at)
+        VALUES ('rss_pending_rebaseline_20260618', datetime('now'));",
+};
+
+pub const RSS_MIGRATIONS: &[SqliteMigration] = &[
+    RSS_SUBSCRIPTIONS_SCHEMA,
+    RSS_ITEM_STATES_SCHEMA,
+    RSS_LEGACY_SEEN_ITEMS_MIGRATION,
+    RSS_PENDING_REBASELINE_MIGRATION,
+];
 
 /// RSS 推送目标类型。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,11 +205,12 @@ pub struct RssSubscription {
 /// 从 feed 中规范化出的条目。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RssFeedItem {
-    pub fingerprint: String,
     pub item_key: String,
+    pub revision_hash: String,
     pub title: String,
     pub link: Option<String>,
     pub published_at: Option<String>,
+    pub updated_at: Option<String>,
     pub summary: Option<String>,
     pub source_order: i64,
 }
@@ -128,13 +219,21 @@ pub struct RssFeedItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RssPendingItem {
     pub subscription_id: String,
-    pub fingerprint: String,
     pub item_key: String,
+    pub revision_hash: String,
     pub title: String,
     pub link: Option<String>,
     pub published_at: Option<String>,
+    pub updated_at: Option<String>,
     pub summary: Option<String>,
     pub failed_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedItemChange {
+    New,
+    Updated,
+    Unchanged,
 }
 
 #[derive(Debug, Clone)]
@@ -294,7 +393,7 @@ impl RssStore {
         Ok(())
     }
 
-    /// 将本轮发现的新条目写成待推送状态；已见条目不会重复入队。
+    /// 将本轮发现的新条目或内容更新写成待推送状态；未变化条目只刷新 last_seen_at。
     pub fn enqueue_items(
         &self,
         subscription_id: &str,
@@ -318,15 +417,15 @@ impl RssStore {
         let conn = self.connection()?;
         let mut stmt = conn
             .prepare(
-                "SELECT subscription_id, fingerprint, item_key, title, link,
-                        published_at, summary, failed_count
-                 FROM rss_seen_items
+                "SELECT subscription_id, item_key, revision_hash, title, link,
+                        published_at, updated_at, summary, failed_count
+                 FROM rss_item_states
                  WHERE subscription_id = ?1
                    AND pushed_at IS NULL
                    AND failed_count < ?2
                  ORDER BY
-                   published_at IS NULL ASC,
-                   published_at ASC,
+                   COALESCE(updated_at, published_at) IS NULL ASC,
+                   COALESCE(updated_at, published_at) ASC,
                    source_order ASC,
                    first_seen_at ASC
                  LIMIT ?3",
@@ -338,13 +437,14 @@ impl RssStore {
                 |row| {
                     Ok(RssPendingItem {
                         subscription_id: row.get(0)?,
-                        fingerprint: row.get(1)?,
-                        item_key: row.get(2)?,
+                        item_key: row.get(1)?,
+                        revision_hash: row.get(2)?,
                         title: row.get(3)?,
                         link: row.get(4)?,
                         published_at: row.get(5)?,
-                        summary: row.get(6)?,
-                        failed_count: row.get::<_, i64>(7)? as u32,
+                        updated_at: row.get(6)?,
+                        summary: row.get(7)?,
+                        failed_count: row.get::<_, i64>(8)? as u32,
                     })
                 },
             )
@@ -355,34 +455,42 @@ impl RssStore {
     pub fn mark_item_pushed(
         &self,
         subscription_id: &str,
-        fingerprint: &str,
+        item_key: &str,
     ) -> Result<(), RssStoreError> {
         let conn = self.connection()?;
-        conn.execute(
-            "UPDATE rss_seen_items
+        let affected = conn
+            .execute(
+                "UPDATE rss_item_states
              SET pushed_at = ?3, last_error = NULL
-             WHERE subscription_id = ?1 AND fingerprint = ?2",
-            params![subscription_id, fingerprint, now_iso_cn()],
-        )
-        .map_err(RssStoreError::from_sql)?;
+             WHERE subscription_id = ?1 AND item_key = ?2",
+                params![subscription_id, item_key, now_iso_cn()],
+            )
+            .map_err(RssStoreError::from_sql)?;
+        if affected == 0 {
+            return Err(RssStoreError::io("rss item state not found"));
+        }
         Ok(())
     }
 
     pub fn record_item_push_failure(
         &self,
         subscription_id: &str,
-        fingerprint: &str,
+        item_key: &str,
         message: &str,
     ) -> Result<(), RssStoreError> {
         let conn = self.connection()?;
-        conn.execute(
-            "UPDATE rss_seen_items
+        let affected = conn
+            .execute(
+                "UPDATE rss_item_states
              SET failed_count = failed_count + 1,
                  last_error = ?3
-             WHERE subscription_id = ?1 AND fingerprint = ?2",
-            params![subscription_id, fingerprint, truncate_text(message, 300)],
-        )
-        .map_err(RssStoreError::from_sql)?;
+             WHERE subscription_id = ?1 AND item_key = ?2",
+                params![subscription_id, item_key, truncate_text(message, 300)],
+            )
+            .map_err(RssStoreError::from_sql)?;
+        if affected == 0 {
+            return Err(RssStoreError::io("rss item state not found"));
+        }
         Ok(())
     }
 
@@ -390,25 +498,26 @@ impl RssStore {
     pub fn seen_item(
         &self,
         subscription_id: &str,
-        fingerprint: &str,
+        item_key: &str,
     ) -> Result<Option<RssPendingItem>, RssStoreError> {
         let conn = self.connection()?;
         conn.query_row(
-            "SELECT subscription_id, fingerprint, item_key, title, link,
-                    published_at, summary, failed_count
-             FROM rss_seen_items
-             WHERE subscription_id = ?1 AND fingerprint = ?2",
-            params![subscription_id, fingerprint],
+            "SELECT subscription_id, item_key, revision_hash, title, link,
+                    published_at, updated_at, summary, failed_count
+             FROM rss_item_states
+             WHERE subscription_id = ?1 AND item_key = ?2",
+            params![subscription_id, item_key],
             |row| {
                 Ok(RssPendingItem {
                     subscription_id: row.get(0)?,
-                    fingerprint: row.get(1)?,
-                    item_key: row.get(2)?,
+                    item_key: row.get(1)?,
+                    revision_hash: row.get(2)?,
                     title: row.get(3)?,
                     link: row.get(4)?,
                     published_at: row.get(5)?,
-                    summary: row.get(6)?,
-                    failed_count: row.get::<_, i64>(7)? as u32,
+                    updated_at: row.get(6)?,
+                    summary: row.get(7)?,
+                    failed_count: row.get::<_, i64>(8)? as u32,
                 })
             },
         )
@@ -498,31 +607,165 @@ fn insert_items_unlocked(
     pushed_at: Option<&str>,
 ) -> Result<usize, RssStoreError> {
     let now = now_iso_cn();
-    let mut inserted = 0;
+    let mut changed = 0;
     for item in items {
-        let affected = conn
-            .execute(
-                "INSERT OR IGNORE INTO rss_seen_items (
-                    subscription_id, fingerprint, item_key, title, link, published_at,
-                    summary, source_order, first_seen_at, pushed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    subscription_id,
-                    item.fingerprint,
-                    item.item_key,
-                    item.title,
-                    item.link,
-                    item.published_at,
-                    item.summary,
-                    item.source_order,
-                    now,
-                    pushed_at,
-                ],
-            )
-            .map_err(RssStoreError::from_sql)?;
-        inserted += affected;
+        let change = upsert_item_state_unlocked(conn, subscription_id, item, &now, pushed_at)?;
+        if matches!(change, FeedItemChange::New | FeedItemChange::Updated) {
+            changed += 1;
+        }
     }
-    Ok(inserted)
+    Ok(changed)
+}
+
+fn upsert_item_state_unlocked(
+    conn: &Connection,
+    subscription_id: &str,
+    item: &RssFeedItem,
+    now: &str,
+    pushed_at: Option<&str>,
+) -> Result<FeedItemChange, RssStoreError> {
+    let existing = conn
+        .query_row(
+            "SELECT revision_hash, published_at, updated_at, pushed_at
+             FROM rss_item_states
+             WHERE subscription_id = ?1 AND item_key = ?2",
+            params![subscription_id, item.item_key],
+            |row| {
+                Ok(ExistingItemState {
+                    revision_hash: row.get(0)?,
+                    published_at: row.get(1)?,
+                    updated_at: row.get(2)?,
+                    pushed_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(RssStoreError::from_sql)?;
+
+    let Some(existing) = existing else {
+        conn.execute(
+            "INSERT INTO rss_item_states (
+                subscription_id, item_key, revision_hash, title, link,
+                published_at, updated_at, summary, source_order, first_seen_at,
+                last_seen_at, pushed_at, failed_count, last_error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 0, NULL)",
+            params![
+                subscription_id,
+                item.item_key,
+                item.revision_hash,
+                item.title,
+                item.link,
+                item.published_at,
+                item.updated_at,
+                item.summary,
+                item.source_order,
+                now,
+                pushed_at,
+            ],
+        )
+        .map_err(RssStoreError::from_sql)?;
+        return Ok(FeedItemChange::New);
+    };
+
+    if existing.revision_hash == item.revision_hash {
+        update_item_seen_unlocked(
+            conn,
+            subscription_id,
+            item,
+            now,
+            existing.pushed_at.as_deref(),
+        )?;
+        return Ok(FeedItemChange::Unchanged);
+    }
+
+    if is_pushed_legacy_state(&existing) {
+        // legacy revision 来自旧 `rss_seen_items`，只代表“这个 item_key 已见”。
+        // 首次升级后用当前 feed 内容刷新 revision，但保留 pushed_at，避免把历史条目补推一遍。
+        update_item_seen_unlocked(
+            conn,
+            subscription_id,
+            item,
+            now,
+            existing.pushed_at.as_deref(),
+        )?;
+        return Ok(FeedItemChange::Unchanged);
+    }
+
+    if is_same_entry_time(&existing, item) {
+        // 部分状态页 feed 的组件列表顺序会抖动，或 revision 归一化算法升级后 hash 会变化。
+        // 同一 item_key 只有 published/updated 时间也变化时才重新入队；若旧版本已把
+        // 这类抖动写成 pending，这里会把它重新基线，避免历史 incident 反复推送。
+        let pushed_at = existing.pushed_at.as_deref().or(Some(now));
+        update_item_seen_unlocked(conn, subscription_id, item, now, pushed_at)?;
+        return Ok(FeedItemChange::Unchanged);
+    }
+
+    conn.execute(
+        "UPDATE rss_item_states
+         SET revision_hash = ?3,
+             title = ?4,
+             link = ?5,
+             published_at = ?6,
+             updated_at = ?7,
+             summary = ?8,
+             source_order = ?9,
+             last_seen_at = ?10,
+             pushed_at = NULL,
+             failed_count = 0,
+             last_error = NULL
+         WHERE subscription_id = ?1 AND item_key = ?2",
+        params![
+            subscription_id,
+            item.item_key,
+            item.revision_hash,
+            item.title,
+            item.link,
+            item.published_at,
+            item.updated_at,
+            item.summary,
+            item.source_order,
+            now,
+        ],
+    )
+    .map_err(RssStoreError::from_sql)?;
+    Ok(FeedItemChange::Updated)
+}
+
+fn update_item_seen_unlocked(
+    conn: &Connection,
+    subscription_id: &str,
+    item: &RssFeedItem,
+    now: &str,
+    pushed_at: Option<&str>,
+) -> Result<(), RssStoreError> {
+    conn.execute(
+        "UPDATE rss_item_states
+         SET revision_hash = ?3,
+             title = ?4,
+             link = ?5,
+             published_at = ?6,
+             updated_at = ?7,
+             summary = ?8,
+             source_order = ?9,
+             last_seen_at = ?10,
+             pushed_at = COALESCE(?11, pushed_at)
+         WHERE subscription_id = ?1 AND item_key = ?2",
+        params![
+            subscription_id,
+            item.item_key,
+            item.revision_hash,
+            item.title,
+            item.link,
+            item.published_at,
+            item.updated_at,
+            item.summary,
+            item.source_order,
+            now,
+            pushed_at,
+        ],
+    )
+    .map_err(RssStoreError::from_sql)?;
+    Ok(())
 }
 
 /// 去重记录只保留最近 N 条，防止长期订阅无限增长。
@@ -534,12 +777,14 @@ fn trim_seen_unlocked(
     if retain_seen == 0 {
         return Ok(());
     }
+    // pending 记录还承担重试状态，不能因为保留数量太小被提前裁掉。
     let mut stmt = conn
         .prepare(
-            "SELECT fingerprint
-             FROM rss_seen_items
+            "SELECT item_key
+             FROM rss_item_states
              WHERE subscription_id = ?1
-             ORDER BY COALESCE(pushed_at, first_seen_at) DESC, first_seen_at DESC
+               AND pushed_at IS NOT NULL
+             ORDER BY COALESCE(pushed_at, last_seen_at, first_seen_at) DESC, first_seen_at DESC
              LIMIT -1 OFFSET ?2",
         )
         .map_err(RssStoreError::from_sql)?;
@@ -551,14 +796,29 @@ fn trim_seen_unlocked(
         .collect::<Result<Vec<_>, _>>()
         .map_err(RssStoreError::from_sql)?;
     drop(stmt);
-    for fingerprint in stale {
+    for item_key in stale {
         conn.execute(
-            "DELETE FROM rss_seen_items WHERE subscription_id = ?1 AND fingerprint = ?2",
-            params![subscription_id, fingerprint],
+            "DELETE FROM rss_item_states WHERE subscription_id = ?1 AND item_key = ?2",
+            params![subscription_id, item_key],
         )
         .map_err(RssStoreError::from_sql)?;
     }
     Ok(())
+}
+
+struct ExistingItemState {
+    revision_hash: String,
+    published_at: Option<String>,
+    updated_at: Option<String>,
+    pushed_at: Option<String>,
+}
+
+fn is_pushed_legacy_state(existing: &ExistingItemState) -> bool {
+    existing.revision_hash.starts_with(LEGACY_REVISION_PREFIX) && existing.pushed_at.is_some()
+}
+
+fn is_same_entry_time(existing: &ExistingItemState, item: &RssFeedItem) -> bool {
+    existing.published_at == item.published_at && existing.updated_at == item.updated_at
 }
 
 fn subscription_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RssSubscription> {
@@ -618,6 +878,50 @@ mod tests {
         std::env::temp_dir().join(format!("qq-maid-app-db-test-{}.db", Uuid::new_v4()))
     }
 
+    fn legacy_rss_schema() -> SqliteMigration {
+        SqliteMigration {
+            name: "legacy_rss_schema",
+            sql: "CREATE TABLE IF NOT EXISTS rss_subscriptions (
+                    id TEXT PRIMARY KEY,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    last_checked_at TEXT,
+                    last_success_at TEXT,
+                    last_error TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    initialized INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS rss_seen_items (
+                    subscription_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    link TEXT,
+                    published_at TEXT,
+                    summary TEXT,
+                    source_order INTEGER NOT NULL DEFAULT 0,
+                    first_seen_at TEXT NOT NULL,
+                    pushed_at TEXT,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    PRIMARY KEY(subscription_id, fingerprint)
+                );",
+        }
+    }
+
+    fn rss_schema_without_pending_rebaseline() -> &'static [SqliteMigration] {
+        &[
+            RSS_SUBSCRIPTIONS_SCHEMA,
+            RSS_ITEM_STATES_SCHEMA,
+            RSS_LEGACY_SEEN_ITEMS_MIGRATION,
+        ]
+    }
+
     fn target(scope: &str) -> RssTarget {
         RssTarget {
             target_type: RssTargetType::Group,
@@ -626,14 +930,35 @@ mod tests {
         }
     }
 
-    fn item(fingerprint: &str) -> RssFeedItem {
+    fn item(item_key: &str) -> RssFeedItem {
+        item_with_revision(item_key, &format!("{item_key}-rev-1"), "摘要")
+    }
+
+    fn item_with_revision(item_key: &str, revision_hash: &str, summary: &str) -> RssFeedItem {
+        item_with_revision_and_time(
+            item_key,
+            revision_hash,
+            summary,
+            "2026-06-17T00:00:00+00:00",
+            "2026-06-17T00:00:00+00:00",
+        )
+    }
+
+    fn item_with_revision_and_time(
+        item_key: &str,
+        revision_hash: &str,
+        summary: &str,
+        published_at: &str,
+        updated_at: &str,
+    ) -> RssFeedItem {
         RssFeedItem {
-            fingerprint: fingerprint.to_owned(),
-            item_key: fingerprint.to_owned(),
-            title: format!("标题 {fingerprint}"),
-            link: Some(format!("https://example.test/{fingerprint}")),
-            published_at: Some("2026-06-17T00:00:00+00:00".to_owned()),
-            summary: Some("摘要".to_owned()),
+            item_key: item_key.to_owned(),
+            revision_hash: revision_hash.to_owned(),
+            title: format!("标题 {item_key}"),
+            link: Some(format!("https://example.test/{item_key}")),
+            published_at: Some(published_at.to_owned()),
+            updated_at: Some(updated_at.to_owned()),
+            summary: Some(summary.to_owned()),
             source_order: 0,
         }
     }
@@ -710,6 +1035,138 @@ mod tests {
     }
 
     #[test]
+    fn same_item_key_revision_update_requeues_pending_once() {
+        let store = test_store();
+        let sub = store
+            .create_subscription(
+                &target("group:g1"),
+                "https://example.test/feed.xml",
+                "测试 Feed",
+                &[item_with_revision("incident-1", "rev-a", "Investigating")],
+                50,
+            )
+            .unwrap();
+
+        assert!(store.pending_items(&sub.id, 10, 3).unwrap().is_empty());
+
+        let updated = item_with_revision_and_time(
+            "incident-1",
+            "rev-b",
+            "Resolved",
+            "2026-06-17T00:00:00+00:00",
+            "2026-06-17T01:00:00+00:00",
+        );
+        assert_eq!(
+            store
+                .enqueue_items(&sub.id, &[updated.clone()], 50)
+                .unwrap(),
+            1
+        );
+        let pending = store.pending_items(&sub.id, 10, 3).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].item_key, "incident-1");
+        assert_eq!(pending[0].revision_hash, "rev-b");
+        assert_eq!(pending[0].summary.as_deref(), Some("Resolved"));
+
+        assert_eq!(store.enqueue_items(&sub.id, &[updated], 50).unwrap(), 0);
+        assert_eq!(store.pending_items(&sub.id, 10, 3).unwrap().len(), 1);
+
+        store.mark_item_pushed(&sub.id, "incident-1").unwrap();
+        assert!(store.pending_items(&sub.id, 10, 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_item_key_same_time_revision_noise_does_not_requeue() {
+        let store = test_store();
+        let sub = store
+            .create_subscription(
+                &target("group:g1"),
+                "https://example.test/feed.xml",
+                "测试 Feed",
+                &[item_with_revision("incident-1", "rev-a", "组件 A\n组件 B")],
+                50,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .enqueue_items(
+                    &sub.id,
+                    &[item_with_revision("incident-1", "rev-b", "组件 B\n组件 A")],
+                    50
+                )
+                .unwrap(),
+            0
+        );
+        let seen = store.seen_item(&sub.id, "incident-1").unwrap().unwrap();
+        assert_eq!(seen.revision_hash, "rev-b");
+        assert_eq!(seen.summary.as_deref(), Some("组件 B\n组件 A"));
+        assert!(store.pending_items(&sub.id, 10, 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn existing_pending_same_time_revision_noise_is_rebaselined() {
+        let store = test_store();
+        let sub = store
+            .create_subscription(
+                &target("group:g1"),
+                "https://example.test/feed.xml",
+                "测试 Feed",
+                &[],
+                50,
+            )
+            .unwrap();
+        store
+            .enqueue_items(
+                &sub.id,
+                &[item_with_revision("incident-1", "rev-a", "组件 A")],
+                50,
+            )
+            .unwrap();
+        assert_eq!(store.pending_items(&sub.id, 10, 3).unwrap().len(), 1);
+
+        assert_eq!(
+            store
+                .enqueue_items(
+                    &sub.id,
+                    &[item_with_revision("incident-1", "rev-b", "组件 B")],
+                    50
+                )
+                .unwrap(),
+            0
+        );
+        assert!(store.pending_items(&sub.id, 10, 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retention_never_trims_pending_items() {
+        let store = test_store();
+        let sub = store
+            .create_subscription(
+                &target("group:g1"),
+                "https://example.test/feed.xml",
+                "测试 Feed",
+                &[],
+                50,
+            )
+            .unwrap();
+        store.enqueue_items(&sub.id, &[item("pending")], 1).unwrap();
+        store.mark_item_pushed(&sub.id, "pending").unwrap();
+        store
+            .enqueue_items(&sub.id, &[item("new-pending"), item("another-pending")], 1)
+            .unwrap();
+
+        let pending = store.pending_items(&sub.id, 10, 3).unwrap();
+        let keys = pending
+            .iter()
+            .map(|item| item.item_key.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(keys.contains(&"new-pending"));
+        assert!(keys.contains(&"another-pending"));
+    }
+
+    #[test]
     fn reopened_database_reads_existing_rss_data() {
         let path = test_database_path();
         let first_store = RssStore::new(SqliteDatabase::open(&path, RSS_MIGRATIONS).unwrap());
@@ -752,5 +1209,104 @@ mod tests {
 
         assert!(store.delete_for_scope("group:g1", &sub.id).unwrap());
         assert!(store.seen_item(&sub.id, "baseline").unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_seen_items_are_migrated_and_dropped_without_repush() {
+        let path = test_database_path();
+        let legacy_database = SqliteDatabase::open(&path, &[legacy_rss_schema()]).unwrap();
+        {
+            let conn = legacy_database.connection().unwrap();
+            conn.execute(
+                "INSERT INTO rss_subscriptions (
+                    id, target_type, target_id, scope_key, url, title, enabled,
+                    created_at, initialized, consecutive_failures
+                 ) VALUES ('sub-1', 'group', 'g1', 'group:g1',
+                    'https://example.test/feed.xml', '旧订阅', 1,
+                    '2026-06-17T00:00:00+08:00', 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rss_seen_items (
+                    subscription_id, fingerprint, item_key, title, link, published_at,
+                    summary, source_order, first_seen_at, pushed_at
+                 ) VALUES ('sub-1', 'old-fingerprint', 'id:legacy-entry', '旧条目',
+                    'https://example.test/legacy', '2026-06-17T00:00:00+00:00',
+                    '旧摘要', 0, '2026-06-17T00:00:00+08:00',
+                    '2026-06-17T00:00:00+08:00')",
+                [],
+            )
+            .unwrap();
+        }
+        drop(legacy_database);
+
+        let store = RssStore::new(SqliteDatabase::open(&path, RSS_MIGRATIONS).unwrap());
+        let legacy_table_count: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'rss_seen_items'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_table_count, 0);
+        assert!(store.pending_items("sub-1", 10, 3).unwrap().is_empty());
+
+        let current = item_with_revision("id:legacy-entry", "current-rev", "当前摘要");
+        assert_eq!(store.enqueue_items("sub-1", &[current], 50).unwrap(), 0);
+        let seen = store
+            .seen_item("sub-1", "id:legacy-entry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen.revision_hash, "current-rev");
+        assert!(store.pending_items("sub-1", 10, 3).unwrap().is_empty());
+
+        let updated = item_with_revision_and_time(
+            "id:legacy-entry",
+            "next-rev",
+            "后续更新",
+            "2026-06-17T00:00:00+00:00",
+            "2026-06-17T01:00:00+00:00",
+        );
+        assert_eq!(store.enqueue_items("sub-1", &[updated], 50).unwrap(), 1);
+        assert_eq!(store.pending_items("sub-1", 10, 3).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_rebaseline_migration_clears_existing_pending_once() {
+        let path = test_database_path();
+        let old_store = RssStore::new(
+            SqliteDatabase::open(&path, rss_schema_without_pending_rebaseline()).unwrap(),
+        );
+        let sub = old_store
+            .create_subscription(
+                &target("group:g1"),
+                "https://example.test/feed.xml",
+                "测试 Feed",
+                &[],
+                50,
+            )
+            .unwrap();
+        old_store
+            .enqueue_items(&sub.id, &[item("old-pending")], 50)
+            .unwrap();
+        assert_eq!(old_store.pending_items(&sub.id, 10, 3).unwrap().len(), 1);
+        drop(old_store);
+
+        let migrated = RssStore::new(SqliteDatabase::open(&path, RSS_MIGRATIONS).unwrap());
+        assert!(migrated.pending_items(&sub.id, 10, 3).unwrap().is_empty());
+
+        migrated
+            .enqueue_items(&sub.id, &[item("new-pending")], 50)
+            .unwrap();
+        assert_eq!(migrated.pending_items(&sub.id, 10, 3).unwrap().len(), 1);
+        drop(migrated);
+
+        let reopened = RssStore::new(SqliteDatabase::open(&path, RSS_MIGRATIONS).unwrap());
+        let pending = reopened.pending_items(&sub.id, 10, 3).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].item_key, "new-pending");
     }
 }

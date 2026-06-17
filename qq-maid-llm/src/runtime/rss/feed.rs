@@ -17,6 +17,7 @@ use url::Url;
 use crate::storage::rss::RssFeedItem;
 
 const DEFAULT_USER_AGENT: &str = "qq-maid-rss/0.1 (+https://github.com/kuliantnt/qqbot)";
+const RSS_HTML_TEXT_WIDTH: usize = 4000;
 
 #[derive(Debug, Clone)]
 pub struct RssFetchConfig {
@@ -156,8 +157,7 @@ pub fn parse_feed_bytes(
     let title = feed
         .title
         .as_ref()
-        .map(|text| clean_text(&text.content))
-        .filter(|text| !text.is_empty())
+        .and_then(|text| clean_feed_text(&text.content))
         .unwrap_or_else(|| "未命名订阅".to_owned());
     let items = feed
         .entries
@@ -170,9 +170,12 @@ pub fn parse_feed_bytes(
 
 pub fn clean_summary_text(raw: &str, limit: usize) -> Option<String> {
     let without_scripts = strip_script_style(raw);
-    let rendered = html2text::from_read(without_scripts.as_bytes(), 80).unwrap_or(without_scripts);
-    let clean = clean_text(&strip_markdown_emphasis(&rendered));
-    if clean.is_empty() {
+    // 摘要用于直接推送给 QQ，必须保留 feed 中原有的段落和列表换行。
+    // 这里把 html2text 宽度放大，避免它按终端列宽插入额外软换行。
+    let rendered = html2text::from_read(without_scripts.as_bytes(), RSS_HTML_TEXT_WIDTH)
+        .unwrap_or(without_scripts);
+    let clean = clean_multiline_text(&strip_markdown_emphasis(&rendered));
+    if clean.is_empty() || is_placeholder_null(&clean) {
         None
     } else {
         Some(truncate_chars(&clean, limit))
@@ -201,36 +204,38 @@ fn normalize_entry(
     let title = entry
         .title
         .as_ref()
-        .map(|text| clean_text(&text.content))
-        .filter(|text| !text.is_empty())
+        .and_then(|text| clean_feed_text(&text.content))
         .unwrap_or_else(|| "无标题".to_owned());
     let link = entry.links.first().map(|link| normalize_link(&link.href));
-    let published_at = entry
-        .published
-        .or(entry.updated)
-        .map(|time| time.to_rfc3339());
-    let summary = preferred_summary_text(
-        entry.summary.as_ref().map(|text| text.content.as_str()),
-        entry
-            .content
-            .as_ref()
-            .and_then(|content| content.body.as_deref()),
-        summary_limit,
-    );
+    let original_published_at = entry.published.map(|time| time.to_rfc3339());
+    let original_updated_at = entry.updated.map(|time| time.to_rfc3339());
+    let published_at = original_published_at
+        .clone()
+        .or_else(|| original_updated_at.clone());
+    let updated_at = original_updated_at
+        .clone()
+        .or_else(|| original_published_at.clone());
+    let raw_summary = entry.summary.as_ref().map(|text| text.content.as_str());
+    let raw_content = entry
+        .content
+        .as_ref()
+        .and_then(|content| content.body.as_deref());
+    let summary = preferred_summary_text(raw_summary, raw_content, summary_limit);
     let item_key = stable_item_key(
         feed,
         entry,
         link.as_deref(),
         &title,
-        published_at.as_deref(),
+        original_published_at.as_deref(),
     );
-    let fingerprint = sha256_hex(&item_key);
+    let revision_hash = revision_hash(updated_at.as_deref(), &title, raw_summary, raw_content);
     RssFeedItem {
-        fingerprint,
         item_key,
+        revision_hash,
         title,
         link,
         published_at,
+        updated_at,
         summary,
         source_order,
     }
@@ -253,14 +258,15 @@ fn stable_item_key(
     let feed_title = feed
         .title
         .as_ref()
-        .map(|text| clean_text(&text.content))
+        .and_then(|text| clean_feed_text(&text.content))
         .unwrap_or_default();
-    format!(
-        "fallback:{}|{}|{}",
+    let fallback_source = format!(
+        "{}|{}|{}",
         feed_title,
         title.trim(),
         published_at.unwrap_or("")
-    )
+    );
+    format!("fallback:{}", sha256_hex(&fallback_source))
 }
 
 fn normalize_link(raw: &str) -> String {
@@ -335,6 +341,99 @@ fn clean_text(raw: &str) -> String {
     no_control.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn clean_multiline_text(raw: &str) -> String {
+    let no_control = raw
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t' | '\r'))
+        .collect::<String>();
+    let normalized = no_control.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = Vec::new();
+    let mut previous_blank = false;
+    for line in normalized.lines() {
+        let clean = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if clean.is_empty() {
+            if !lines.is_empty() && !previous_blank {
+                lines.push(String::new());
+                previous_blank = true;
+            }
+        } else {
+            lines.push(clean);
+            previous_blank = false;
+        }
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn clean_feed_text(raw: &str) -> Option<String> {
+    let text = clean_text(raw);
+    if text.is_empty() || is_placeholder_null(&text) {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn clean_revision_text(raw: &str) -> Option<String> {
+    let without_scripts = strip_script_style(raw);
+    let rendered = html2text::from_read(without_scripts.as_bytes(), RSS_HTML_TEXT_WIDTH)
+        .unwrap_or(without_scripts);
+    let clean =
+        canonicalize_revision_text(&clean_multiline_text(&strip_markdown_emphasis(&rendered)));
+    if clean.is_empty() || is_placeholder_null(&clean) {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+fn canonicalize_revision_text(raw: &str) -> String {
+    let mut output = Vec::new();
+    let mut bullet_group = Vec::new();
+    for line in raw.lines() {
+        let clean = line.trim();
+        if let Some(item) = unordered_bullet_item(clean) {
+            bullet_group.push(item);
+        } else {
+            flush_bullet_group(&mut output, &mut bullet_group);
+            output.push(clean.to_owned());
+        }
+    }
+    flush_bullet_group(&mut output, &mut bullet_group);
+    output.join("\n")
+}
+
+fn flush_bullet_group(output: &mut Vec<String>, bullet_group: &mut Vec<String>) {
+    if bullet_group.is_empty() {
+        return;
+    }
+    // RSS/Atom 中的无序列表顺序经常由源站生成逻辑决定；revision hash 只关心集合内容，
+    // 避免 Statuspage 这类 feed 因组件列表顺序抖动而被误判为新更新。
+    bullet_group.sort_by_key(|item| item.to_ascii_lowercase());
+    output.extend(bullet_group.drain(..).map(|item| format!("* {item}")));
+}
+
+fn unordered_bullet_item(line: &str) -> Option<String> {
+    for marker in ["* ", "- ", "+ ", "• "] {
+        if let Some(value) = line.strip_prefix(marker) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn is_placeholder_null(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "null" | "none" | "undefined"
+    )
+}
+
 fn strip_markdown_emphasis(raw: &str) -> String {
     raw.replace("**", "").replace("__", "").replace('`', "")
 }
@@ -354,6 +453,32 @@ fn sha256_hex(value: &str) -> String {
         output.push_str(&format!("{byte:02x}"));
     }
     output
+}
+
+fn revision_hash(
+    updated_at: Option<&str>,
+    title: &str,
+    summary: Option<&str>,
+    content: Option<&str>,
+) -> String {
+    // revision 只包含 feed 自身内容，不能混入抓取时间，否则同内容重复轮询会误判更新。
+    let input = [
+        ("updated", updated_at.unwrap_or("").trim().to_owned()),
+        ("title", clean_feed_text(title).unwrap_or_default()),
+        (
+            "summary",
+            summary.and_then(clean_revision_text).unwrap_or_default(),
+        ),
+        (
+            "content",
+            content.and_then(clean_revision_text).unwrap_or_default(),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, value)| format!("{key}\0{value}"))
+    .collect::<Vec<_>>()
+    .join("\0");
+    sha256_hex(&input)
 }
 
 fn reqwest_error_summary(error: &reqwest::Error) -> String {
@@ -418,25 +543,125 @@ mod tests {
         assert_eq!(feed.title, "测试 Atom");
         assert_eq!(feed.items[0].item_key, "id:tag:example.test,2026:a");
         assert!(feed.items[0].published_at.is_some());
+        assert!(feed.items[0].updated_at.is_some());
     }
 
     #[test]
-    fn guid_and_url_dedupe_are_stable() {
+    fn guid_and_revision_hash_are_stable_for_same_content() {
         let feed = parse_feed_bytes(RSS.as_bytes(), None, 120).unwrap();
-        let first = feed.items[0].fingerprint.clone();
-        let second = parse_feed_bytes(RSS.as_bytes(), None, 120).unwrap().items[0]
-            .fingerprint
-            .clone();
-        assert_eq!(first, second);
+        let first = feed.items[0].revision_hash.clone();
+        let second = parse_feed_bytes(RSS.as_bytes(), None, 120).unwrap().items[0].clone();
+        assert_eq!(feed.items[0].item_key, second.item_key);
+        assert_eq!(first, second.revision_hash);
     }
 
     #[test]
-    fn fallback_fingerprint_is_stable_without_guid_or_link() {
+    fn fallback_item_key_is_stable_without_guid_or_link() {
         let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>源</title><item><title>无链接</title><pubDate>Wed, 17 Jun 2026 08:00:00 GMT</pubDate></item></channel></rss>"#;
         let a = parse_feed_bytes(xml.as_bytes(), None, 120).unwrap().items[0].clone();
         let b = parse_feed_bytes(xml.as_bytes(), None, 120).unwrap().items[0].clone();
         assert!(a.item_key.starts_with("fallback:"));
-        assert_eq!(a.fingerprint, b.fingerprint);
+        assert_eq!(a.item_key, b.item_key);
+        assert_eq!(a.revision_hash, b.revision_hash);
+    }
+
+    #[test]
+    fn atom_same_entry_id_changes_revision_when_status_updates() {
+        let investigating = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Status</title>
+  <entry>
+    <id>tag:example.test,2026:incident-1</id>
+    <title>Incident</title>
+    <updated>2026-06-17T08:00:00Z</updated>
+    <summary type="html">&lt;p&gt;Investigating&lt;/p&gt;</summary>
+  </entry>
+</feed>"#;
+        let resolved = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Status</title>
+  <entry>
+    <id>tag:example.test,2026:incident-1</id>
+    <title>Incident</title>
+    <updated>2026-06-17T09:00:00Z</updated>
+    <summary type="html">&lt;p&gt;Resolved&lt;/p&gt;</summary>
+  </entry>
+</feed>"#;
+
+        let first = parse_feed_bytes(investigating.as_bytes(), None, 120)
+            .unwrap()
+            .items[0]
+            .clone();
+        let second = parse_feed_bytes(resolved.as_bytes(), None, 120)
+            .unwrap()
+            .items[0]
+            .clone();
+
+        assert_eq!(first.item_key, second.item_key);
+        assert_ne!(first.revision_hash, second.revision_hash);
+        assert_ne!(first.updated_at, second.updated_at);
+    }
+
+    #[test]
+    fn statuspage_component_order_does_not_change_revision() {
+        let first = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Status</title>
+  <entry>
+    <id>https://status.example.test/incidents/incident-1</id>
+    <title>Incident</title>
+    <updated>2026-06-17T08:00:00Z</updated>
+    <summary type="html">
+      &lt;p&gt;Status: Resolved&lt;/p&gt;
+      &lt;p&gt;Affected components&lt;/p&gt;
+      &lt;ul&gt;&lt;li&gt;Files (Operational)&lt;/li&gt;&lt;li&gt;Search (Operational)&lt;/li&gt;&lt;/ul&gt;
+    </summary>
+  </entry>
+</feed>"#;
+        let reordered = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Status</title>
+  <entry>
+    <id>https://status.example.test/incidents/incident-1</id>
+    <title>Incident</title>
+    <updated>2026-06-17T08:00:00Z</updated>
+    <summary type="html">
+      &lt;p&gt;Status: Resolved&lt;/p&gt;
+      &lt;p&gt;Affected components&lt;/p&gt;
+      &lt;ul&gt;&lt;li&gt;Search (Operational)&lt;/li&gt;&lt;li&gt;Files (Operational)&lt;/li&gt;&lt;/ul&gt;
+    </summary>
+  </entry>
+</feed>"#;
+
+        let first_item = parse_feed_bytes(first.as_bytes(), None, 500).unwrap().items[0].clone();
+        let reordered_item = parse_feed_bytes(reordered.as_bytes(), None, 500)
+            .unwrap()
+            .items[0]
+            .clone();
+
+        assert_eq!(first_item.item_key, reordered_item.item_key);
+        assert_eq!(first_item.updated_at, reordered_item.updated_at);
+        assert_eq!(first_item.revision_hash, reordered_item.revision_hash);
+    }
+
+    #[test]
+    fn placeholder_null_titles_and_summaries_are_ignored() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>null</title>
+  <entry>
+    <id>tag:example.test,2026:null-title</id>
+    <title>null</title>
+    <updated>2026-06-17T08:00:00Z</updated>
+    <summary>null</summary>
+  </entry>
+</feed>"#;
+
+        let feed = parse_feed_bytes(xml.as_bytes(), None, 120).unwrap();
+
+        assert_eq!(feed.title, "未命名订阅");
+        assert_eq!(feed.items[0].title, "无标题");
+        assert_eq!(feed.items[0].summary, None);
     }
 
     #[test]
@@ -444,6 +669,18 @@ mod tests {
         assert_eq!(
             clean_summary_text("<p>一 <b>二</b></p><style>x</style>", 20).as_deref(),
             Some("一 二")
+        );
+    }
+
+    #[test]
+    fn html_summary_preserves_block_line_breaks() {
+        assert_eq!(
+            clean_summary_text(
+                "<p>Status: Resolved</p><p>Affected components</p><ul><li>Files (Operational)</li><li>Search (Operational)</li></ul>",
+                500,
+            )
+            .as_deref(),
+            Some("Status: Resolved\n\nAffected components\n* Files (Operational)\n* Search (Operational)")
         );
     }
 
@@ -528,7 +765,7 @@ mod tests {
                 500,
             )
             .as_deref(),
-            Some("第一段 第二段")
+            Some("第一段\n\n第二段")
         );
     }
 

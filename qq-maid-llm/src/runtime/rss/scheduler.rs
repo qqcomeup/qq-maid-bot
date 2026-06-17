@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{debug, info, warn};
 
@@ -201,11 +202,11 @@ impl RssScheduler {
             Ok(()) => {
                 if let Err(err) = self
                     .store
-                    .mark_item_pushed(&subscription.id, &item.fingerprint)
+                    .mark_item_pushed(&subscription.id, &item.item_key)
                 {
                     warn!(
                         subscription_id = %short_id(&subscription.id),
-                        item = %short_id(&item.fingerprint),
+                        item = %short_id(&item.item_key),
                         error = %err,
                         "failed to mark RSS item pushed"
                     );
@@ -213,25 +214,25 @@ impl RssScheduler {
                 }
                 info!(
                     subscription_id = %short_id(&subscription.id),
-                    item = %short_id(&item.fingerprint),
+                    item = %short_id(&item.item_key),
                     "RSS push succeeded"
                 );
             }
             Err(err) => {
                 warn!(
                     subscription_id = %short_id(&subscription.id),
-                    item = %short_id(&item.fingerprint),
+                    item = %short_id(&item.item_key),
                     error = %safe_push_error(&err),
                     "RSS push failed"
                 );
                 if let Err(store_err) = self.store.record_item_push_failure(
                     &subscription.id,
-                    &item.fingerprint,
+                    &item.item_key,
                     &safe_push_error(&err),
                 ) {
                     warn!(
                         subscription_id = %short_id(&subscription.id),
-                        item = %short_id(&item.fingerprint),
+                        item = %short_id(&item.item_key),
                         error = %store_err,
                         "failed to persist RSS push failure"
                     );
@@ -254,15 +255,8 @@ pub fn format_push_message(subscription_title: &str, item: &RssPendingItem) -> S
     {
         rows.push(summary.trim().to_owned());
     }
-    if let Some(published_at) = item
-        .published_at
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        rows.push(format!(
-            "发布时间：{}",
-            format_rss_time_for_display(published_at)
-        ));
+    if let Some((label, value)) = item_display_time(item) {
+        rows.push(format!("{label}：{}", format_rss_time_for_display(value)));
     }
     if let Some(link) = item
         .link
@@ -296,16 +290,9 @@ pub fn format_push_markdown(subscription_title: &str, item: &RssPendingItem) -> 
         rows.push(String::new());
         rows.push(summary.trim().to_owned());
     }
-    if let Some(published_at) = item
-        .published_at
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
+    if let Some((label, value)) = item_display_time(item) {
         rows.push(String::new());
-        rows.push(format!(
-            "发布时间：`{}`",
-            format_rss_time_for_display(published_at)
-        ));
+        rows.push(format!("{label}：`{}`", format_rss_time_for_display(value)));
     }
     if let Some(link) = item
         .link
@@ -316,6 +303,19 @@ pub fn format_push_markdown(subscription_title: &str, item: &RssPendingItem) -> 
         rows.push(format!("链接：{link}"));
     }
     rows.join("\n")
+}
+
+fn item_display_time(item: &RssPendingItem) -> Option<(&'static str, &str)> {
+    item.updated_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| ("更新时间", value))
+        .or_else(|| {
+            item.published_at
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| ("发布时间", value))
+        })
 }
 
 fn safe_feed_error(err: &RssFeedError) -> String {
@@ -330,7 +330,13 @@ fn safe_push_error(err: &RssPushError) -> String {
 }
 
 fn short_id(value: &str) -> String {
-    value.chars().take(8).collect()
+    let digest = Sha256::digest(value.as_bytes());
+    // 日志里只暴露稳定短哈希，避免 Statuspage 这类 item_key 前缀全相同且可能包含 URL。
+    let mut output = String::with_capacity(10);
+    for byte in digest.iter().take(5) {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
 }
 
 #[cfg(test)]
@@ -341,11 +347,12 @@ mod tests {
     fn push_message_omits_empty_summary() {
         let item = RssPendingItem {
             subscription_id: "s1".to_owned(),
-            fingerprint: "f1".to_owned(),
             item_key: "k1".to_owned(),
+            revision_hash: "r1".to_owned(),
             title: "文章标题".to_owned(),
             link: Some("https://example.test/a".to_owned()),
             published_at: None,
+            updated_at: None,
             summary: None,
             failed_count: 0,
         };
@@ -360,11 +367,12 @@ mod tests {
     fn markdown_push_message_contains_link() {
         let item = RssPendingItem {
             subscription_id: "s1".to_owned(),
-            fingerprint: "f1".to_owned(),
             item_key: "k1".to_owned(),
+            revision_hash: "r1".to_owned(),
             title: "文章标题".to_owned(),
             link: Some("https://example.test/a".to_owned()),
             published_at: Some("2026-06-17T00:00:00+00:00".to_owned()),
+            updated_at: Some("2026-06-17T00:00:00+00:00".to_owned()),
             summary: Some("摘要".to_owned()),
             failed_count: 0,
         };
@@ -379,11 +387,12 @@ mod tests {
     fn push_messages_keep_original_link_with_summary() {
         let item = RssPendingItem {
             subscription_id: "s1".to_owned(),
-            fingerprint: "f1".to_owned(),
             item_key: "k1".to_owned(),
+            revision_hash: "r1".to_owned(),
             title: "文章标题".to_owned(),
             link: Some("https://example.test/original".to_owned()),
             published_at: None,
+            updated_at: None,
             summary: Some("短摘要".to_owned()),
             failed_count: 0,
         };
@@ -398,14 +407,40 @@ mod tests {
     }
 
     #[test]
+    fn push_messages_preserve_summary_line_breaks() {
+        let item = RssPendingItem {
+            subscription_id: "s1".to_owned(),
+            item_key: "k1".to_owned(),
+            revision_hash: "r1".to_owned(),
+            title: "文章标题".to_owned(),
+            link: Some("https://example.test/a".to_owned()),
+            published_at: None,
+            updated_at: None,
+            summary: Some(
+                "Status: Resolved\n\nAffected components\n\n* Files\n* Search".to_owned(),
+            ),
+            failed_count: 0,
+        };
+
+        let text = format_push_message("订阅", &item);
+        let markdown = format_push_markdown("订阅", &item);
+
+        assert!(text.contains("Status: Resolved\n\nAffected components"));
+        assert!(text.contains("* Files\n* Search"));
+        assert!(markdown.contains("Status: Resolved\n\nAffected components"));
+        assert!(markdown.contains("* Files\n* Search"));
+    }
+
+    #[test]
     fn push_messages_localize_published_at_for_display_only() {
         let item = RssPendingItem {
             subscription_id: "s1".to_owned(),
-            fingerprint: "f1".to_owned(),
             item_key: "k1".to_owned(),
+            revision_hash: "r1".to_owned(),
             title: "文章标题".to_owned(),
             link: Some("https://example.test/a".to_owned()),
             published_at: Some("2026-06-17T00:00:00+00:00".to_owned()),
+            updated_at: Some("2026-06-17T00:00:00+00:00".to_owned()),
             summary: None,
             failed_count: 0,
         };
@@ -417,19 +452,20 @@ mod tests {
             item.published_at.as_deref(),
             Some("2026-06-17T00:00:00+00:00")
         );
-        assert!(text.contains("发布时间：2026-06-17 08:00"));
-        assert!(markdown.contains("发布时间：`2026-06-17 08:00`"));
+        assert!(text.contains("更新时间：2026-06-17 08:00"));
+        assert!(markdown.contains("更新时间：`2026-06-17 08:00`"));
     }
 
     #[test]
     fn push_messages_keep_original_published_at_when_parse_fails() {
         let item = RssPendingItem {
             subscription_id: "s1".to_owned(),
-            fingerprint: "f1".to_owned(),
             item_key: "k1".to_owned(),
+            revision_hash: "r1".to_owned(),
             title: "文章标题".to_owned(),
             link: Some("https://example.test/a".to_owned()),
             published_at: Some("无法解析的发布时间".to_owned()),
+            updated_at: Some("无法解析的更新时间".to_owned()),
             summary: None,
             failed_count: 0,
         };
@@ -437,7 +473,7 @@ mod tests {
         let text = format_push_message("订阅", &item);
         let markdown = format_push_markdown("订阅", &item);
 
-        assert!(text.contains("发布时间：无法解析的发布时间"));
-        assert!(markdown.contains("发布时间：`无法解析的发布时间`"));
+        assert!(text.contains("更新时间：无法解析的更新时间"));
+        assert!(markdown.contains("更新时间：`无法解析的更新时间`"));
     }
 }

@@ -4,15 +4,24 @@
 //! 避免启动层直接知道某个具体业务模块的 migration 列表。
 
 use crate::storage::{
-    database::SqliteMigration, memory::MEMORY_SCHEMA_V1, rss::RSS_SCHEMA_V1,
-    session::SESSION_SCHEMA_V1, todo::TODO_SCHEMA_V1,
+    database::SqliteMigration,
+    memory::MEMORY_SCHEMA_V1,
+    rss::{
+        RSS_ITEM_STATES_SCHEMA, RSS_LEGACY_SEEN_ITEMS_MIGRATION, RSS_PENDING_REBASELINE_MIGRATION,
+        RSS_SUBSCRIPTIONS_SCHEMA,
+    },
+    session::SESSION_SCHEMA_V1,
+    todo::TODO_SCHEMA_V1,
 };
 
 /// 应用通用 SQLite 数据库需要执行的 migration，顺序即项目级 schema 初始化顺序。
 ///
 /// 这里聚合各业务模块暴露的 migration，不复制业务 SQL，避免通用层反向承载表语义。
 pub const APP_MIGRATIONS: &[SqliteMigration] = &[
-    RSS_SCHEMA_V1,
+    RSS_SUBSCRIPTIONS_SCHEMA,
+    RSS_ITEM_STATES_SCHEMA,
+    RSS_LEGACY_SEEN_ITEMS_MIGRATION,
+    RSS_PENDING_REBASELINE_MIGRATION,
     TODO_SCHEMA_V1,
     SESSION_SCHEMA_V1,
     MEMORY_SCHEMA_V1,
@@ -46,11 +55,12 @@ mod tests {
                 "https://example.test/feed.xml",
                 "测试 Feed",
                 &[RssFeedItem {
-                    fingerprint: "baseline".to_owned(),
                     item_key: "baseline".to_owned(),
+                    revision_hash: "baseline-rev".to_owned(),
                     title: "基线条目".to_owned(),
                     link: Some("https://example.test/baseline".to_owned()),
                     published_at: None,
+                    updated_at: None,
                     summary: None,
                     source_order: 0,
                 }],

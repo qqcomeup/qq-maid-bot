@@ -233,7 +233,7 @@ fn parse_add_argument(argument: &str) -> Option<(String, Option<String>)> {
     if url.is_empty() {
         return None;
     }
-    let name = parts.next().and_then(clean_optional);
+    let name = parts.next().and_then(clean_display_optional);
     Some((url.to_owned(), name))
 }
 
@@ -300,6 +300,18 @@ fn clean_optional(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_owned())
+    }
+}
+
+fn clean_display_optional(value: &str) -> Option<String> {
+    let value = clean_optional(value)?;
+    if matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "null" | "none" | "undefined"
+    ) {
+        None
+    } else {
+        Some(value)
     }
 }
 
