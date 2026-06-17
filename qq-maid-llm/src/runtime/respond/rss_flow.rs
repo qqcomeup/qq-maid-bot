@@ -10,6 +10,7 @@ use crate::{
         rss::{RssSubscription, RssTarget, RssTargetType, feed::RssFeedError},
         session::{SessionMeta, SessionRecord},
     },
+    util::time_context::format_rss_time_for_display,
 };
 
 use super::{
@@ -273,13 +274,21 @@ fn format_rss_list_reply(subscriptions: &[RssSubscription]) -> String {
         if subscription.last_checked_at.is_some() || subscription.last_error.is_some() {
             rows.push(format!(
                 "   最近检查：{}；错误：{}",
-                subscription.last_checked_at.as_deref().unwrap_or("未检查"),
+                format_rss_check_time(subscription.last_checked_at.as_deref()),
                 subscription.last_error.as_deref().unwrap_or("无")
             ));
         }
     }
     rows.push("操作：/rss add 地址 [名称]；/rss delete 1".to_owned());
     rows.join("\n")
+}
+
+fn format_rss_check_time(value: Option<&str>) -> String {
+    // RSS 检查时间在 SQLite 中保留 RFC3339；这里只做用户可读展示，不改变持久化语义。
+    value
+        .map(format_rss_time_for_display)
+        .filter(|display| !display.trim().is_empty())
+        .unwrap_or_else(|| "未检查".to_owned())
 }
 
 fn rss_usage() -> String {
@@ -355,5 +364,48 @@ mod tests {
             resolve_subscription_target(&subscriptions, "1").map(|item| item.id.as_str()),
             Some("sub-1")
         );
+    }
+
+    #[test]
+    fn rss_list_formats_check_time_for_display() {
+        let subscriptions = vec![
+            RssSubscription {
+                id: "sub-1".to_owned(),
+                target_type: RssTargetType::Group,
+                target_id: "g1".to_owned(),
+                scope_key: "group:g1".to_owned(),
+                url: "https://example.test/feed.xml".to_owned(),
+                title: "Feed".to_owned(),
+                enabled: true,
+                created_at: "2026-06-18T03:50:00+08:00".to_owned(),
+                last_checked_at: Some("2026-06-18T03:51:44+08:00".to_owned()),
+                last_success_at: None,
+                last_error: None,
+                consecutive_failures: 0,
+                initialized: true,
+            },
+            RssSubscription {
+                id: "sub-2".to_owned(),
+                target_type: RssTargetType::Group,
+                target_id: "g1".to_owned(),
+                scope_key: "group:g1".to_owned(),
+                url: "https://example.test/utc.xml".to_owned(),
+                title: "UTC Feed".to_owned(),
+                enabled: true,
+                created_at: "2026-06-18T03:50:00+08:00".to_owned(),
+                last_checked_at: Some("2026-06-17T19:51:44+00:00".to_owned()),
+                last_success_at: None,
+                last_error: Some("timeout".to_owned()),
+                consecutive_failures: 1,
+                initialized: true,
+            },
+        ];
+
+        let reply = format_rss_list_reply(&subscriptions);
+
+        assert!(reply.contains("最近检查：2026-06-18 03:51；错误：无"));
+        assert!(reply.contains("最近检查：2026-06-18 03:51；错误：timeout"));
+        assert!(!reply.contains("T03:51:44+08:00"));
+        assert!(!reply.contains("T19:51:44+00:00"));
     }
 }
