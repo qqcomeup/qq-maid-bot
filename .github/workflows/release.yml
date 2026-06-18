@@ -16,22 +16,109 @@ permissions:
 
 jobs:
   build-package:
-    name: Build Linux x86_64 package
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.target_triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_triple: linux-x86_64
+            build_target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_format: tar.gz
+            setup: native
+
+          - target_triple: linux-aarch64
+            build_target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_format: tar.gz
+            setup: linux-cross
+
+          - target_triple: windows-x86_64
+            build_target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_format: zip
+            setup: native
+
+          - target_triple: macos-x86_64
+            build_target: x86_64-apple-darwin
+            os: macos-13
+            archive_format: tar.gz
+            setup: native
+
+          - target_triple: macos-arm64
+            build_target: aarch64-apple-darwin
+            os: macos-latest
+            archive_format: tar.gz
+            setup: native
+
+          - target_triple: android-arm64-v8a
+            build_target: aarch64-linux-android
+            os: ubuntu-latest
+            archive_format: tar.gz
+            setup: android-ndk
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      # ---- Linux aarch64 交叉编译 toolchain ----
+      - name: Install Linux aarch64 cross toolchain
+        if: matrix.setup == 'linux-cross'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Add Linux aarch64 target
+        if: matrix.setup == 'linux-cross'
+        run: rustup target add "${{ matrix.build_target }}"
+
+      - name: Configure Linux aarch64 linker
+        if: matrix.setup == 'linux-cross'
+        run: |
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "${GITHUB_ENV}"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "${GITHUB_ENV}"
+
+      # ---- Android arm64-v8a NDK toolchain ----
+      - name: Install Android NDK
+        if: matrix.setup == 'android-ndk'
+        run: |
+          yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --install "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/27.0.12077973" >> "${GITHUB_ENV}"
+
+      - name: Add Android target
+        if: matrix.setup == 'android-ndk'
+        run: rustup target add "${{ matrix.build_target }}"
+
+      - name: Configure Android linker
+        if: matrix.setup == 'android-ndk'
+        run: |
+          TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TOOLCHAIN}/aarch64-linux-android24-clang" >> "${GITHUB_ENV}"
+          echo "CC_aarch64_linux_android=${TOOLCHAIN}/aarch64-linux-android24-clang" >> "${GITHUB_ENV}"
+          echo "CXX_aarch64_linux_android=${TOOLCHAIN}/aarch64-linux-android24-clang++" >> "${GITHUB_ENV}"
+          echo "AR_aarch64_linux_android=${TOOLCHAIN}/llvm-ar" >> "${GITHUB_ENV}"
+
+      # ---- Cargo 缓存 ----
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.build_target }}
 
+      # ---- 构建 ----
       - name: Build release binaries
-        run: cargo build --workspace --release --all-features
+        shell: bash
+        run: |
+          if [[ "${{ matrix.setup }}" == "native" ]]; then
+            cargo build --workspace --release --all-features
+          else
+            cargo build --workspace --release --all-features --target "${{ matrix.build_target }}"
+          fi
 
+      # ---- 版本号 ----
       - name: Select package version
         id: package
         shell: bash
@@ -43,16 +130,26 @@ jobs:
           fi
           printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
 
+      # ---- 打包 ----
       - name: Build runtime package
-        run: bash scripts/package-release.sh "${{ steps.package.outputs.version }}"
+        shell: bash
+        run: |
+          export TARGET_TRIPLE="${{ matrix.target_triple }}"
+          export ARCHIVE_FORMAT="${{ matrix.archive_format }}"
+          # 原生构建产物在 target/release/；交叉编译产物在 target/<triple>/release/。
+          if [[ "${{ matrix.setup }}" != "native" ]]; then
+            export BUILD_TARGET="${{ matrix.build_target }}"
+          fi
+          bash scripts/package-release.sh "${{ steps.package.outputs.version }}"
 
+      # ---- 上传 artifact ----
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
-          name: qq-maid-bot-${{ steps.package.outputs.version }}-linux-x86_64
+          name: qq-maid-bot-${{ steps.package.outputs.version }}-${{ matrix.target_triple }}
           path: |
-            dist/qq-maid-bot-${{ steps.package.outputs.version }}-linux-x86_64.tar.gz
-            dist/qq-maid-bot-${{ steps.package.outputs.version }}-linux-x86_64.tar.gz.sha256
+            dist/qq-maid-bot-${{ steps.package.outputs.version }}-${{ matrix.target_triple }}.${{ matrix.archive_format }}
+            dist/qq-maid-bot-${{ steps.package.outputs.version }}-${{ matrix.target_triple }}.${{ matrix.archive_format }}.sha256
           if-no-files-found: error
 
   publish-release:
@@ -64,8 +161,8 @@ jobs:
       contents: write
 
     steps:
-      - name: Download package artifact
-        uses: actions/download-artifact@v7
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -77,5 +174,7 @@ jobs:
           name: ${{ github.ref_name }}
           generate_release_notes: true
           files: |
-            dist/qq-maid-bot-${{ github.ref_name }}-linux-x86_64.tar.gz
-            dist/qq-maid-bot-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
+            dist/qq-maid-bot-${{ github.ref_name }}-*.tar.gz
+            dist/qq-maid-bot-${{ github.ref_name }}-*.tar.gz.sha256
+            dist/qq-maid-bot-${{ github.ref_name }}-*.zip
+            dist/qq-maid-bot-${{ github.ref_name }}-*.zip.sha256
