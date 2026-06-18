@@ -71,6 +71,8 @@ pub struct AppConfig {
     pub memory_model: Option<String>,
     /// 内部会话压缩使用的可选模型；未配置时沿用 LLM_MODEL。
     pub compact_model: Option<String>,
+    /// 翻译命令和 RSS 翻译使用的可选模型；未配置时沿用 LLM_MODEL。
+    pub translation_model: Option<String>,
     /// 联网搜索模型
     pub openai_search_model: String,
     /// OpenAI API 密钥
@@ -171,6 +173,7 @@ impl AppConfig {
             todo_model: env_optional("TODO_MODEL"),
             memory_model: env_optional("MEMORY_MODEL"),
             compact_model: env_optional("COMPACT_MODEL"),
+            translation_model: translation_model_from_env(),
             openai_search_model,
             openai_api_key: env_optional("OPENAI_API_KEY"),
             openai_base_url: openai_base_url_from_env(),
@@ -251,6 +254,11 @@ fn env_optional(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// 翻译命令和 RSS 翻译共用的模型配置；空值保持 None，由 provider 回退主模型。
+fn translation_model_from_env() -> Option<String> {
+    env_optional("TRANSLATION_MODEL")
 }
 
 /// 读取必选环境变量，缺失则返回配置错误。
@@ -458,10 +466,42 @@ mod tests {
     }
 
     #[test]
+    fn translation_model_from_env_trims_and_treats_empty_as_unset() {
+        let previous = env::var("TRANSLATION_MODEL").ok();
+        unsafe {
+            env::set_var("TRANSLATION_MODEL", "  deepseek:deepseek-chat  ");
+        }
+        assert_eq!(
+            translation_model_from_env().as_deref(),
+            Some("deepseek:deepseek-chat")
+        );
+
+        unsafe {
+            env::set_var("TRANSLATION_MODEL", "  ");
+        }
+        assert_eq!(translation_model_from_env(), None);
+
+        unsafe {
+            if let Some(value) = previous {
+                env::set_var("TRANSLATION_MODEL", value);
+            } else {
+                env::remove_var("TRANSLATION_MODEL");
+            }
+        }
+    }
+
+    #[test]
     fn env_example_documents_optional_world_file() {
         let env_example = include_str!("../../runtime/.env.example");
 
         assert!(env_example.contains("WORLD_FILE="));
+    }
+
+    #[test]
+    fn env_example_documents_translation_model() {
+        let env_example = include_str!("../../runtime/.env.example");
+
+        assert!(env_example.contains("TRANSLATION_MODEL="));
     }
 
     #[test]

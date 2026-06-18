@@ -68,6 +68,13 @@ pub(super) struct FailingQueryExecutor {
     pub(super) err: LlmError,
 }
 
+struct TestModelOptions {
+    todo_model: Option<String>,
+    memory_model: Option<String>,
+    compact_model: Option<String>,
+    translation_model: Option<String>,
+}
+
 impl MockProvider {
     pub(super) fn new() -> Self {
         Self {
@@ -236,6 +243,7 @@ impl LlmProvider for MockProvider {
             .find(|message| message.role == ChatRole::User)
             .map(|message| message.content.clone())
             .unwrap_or_default();
+        let metrics_model = req.model.clone().unwrap_or_else(|| "mock-model".to_owned());
         let reply = match req.metadata.get("purpose").map(String::as_str) {
             Some("todo_parse") => mock_todo_parse_reply(&last_user),
             Some("memory_draft") => mock_memory_draft_reply(
@@ -248,7 +256,7 @@ impl LlmProvider for MockProvider {
             reply,
             metrics: LlmMetrics {
                 provider: "mock".to_owned(),
-                model: "mock-model".to_owned(),
+                model: metrics_model,
                 stream: false,
                 ttfe_ms: None,
                 ttft_ms: None,
@@ -844,6 +852,46 @@ pub(super) fn test_service_with_provider_base_title_query_and_models(
     memory_model: Option<String>,
     compact_model: Option<String>,
 ) -> (RustRespondService, PathBuf) {
+    test_service_with_provider_base_title_query_weather_and_models(
+        provider,
+        title_model,
+        query_executor,
+        weather_executor,
+        TestModelOptions {
+            todo_model,
+            memory_model,
+            compact_model,
+            translation_model: None,
+        },
+    )
+}
+
+pub(super) fn test_service_with_translation_model(
+    provider: MockProvider,
+    translation_model: Option<String>,
+) -> RustRespondService {
+    test_service_with_provider_base_title_query_weather_and_models(
+        provider,
+        None,
+        Arc::new(MockQueryExecutor),
+        Arc::new(MockWeatherExecutor::new()),
+        TestModelOptions {
+            todo_model: None,
+            memory_model: None,
+            compact_model: None,
+            translation_model,
+        },
+    )
+    .0
+}
+
+fn test_service_with_provider_base_title_query_weather_and_models(
+    provider: MockProvider,
+    title_model: Option<String>,
+    query_executor: Arc<dyn QueryExecutor>,
+    weather_executor: Arc<dyn WeatherExecutor>,
+    models: TestModelOptions,
+) -> (RustRespondService, PathBuf) {
     let base = std::env::temp_dir().join(format!("qq-maid-respond-{}", Uuid::new_v4()));
     let prompt_dir = base.join("prompts");
     write_prompt_set(&prompt_dir);
@@ -872,9 +920,10 @@ pub(super) fn test_service_with_provider_base_title_query_and_models(
         PromptConfig::new(prompt_dir, mapping_file),
         RespondServiceOptions {
             title_model,
-            todo_model,
-            memory_model,
-            compact_model,
+            todo_model: models.todo_model,
+            memory_model: models.memory_model,
+            compact_model: models.compact_model,
+            translation_model: models.translation_model,
             send_mode: "final".to_owned(),
             rss_summary_max_chars: DEFAULT_RSS_SUMMARY_MAX_CHARS as usize,
             rss_seen_retention: 500,

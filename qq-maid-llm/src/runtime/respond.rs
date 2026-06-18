@@ -14,6 +14,7 @@ use crate::{
         rss::{RssFetcher, RssStore},
         session::{SessionMeta, SessionStore},
         todo::TodoStore,
+        translation::TranslationService,
         weather::DynWeatherExecutor,
     },
 };
@@ -67,6 +68,8 @@ pub struct RespondServiceOptions {
     pub memory_model: Option<String>,
     /// 上下文压缩专用模型（可选）
     pub compact_model: Option<String>,
+    /// 翻译专用模型（可选）；未配置时沿用主 provider 模型。
+    pub translation_model: Option<String>,
     /// HTTP 输出模式（final / streaming）
     pub send_mode: String,
     /// RSS 摘要最大字符数
@@ -97,6 +100,8 @@ pub struct RustRespondService {
     rss_store: RssStore,
     /// RSS / Atom 拉取解析器
     rss_fetcher: RssFetcher,
+    /// 共享翻译执行器；命令和 RSS 共用同一套 provider 调用逻辑。
+    translation_service: TranslationService,
     /// 系统提示词配置
     prompt_config: PromptConfig,
     /// 标题自动生成专用模型名（若指定则覆盖默认模型）
@@ -128,6 +133,8 @@ impl RustRespondService {
         prompt_config: PromptConfig,
         options: RespondServiceOptions,
     ) -> Self {
+        let translation_service =
+            TranslationService::new(provider.clone(), options.translation_model);
         Self {
             provider,
             query_executor,
@@ -137,6 +144,7 @@ impl RustRespondService {
             todo_store: stores.todo_store,
             rss_store: stores.rss_store,
             rss_fetcher,
+            translation_service,
             prompt_config,
             title_model: options.title_model,
             todo_model: options.todo_model,

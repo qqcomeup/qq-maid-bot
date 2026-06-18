@@ -85,7 +85,7 @@ APP_DB_FILE=/opt/qqbot/data/app.db
 
 ### `config/.env` / `.env`
 
-全局环境变量。控制 QQ Bot SDK 参数、LLM 供应商（OpenAI / DeepSeek）、LLM 服务监听地址、超时和外部配置路径等。首次配置推荐从仓库根目录执行：
+全局环境变量。控制 QQ Bot SDK 参数、LLM 供应商（OpenAI / DeepSeek）、主模型、内部任务模型（含翻译模型）、LLM 服务监听地址、超时和外部配置路径等。首次配置推荐从仓库根目录执行：
 
 ```bash
 cp runtime/.env.example runtime/config/.env

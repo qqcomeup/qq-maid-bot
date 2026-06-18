@@ -12,4 +12,5 @@ pub mod respond;
 pub mod rss;
 pub mod session;
 pub mod todo;
+pub mod translation;
 pub mod weather;

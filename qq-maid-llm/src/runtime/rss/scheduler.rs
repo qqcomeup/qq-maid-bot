@@ -3,13 +3,17 @@
 //! 调度器只启动一个循环，逐个处理启用中的订阅，避免同一订阅并发拉取。
 //! 网络请求不在 SQLite 锁内执行；发送成功后才写入 pushed_at。
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use sha2::{Digest, Sha256};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{debug, info, warn};
 
 use crate::{
+    runtime::translation::{
+        TRANSLATION_SOURCE_MAX_LENGTH, TranslationPurpose, TranslationRequest, TranslationService,
+        looks_like_chinese_text,
+    },
     storage::rss::{RssPendingItem, RssStore, RssSubscription, RssTarget},
     util::time_context::format_rss_time_for_display,
 };
@@ -30,11 +34,12 @@ pub struct RssSchedulerConfig {
     pub push_message_type: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RssScheduler {
     store: RssStore,
     fetcher: RssFetcher,
     push_client: RssPushClient,
+    translation_service: TranslationService,
     config: RssSchedulerConfig,
 }
 
@@ -43,12 +48,14 @@ impl RssScheduler {
         store: RssStore,
         fetcher: RssFetcher,
         push_client: RssPushClient,
+        translation_service: TranslationService,
         config: RssSchedulerConfig,
     ) -> Self {
         Self {
             store,
             fetcher,
             push_client,
+            translation_service,
             config,
         }
     }
@@ -186,8 +193,9 @@ impl RssScheduler {
             target_id: subscription.target_id.clone(),
             scope_key: subscription.scope_key.clone(),
         };
-        let fallback_text = format_push_message(&subscription.title, item);
-        let markdown_text = format_push_markdown(&subscription.title, item);
+        let display_item = self.translate_item_for_push(subscription, item).await;
+        let fallback_text = format_push_message(&subscription.title, &display_item);
+        let markdown_text = format_push_markdown(&subscription.title, &display_item);
         let message_type = self.config.push_message_type.trim();
         let (message_type, text) = if message_type.eq_ignore_ascii_case("markdown") {
             ("markdown", markdown_text.as_str())
@@ -237,6 +245,113 @@ impl RssScheduler {
                         "failed to persist RSS push failure"
                     );
                 }
+            }
+        }
+    }
+
+    async fn translate_item_for_push(
+        &self,
+        subscription: &RssSubscription,
+        item: &RssPendingItem,
+    ) -> RssPendingItem {
+        let mut display_item = item.clone();
+        display_item.title = self
+            .translate_rss_field(
+                subscription,
+                item,
+                "title",
+                &item.title,
+                TranslationPurpose::RssTitle,
+            )
+            .await;
+        if let Some(summary) = item.summary.as_deref() {
+            display_item.summary = Some(
+                self.translate_rss_field(
+                    subscription,
+                    item,
+                    "summary",
+                    summary,
+                    TranslationPurpose::RssSummary,
+                )
+                .await,
+            );
+        }
+        display_item
+    }
+
+    async fn translate_rss_field(
+        &self,
+        subscription: &RssSubscription,
+        item: &RssPendingItem,
+        field: &'static str,
+        source_text: &str,
+        purpose: TranslationPurpose,
+    ) -> String {
+        let source_text = source_text.trim();
+        if source_text.is_empty() {
+            return String::new();
+        }
+        if looks_like_chinese_text(source_text) {
+            return source_text.to_owned();
+        }
+        let source_chars = source_text.chars().count();
+        if source_chars > TRANSLATION_SOURCE_MAX_LENGTH {
+            warn!(
+                subscription_id = %short_id(&subscription.id),
+                item = %short_id(&item.item_key),
+                field,
+                translation_provider = self.translation_service.provider_name(),
+                translation_model = %self.translation_service.model_for_log(),
+                error_code = "translation_input_too_long",
+                error_stage = "translation",
+                source_chars,
+                "RSS translation failed, falling back to original text"
+            );
+            return source_text.to_owned();
+        }
+
+        // RSS 翻译只影响本次展示副本，不能写回 item_key、revision_hash 或数据库字段，
+        // 避免模型输出变化影响去重和 pending 状态。
+        let metadata = HashMap::from([
+            ("rss_subscription_id".to_owned(), short_id(&subscription.id)),
+            ("rss_item_key".to_owned(), short_id(&item.item_key)),
+            ("rss_field".to_owned(), field.to_owned()),
+        ]);
+        let request = TranslationRequest {
+            session_id: format!(
+                "rss:{}:{}",
+                short_id(&subscription.id),
+                short_id(&item.item_key)
+            ),
+            source_text: source_text.to_owned(),
+            target_language: "简体中文".to_owned(),
+            purpose,
+            metadata,
+        };
+        match self.translation_service.translate(request).await {
+            Ok(outcome) => {
+                debug!(
+                    subscription_id = %short_id(&subscription.id),
+                    item = %short_id(&item.item_key),
+                    field,
+                    translation_provider = %outcome.provider,
+                    translation_model = %outcome.model,
+                    "RSS translation succeeded"
+                );
+                outcome.translated_text
+            }
+            Err(err) => {
+                warn!(
+                    subscription_id = %short_id(&subscription.id),
+                    item = %short_id(&item.item_key),
+                    field,
+                    translation_provider = self.translation_service.provider_name(),
+                    translation_model = %self.translation_service.model_for_log(),
+                    error_code = err.code,
+                    error_stage = err.stage,
+                    "RSS translation failed, falling back to original text"
+                );
+                source_text.to_owned()
             }
         }
     }
@@ -342,6 +457,302 @@ fn short_id(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+    };
+
+    use async_trait::async_trait;
+
+    use crate::{
+        error::LlmError,
+        provider::{
+            ChatOutcome, LlmProvider,
+            types::{ChatRequest, TokenUsage},
+        },
+        runtime::rss::RssFetchConfig,
+        storage::{
+            APP_MIGRATIONS,
+            database::SqliteDatabase,
+            rss::{RssFeedItem, RssTargetType},
+        },
+        util::metrics::LlmMetrics,
+    };
+
+    #[derive(Clone)]
+    struct MockTranslationProvider {
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
+        replies: Arc<Mutex<Vec<Result<String, LlmError>>>>,
+    }
+
+    impl MockTranslationProvider {
+        fn new(replies: Vec<Result<&str, LlmError>>) -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                replies: Arc::new(Mutex::new(
+                    replies
+                        .into_iter()
+                        .map(|result| result.map(str::to_owned))
+                        .collect(),
+                )),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockTranslationProvider {
+        async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(req.clone());
+            let reply = self.replies.lock().unwrap().remove(0)?;
+            Ok(ChatOutcome {
+                reply,
+                metrics: LlmMetrics {
+                    provider: "mock".to_owned(),
+                    model: req
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| "mock-main-model".to_owned()),
+                    stream: false,
+                    ttfe_ms: None,
+                    ttft_ms: None,
+                    total_latency_ms: 1,
+                },
+                usage: Some(TokenUsage {
+                    input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: None,
+                }),
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn model(&self) -> &str {
+            "mock-main-model"
+        }
+
+        fn stream_enabled(&self) -> bool {
+            false
+        }
+    }
+
+    fn test_scheduler(provider: MockTranslationProvider) -> RssScheduler {
+        let database = SqliteDatabase::open(
+            std::env::temp_dir().join(format!("qq-maid-rss-scheduler-{}.db", uuid::Uuid::new_v4())),
+            APP_MIGRATIONS,
+        )
+        .unwrap();
+        RssScheduler::new(
+            RssStore::new(database),
+            RssFetcher::new(RssFetchConfig::default()).unwrap(),
+            RssPushClient::new("http://127.0.0.1:9/internal/push", None, 1).unwrap(),
+            TranslationService::new(
+                Arc::new(provider),
+                Some("openai:translation-model".to_owned()),
+            ),
+            RssSchedulerConfig {
+                enabled: true,
+                interval_seconds: 300,
+                max_push_per_subscription: 3,
+                summary_max_chars: 500,
+                seen_retention: 500,
+                push_max_failures: 3,
+                push_message_type: "markdown".to_owned(),
+            },
+        )
+    }
+
+    fn pending_item(title: &str, summary: Option<&str>) -> RssPendingItem {
+        RssPendingItem {
+            subscription_id: "s1".to_owned(),
+            item_key: "key:stable".to_owned(),
+            revision_hash: "rev:stable".to_owned(),
+            title: title.to_owned(),
+            link: Some("https://example.test/a".to_owned()),
+            published_at: None,
+            updated_at: None,
+            summary: summary.map(str::to_owned),
+            failed_count: 0,
+        }
+    }
+
+    fn subscription() -> RssSubscription {
+        RssSubscription {
+            id: "s1".to_owned(),
+            target_type: RssTargetType::Group,
+            target_id: "g1".to_owned(),
+            scope_key: "group:g1".to_owned(),
+            url: "https://example.test/feed.xml".to_owned(),
+            title: "订阅".to_owned(),
+            enabled: true,
+            created_at: "2026-06-18T00:00:00+08:00".to_owned(),
+            last_checked_at: None,
+            last_success_at: None,
+            last_error: None,
+            consecutive_failures: 0,
+            initialized: true,
+        }
+    }
+
+    fn spawn_push_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://{addr}/internal/push")
+    }
+
+    #[tokio::test]
+    async fn rss_translation_success_uses_display_copy_only() {
+        let provider = MockTranslationProvider::new(vec![Ok("中文标题"), Ok("中文摘要")]);
+        let scheduler = test_scheduler(provider.clone());
+        let item = pending_item("English title", Some("English summary"));
+
+        let translated = scheduler
+            .translate_item_for_push(&subscription(), &item)
+            .await;
+
+        assert_eq!(translated.title, "中文标题");
+        assert_eq!(translated.summary.as_deref(), Some("中文摘要"));
+        assert_eq!(translated.item_key, item.item_key);
+        assert_eq!(translated.revision_hash, item.revision_hash);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].metadata["translation_purpose"], "rss_title");
+        assert_eq!(requests[1].metadata["translation_purpose"], "rss_summary");
+        assert_eq!(
+            requests[0].model.as_deref(),
+            Some("openai:translation-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn rss_translation_falls_back_per_field() {
+        let provider = MockTranslationProvider::new(vec![
+            Ok("中文标题"),
+            Err(LlmError::timeout("translation")),
+        ]);
+        let scheduler = test_scheduler(provider);
+        let item = pending_item("English title", Some("English summary"));
+
+        let translated = scheduler
+            .translate_item_for_push(&subscription(), &item)
+            .await;
+
+        assert_eq!(translated.title, "中文标题");
+        assert_eq!(translated.summary.as_deref(), Some("English summary"));
+    }
+
+    #[tokio::test]
+    async fn rss_chinese_title_and_summary_skip_translation_model() {
+        let provider = MockTranslationProvider::new(Vec::new());
+        let scheduler = test_scheduler(provider.clone());
+        let item = pending_item("中文标题", Some("这是一段中文摘要"));
+
+        let translated = scheduler
+            .translate_item_for_push(&subscription(), &item)
+            .await;
+
+        assert_eq!(translated.title, "中文标题");
+        assert_eq!(translated.summary.as_deref(), Some("这是一段中文摘要"));
+        assert_eq!(provider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn rss_translation_failure_still_pushes_and_marks_pushed() {
+        let provider = MockTranslationProvider::new(vec![
+            Err(LlmError::provider("boom", "translation")),
+            Err(LlmError::provider("boom", "translation")),
+        ]);
+        let database = SqliteDatabase::open(
+            std::env::temp_dir().join(format!("qq-maid-rss-push-{}.db", uuid::Uuid::new_v4())),
+            APP_MIGRATIONS,
+        )
+        .unwrap();
+        let store = RssStore::new(database);
+        let target = RssTarget {
+            target_type: RssTargetType::Group,
+            target_id: "g1".to_owned(),
+            scope_key: "group:g1".to_owned(),
+        };
+        let subscription = store
+            .create_subscription(&target, "https://example.test/feed.xml", "订阅", &[], 500)
+            .unwrap();
+        let feed_item = RssFeedItem {
+            item_key: "key:stable".to_owned(),
+            revision_hash: "rev:stable".to_owned(),
+            title: "English title".to_owned(),
+            link: Some("https://example.test/a".to_owned()),
+            published_at: None,
+            updated_at: None,
+            summary: Some("English summary".to_owned()),
+            source_order: 0,
+        };
+        assert_eq!(
+            store
+                .enqueue_items(&subscription.id, &[feed_item], 500)
+                .unwrap(),
+            1
+        );
+        let item = store
+            .pending_items(&subscription.id, 10, 3)
+            .unwrap()
+            .remove(0);
+        let scheduler = RssScheduler::new(
+            store.clone(),
+            RssFetcher::new(RssFetchConfig::default()).unwrap(),
+            RssPushClient::new(spawn_push_server(), None, 5).unwrap(),
+            TranslationService::new(Arc::new(provider), None),
+            RssSchedulerConfig {
+                enabled: true,
+                interval_seconds: 300,
+                max_push_per_subscription: 3,
+                summary_max_chars: 500,
+                seen_retention: 500,
+                push_max_failures: 3,
+                push_message_type: "text".to_owned(),
+            },
+        );
+
+        scheduler.push_item(&subscription, &item).await;
+
+        assert!(
+            store
+                .pending_items(&subscription.id, 10, 3)
+                .unwrap()
+                .is_empty()
+        );
+        let stored = store
+            .seen_item(&subscription.id, "key:stable")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.failed_count, 0);
+    }
 
     #[test]
     fn push_message_omits_empty_summary() {

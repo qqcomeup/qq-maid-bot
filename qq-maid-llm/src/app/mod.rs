@@ -19,6 +19,7 @@ use crate::{
         },
         session::SessionStore,
         todo::TodoStore,
+        translation::TranslationService,
         weather::build_weather_executor,
     },
     storage::{APP_MIGRATIONS, database::SqliteDatabase},
@@ -42,6 +43,8 @@ pub async fn run() -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
     let addr: SocketAddr = format!("{}:{}", config.server_host, config.server_port).parse()?;
     let provider = build_provider(&config)?;
+    let translation_service =
+        TranslationService::new(provider.clone(), config.translation_model.clone());
     let query_executor = build_query_executor(&config)?;
     let weather_executor = build_weather_executor(&config)?;
     // 通用数据库在应用启动阶段统一打开并执行项目级 migration；
@@ -73,6 +76,7 @@ pub async fn run() -> anyhow::Result<()> {
             rss_store.clone(),
             rss_fetcher.clone(),
             rss_push_client,
+            translation_service,
             RssSchedulerConfig {
                 enabled: config.rss_enabled,
                 interval_seconds: config.rss_poll_interval_seconds,

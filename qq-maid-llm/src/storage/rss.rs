@@ -1058,7 +1058,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .enqueue_items(&sub.id, &[updated.clone()], 50)
+                .enqueue_items(&sub.id, std::slice::from_ref(&updated), 50)
                 .unwrap(),
             1
         );
