@@ -1,5 +1,8 @@
 # QQ Maid Bot
 
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-blue.svg)](CONTRIBUTING.md)
+[![Stars](https://img.shields.io/github/stars/kuliantnt/qq-maid-bot?style=social)](https://github.com/kuliantnt/qq-maid-bot/stargazers)
+
 一个使用 Rust 构建的 QQ 官方 AI 机器人，集成聊天、会话、长期记忆、待办、RSS / Atom 订阅、查询、天气和主动推送能力，适合搭建属于自己的长期在线 QQ 助手。
 
 ## 项目状态
@@ -154,6 +157,12 @@ make run
 - 改善配置体验和排障提示。
 - 增加更多通用机器人能力。
 - 持续移除私人场景耦合，提高项目通用性。
+
+## ⭐ Star History
+
+如果喜欢这个项目，请给个 Star ⭐
+
+[![Star History Chart](https://api.star-history.com/svg?repos=kuliantnt/qq-maid-bot&type=Date)](https://star-history.com/#kuliantnt/qq-maid-bot&Date)
 
 ## 文档导航
 
