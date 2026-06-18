@@ -33,7 +33,8 @@ use crate::{
     },
     auth::AccessTokenManager,
     config::AppConfig,
-    render::render_respond_response,
+    markdown::MarkdownPayload,
+    render::{OutboundMessage, render_respond_response},
     respond::{
         RespondClient, RespondResponse, RespondStream, RespondStreamEvent, RespondTransport,
         build_group_respond_content, build_respond_content, respond_error_to_qq_text,
@@ -594,20 +595,27 @@ async fn handle_c2c_message(
             user_openid: message.user_openid,
             msg_id: Some(message.message_id),
         };
+        let outbound = render_local_ping_reply(reply, config.enable_markdown);
         debug!(
             message_id = target.msg_id.as_deref().unwrap_or(""),
             user = %mask_openid(&target.user_openid),
-            reply_len = reply.chars().count(),
+            reply_len = outbound.fallback_text().chars().count(),
             "preparing local /ping reply"
         );
-        send_c2c_text_with_status(
-            api,
+        let sender = RuntimeRecordingSender {
+            inner: api,
             runtime,
-            &target.user_openid,
-            target.msg_id.as_deref(),
-            &reply,
-        )
-        .await?;
+        };
+        send_outbound_with_fallback(&sender, &target, &outbound)
+            .await
+            .inspect_err(|err| {
+                warn!(
+                    message_id = target.msg_id.as_deref().unwrap_or(""),
+                    user = %mask_openid(&target.user_openid),
+                    error = %err.log_summary(),
+                    "local /ping QQ reply send failed"
+                );
+            })?;
         return Ok(());
     }
 
@@ -731,6 +739,18 @@ async fn handle_c2c_message(
         }
     }
     Ok(())
+}
+
+fn render_local_ping_reply(reply: String, enable_markdown: bool) -> OutboundMessage {
+    if enable_markdown {
+        // `/ping` 本地生成的状态报告本身就是 Markdown；发送层复用现有 fallback，
+        // 避免 QQ Markdown 权限或平台兼容问题导致诊断消息完全丢失。
+        return OutboundMessage::Markdown {
+            markdown: MarkdownPayload::new(reply.clone()),
+            fallback_text: reply,
+        };
+    }
+    OutboundMessage::Text { text: reply }
 }
 
 async fn handle_streaming_respond_response(
@@ -1127,6 +1147,26 @@ mod tests {
             .expect("buffered response");
 
         assert_eq!(buffered.text.as_deref(), Some("我会按北京时间整理今天新闻"));
+    }
+
+    #[test]
+    fn local_ping_reply_respects_markdown_config() {
+        let markdown = render_local_ping_reply("# 状态\n\n| A | B |".to_owned(), true);
+        assert_eq!(
+            markdown,
+            OutboundMessage::Markdown {
+                markdown: MarkdownPayload::new("# 状态\n\n| A | B |"),
+                fallback_text: "# 状态\n\n| A | B |".to_owned(),
+            }
+        );
+
+        let text = render_local_ping_reply("# 状态".to_owned(), false);
+        assert_eq!(
+            text,
+            OutboundMessage::Text {
+                text: "# 状态".to_owned(),
+            }
+        );
     }
 
     #[test]

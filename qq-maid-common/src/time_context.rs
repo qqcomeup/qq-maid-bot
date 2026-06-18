@@ -253,17 +253,166 @@ pub fn format_diagnostic_time_for_display(value: &str) -> String {
         .to_owned()
 }
 
+/// 格式化诊断时间给默认用户视图使用，不展示 Unix 秒。
+///
+/// `/ping` 默认主视图应优先可读，Unix 秒只保留给 `/ping all` 调试详情。
+pub fn format_diagnostic_time_without_unix_for_display(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return value.to_owned();
+    }
+    if let Some(seconds) = parse_unix_seconds_marker(value) {
+        return format_unix_seconds_without_marker(seconds)
+            .unwrap_or_else(|| format!("unix:{seconds}"));
+    }
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+        return format_datetime_with_offset(datetime.with_timezone(&shanghai_offset()));
+    }
+    if let Some(datetime) = parse_naive_local_datetime(value) {
+        return format!("{} +08:00", datetime.format("%Y-%m-%d %H:%M:%S"));
+    }
+    value
+        .replace('T', " ")
+        .trim_end_matches("+08:00")
+        .to_owned()
+}
+
+/// 格式化诊断事件的时分秒，用于 `/ping` 最近事件列表。
+pub fn format_diagnostic_clock_time_for_display(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return value.to_owned();
+    }
+    if let Some(seconds) = diagnostic_time_unix_seconds(value)
+        && let Some(datetime) = shanghai_datetime_from_unix_seconds(seconds)
+    {
+        return datetime.format("%H:%M:%S").to_string();
+    }
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+        return datetime
+            .with_timezone(&shanghai_offset())
+            .format("%H:%M:%S")
+            .to_string();
+    }
+    if let Some(datetime) = parse_naive_local_datetime(value) {
+        return datetime.format("%H:%M:%S").to_string();
+    }
+    format_diagnostic_time_without_unix_for_display(value)
+}
+
+/// 将诊断时间解析为 Unix 秒，供状态新旧关系和相对时间判断使用。
+pub fn diagnostic_time_unix_seconds(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if let Some(seconds) = parse_unix_seconds_marker(value) {
+        return Some(seconds);
+    }
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+        return Some(datetime.timestamp());
+    }
+    parse_naive_local_datetime(value).and_then(|datetime| {
+        shanghai_offset()
+            .from_local_datetime(&datetime)
+            .single()
+            .map(|datetime| datetime.timestamp())
+    })
+}
+
+/// 格式化紧凑时长，例如 `4小时26分钟`，用于 `/ping` 运行时长和恢复耗时。
+pub fn format_duration_for_display(duration: StdDuration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        return format!("{seconds}秒");
+    }
+
+    let minutes = seconds / 60;
+    let seconds_remainder = seconds % 60;
+    if minutes < 60 {
+        return if seconds_remainder == 0 {
+            format!("{minutes}分钟")
+        } else {
+            format!("{minutes}分钟{seconds_remainder}秒")
+        };
+    }
+
+    let hours = minutes / 60;
+    let minutes_remainder = minutes % 60;
+    if hours < 24 {
+        return if minutes_remainder == 0 {
+            format!("{hours}小时")
+        } else {
+            format!("{hours}小时{minutes_remainder}分钟")
+        };
+    }
+
+    let days = hours / 24;
+    let hours_remainder = hours % 24;
+    if hours_remainder == 0 {
+        format!("{days}天")
+    } else {
+        format!("{days}天{hours_remainder}小时")
+    }
+}
+
+/// 基于当前时间输出诊断时间的相对描述，例如 `刚刚`、`30秒前`。
+pub fn format_diagnostic_time_ago_for_display(value: &str) -> Option<String> {
+    format_diagnostic_time_ago_for_display_at(value, Utc::now().timestamp())
+}
+
+/// 基于指定 Unix 秒输出诊断时间的相对描述，主要供测试和状态展示复用。
+pub fn format_diagnostic_time_ago_for_display_at(value: &str, now_seconds: i64) -> Option<String> {
+    let seconds = diagnostic_time_unix_seconds(value)?;
+    if now_seconds >= seconds {
+        let diff = now_seconds - seconds;
+        if diff < 5 {
+            return Some("刚刚".to_owned());
+        }
+        return Some(format!(
+            "{}前",
+            format_duration_for_display(StdDuration::from_secs(diff as u64))
+        ));
+    }
+
+    let future = seconds - now_seconds;
+    Some(format!(
+        "{}后",
+        format_duration_for_display(StdDuration::from_secs(future as u64))
+    ))
+}
+
+/// 计算两个诊断时间之间的耗时，无法解析或结束早于开始时返回 `None`。
+pub fn format_diagnostic_elapsed_between_for_display(start: &str, end: &str) -> Option<String> {
+    let start = diagnostic_time_unix_seconds(start)?;
+    let end = diagnostic_time_unix_seconds(end)?;
+    let elapsed = end.checked_sub(start)?;
+    if elapsed < 0 {
+        return None;
+    }
+    Some(format_duration_for_display(StdDuration::from_secs(
+        elapsed as u64,
+    )))
+}
+
 /// 格式化 Unix 秒为北京时间诊断文本。
 pub fn format_unix_seconds_for_display(seconds: i64) -> String {
+    format_unix_seconds_without_marker(seconds)
+        .map(|datetime| format!("{datetime} (unix:{seconds})"))
+        .unwrap_or_else(|| format!("unix:{seconds}"))
+}
+
+fn format_unix_seconds_without_marker(seconds: i64) -> Option<String> {
+    shanghai_datetime_from_unix_seconds(seconds).map(format_datetime_with_offset)
+}
+
+fn shanghai_datetime_from_unix_seconds(seconds: i64) -> Option<DateTime<FixedOffset>> {
     Utc.timestamp_opt(seconds, 0)
         .single()
-        .map(|datetime| {
-            format!(
-                "{} (unix:{seconds})",
-                format_datetime_with_offset(datetime.with_timezone(&shanghai_offset()))
-            )
-        })
-        .unwrap_or_else(|| format!("unix:{seconds}"))
+        .map(|datetime| datetime.with_timezone(&shanghai_offset()))
+}
+
+fn parse_unix_seconds_marker(value: &str) -> Option<i64> {
+    value
+        .strip_prefix("unix:")
+        .and_then(|seconds| seconds.parse::<i64>().ok())
 }
 
 /// 获取当前北京时间诊断文本，保留 Unix 秒便于和日志时间线对应。
@@ -276,16 +425,21 @@ pub fn now_diagnostic_time_for_display() -> String {
     )
 }
 
+/// 获取当前 Unix 秒，供需要和诊断时间标记比较的运行态展示逻辑使用。
+pub fn now_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(StdDuration::ZERO)
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
 /// 获取当前 Unix 秒标记，供运行时状态内部保存。
 ///
 /// 展示给用户前仍应调用 `format_diagnostic_time_for_display`，避免 `/ping`
 /// 直接输出裸 Unix 秒。
 pub fn now_unix_seconds_marker() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(StdDuration::ZERO)
-        .as_secs();
-    unix_seconds_marker(seconds)
+    unix_seconds_marker(now_unix_seconds() as u64)
 }
 
 /// 将 Unix 秒转成运行时状态使用的稳定标记格式。
@@ -860,6 +1014,46 @@ mod tests {
         assert_eq!(
             format_diagnostic_time_for_display("not-a-date"),
             "not-a-date"
+        );
+    }
+
+    #[test]
+    fn formats_ping_diagnostic_times_for_summary_view() {
+        assert_eq!(
+            format_diagnostic_time_without_unix_for_display("unix:1"),
+            "1970-01-01 08:00:01 +08:00"
+        );
+        assert_eq!(
+            format_diagnostic_clock_time_for_display("unix:1781726091"),
+            "03:54:51"
+        );
+        assert_eq!(
+            diagnostic_time_unix_seconds("2026-06-09T12:00:00+08:00"),
+            Some(1_780_977_600)
+        );
+        assert_eq!(
+            format_diagnostic_time_ago_for_display_at("unix:1000", 1000),
+            Some("刚刚".to_owned())
+        );
+        assert_eq!(
+            format_diagnostic_time_ago_for_display_at("unix:970", 1000),
+            Some("30秒前".to_owned())
+        );
+        assert_eq!(
+            format_diagnostic_time_ago_for_display_at("unix:700", 1000),
+            Some("5分钟前".to_owned())
+        );
+        assert_eq!(
+            format_diagnostic_time_ago_for_display_at("unix:1100", 1000),
+            Some("1分钟40秒后".to_owned())
+        );
+        assert_eq!(
+            format_diagnostic_elapsed_between_for_display("unix:1000", "unix:1005"),
+            Some("5秒".to_owned())
+        );
+        assert_eq!(
+            format_duration_for_display(StdDuration::from_secs(4 * 3600 + 26 * 60)),
+            "4小时26分钟"
         );
     }
 
