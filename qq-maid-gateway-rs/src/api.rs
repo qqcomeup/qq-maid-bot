@@ -98,6 +98,15 @@ pub trait OutboundSender: Send + Sync {
     ) -> SendFuture<'a>;
 }
 
+pub trait GroupOutboundSender: Send + Sync {
+    fn send_text<'a>(&'a self, target: &'a GroupReplyTarget, text: &'a str) -> SendFuture<'a>;
+    fn send_markdown<'a>(
+        &'a self,
+        target: &'a GroupReplyTarget,
+        markdown: &'a MarkdownPayload,
+    ) -> SendFuture<'a>;
+}
+
 impl QqApiClient {
     pub fn new(
         client: reqwest::Client,
@@ -386,6 +395,46 @@ pub async fn send_outbound_with_fallback<S: OutboundSender + ?Sized>(
     }
 }
 
+pub async fn send_group_outbound_with_fallback<S: GroupOutboundSender + ?Sized>(
+    sender: &S,
+    target: &GroupReplyTarget,
+    outbound: &OutboundMessage,
+) -> Result<(), ApiError> {
+    match outbound {
+        OutboundMessage::Text { text } => sender.send_text(target, text).await,
+        OutboundMessage::Markdown {
+            markdown,
+            fallback_text,
+        } => match sender.send_markdown(target, markdown).await {
+            Ok(()) => Ok(()),
+            Err(err) if !fallback_text.trim().is_empty() => {
+                warn!(
+                    group = %mask_openid(&target.group_openid),
+                    source_message_id = target.msg_id.as_deref().unwrap_or(""),
+                    error = %err.log_summary(),
+                    "group markdown send failed; falling back to text"
+                );
+                match sender.send_text(target, fallback_text).await {
+                    Ok(()) => Ok(()),
+                    Err(fallback_err) => {
+                        warn!(
+                            group = %mask_openid(&target.group_openid),
+                            source_message_id = target.msg_id.as_deref().unwrap_or(""),
+                            error = %fallback_err.log_summary(),
+                            "group markdown fallback text send failed"
+                        );
+                        Err(fallback_err)
+                    }
+                }
+            }
+            Err(err) => Err(err),
+        },
+        OutboundMessage::Image { fallback_text, .. } => {
+            sender.send_text(target, fallback_text).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -445,9 +494,39 @@ mod tests {
         }
     }
 
+    impl GroupOutboundSender for MockSender {
+        fn send_text<'a>(&'a self, _target: &'a GroupReplyTarget, text: &'a str) -> SendFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("group-text:{text}"));
+                Ok(())
+            })
+        }
+
+        fn send_markdown<'a>(
+            &'a self,
+            _target: &'a GroupReplyTarget,
+            _markdown: &'a MarkdownPayload,
+        ) -> SendFuture<'a> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("group-markdown".to_owned());
+                Err(ApiError::Unsupported("markdown"))
+            })
+        }
+    }
+
     fn target() -> C2cReplyTarget {
         C2cReplyTarget {
             user_openid: "user-1".to_owned(),
+            msg_id: Some("msg-1".to_owned()),
+        }
+    }
+
+    fn group_target() -> GroupReplyTarget {
+        GroupReplyTarget {
+            group_openid: "group-1".to_owned(),
             msg_id: Some("msg-1".to_owned()),
         }
     }
@@ -492,5 +571,18 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn group_markdown_send_failure_falls_back_to_text() {
+        let sender = MockSender::default();
+        let outbound = OutboundMessage::Markdown {
+            markdown: MarkdownPayload::new("# hello"),
+            fallback_text: "hello".to_owned(),
+        };
+        send_group_outbound_with_fallback(&sender, &group_target(), &outbound)
+            .await
+            .unwrap();
+        assert_eq!(sender.calls(), vec!["group-markdown", "group-text:hello"]);
     }
 }

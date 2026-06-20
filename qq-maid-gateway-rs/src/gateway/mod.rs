@@ -31,8 +31,8 @@ use self::{
 };
 use crate::{
     api::{
-        ApiError, C2cReplyTarget, OutboundSender, QqApiClient, SendFuture,
-        send_outbound_with_fallback,
+        ApiError, C2cReplyTarget, GroupOutboundSender, GroupReplyTarget, OutboundSender,
+        QqApiClient, SendFuture, send_group_outbound_with_fallback, send_outbound_with_fallback,
     },
     auth::AccessTokenManager,
     config::AppConfig,
@@ -518,14 +518,15 @@ async fn send_group_respond_response(
         );
         return Ok(());
     };
-    send_group_text_with_status(
-        api,
+    let sender = RuntimeRecordingGroupSender {
+        inner: api,
         runtime,
-        &message.group_openid,
-        Some(&message.message_id),
-        outbound.fallback_text(),
-    )
-    .await?;
+    };
+    let target = GroupReplyTarget {
+        group_openid: message.group_openid.clone(),
+        msg_id: Some(message.message_id.clone()),
+    };
+    send_group_outbound_with_fallback(&sender, &target, &outbound).await?;
     Ok(())
 }
 
@@ -980,6 +981,11 @@ struct RuntimeRecordingSender<'a> {
     runtime: &'a GatewayRuntimeStatus,
 }
 
+struct RuntimeRecordingGroupSender<'a> {
+    inner: &'a QqApiClient,
+    runtime: &'a GatewayRuntimeStatus,
+}
+
 impl OutboundSender for RuntimeRecordingSender<'_> {
     fn send_text<'a>(&'a self, target: &'a C2cReplyTarget, text: &'a str) -> SendFuture<'a> {
         Box::pin(async move {
@@ -1016,6 +1022,34 @@ impl OutboundSender for RuntimeRecordingSender<'_> {
             let result = self
                 .inner
                 .send_c2c_image(&target.user_openid, target.msg_id.as_deref(), image)
+                .await;
+            record_qq_send_result(self.runtime, &result);
+            result
+        })
+    }
+}
+
+impl GroupOutboundSender for RuntimeRecordingGroupSender<'_> {
+    fn send_text<'a>(&'a self, target: &'a GroupReplyTarget, text: &'a str) -> SendFuture<'a> {
+        Box::pin(async move {
+            let result = self
+                .inner
+                .send_group_text(&target.group_openid, target.msg_id.as_deref(), text)
+                .await;
+            record_qq_send_result(self.runtime, &result);
+            result
+        })
+    }
+
+    fn send_markdown<'a>(
+        &'a self,
+        target: &'a GroupReplyTarget,
+        markdown: &'a crate::markdown::MarkdownPayload,
+    ) -> SendFuture<'a> {
+        Box::pin(async move {
+            let result = self
+                .inner
+                .send_group_markdown(&target.group_openid, target.msg_id.as_deref(), markdown)
                 .await;
             record_qq_send_result(self.runtime, &result);
             result
@@ -1141,6 +1175,7 @@ mod tests {
         let response = RespondResponse {
             ok: true,
             text: Some("最终完整回复".to_owned()),
+            markdown: Some("# 最终完整回复".to_owned()),
             handled: Some(true),
             session_id: Some("sess-1".to_owned()),
             command: Some("web_search".to_owned()),
@@ -1152,6 +1187,7 @@ mod tests {
             build_streaming_buffered_response(&response, "中间增量").expect("buffered response");
 
         assert_eq!(buffered.text.as_deref(), Some("最终完整回复"));
+        assert_eq!(buffered.markdown.as_deref(), Some("# 最终完整回复"));
         assert_eq!(buffered.command.as_deref(), Some("web_search"));
     }
 
@@ -1160,6 +1196,7 @@ mod tests {
         let response = RespondResponse {
             ok: true,
             text: None,
+            markdown: Some("# 结构化最终回复".to_owned()),
             handled: Some(true),
             session_id: Some("sess-1".to_owned()),
             command: Some("web_search".to_owned()),
@@ -1171,6 +1208,7 @@ mod tests {
             .expect("buffered response");
 
         assert_eq!(buffered.text.as_deref(), Some("我会按北京时间整理今天新闻"));
+        assert_eq!(buffered.markdown.as_deref(), Some("# 结构化最终回复"));
     }
 
     #[test]

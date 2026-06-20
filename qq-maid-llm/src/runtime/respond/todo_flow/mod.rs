@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     RespondPurpose, RespondRequest, RespondResponse, RustRespondService,
-    common::{empty_respond_request, todo_error},
+    common::{CommandBody, empty_respond_request, todo_error},
     llm_service::{ChatService, LlmChatService},
 };
 
@@ -118,7 +118,10 @@ impl RustRespondService {
                 session.last_todo_query = None;
                 let argument = command.argument.trim();
                 if argument.is_empty() {
-                    ("用法：/todo add 待办内容".to_owned(), "todo_add".to_owned())
+                    (
+                        CommandBody::plain("用法：/todo add 待办内容"),
+                        "todo_add".to_owned(),
+                    )
                 } else {
                     match self.parse_todo_draft(argument, None).await? {
                         Ok(draft) => {
@@ -129,7 +132,7 @@ impl RustRespondService {
                             });
                             (format_todo_add_confirm(&draft), "todo_add".to_owned())
                         }
-                        Err(message) => (message, "todo_add".to_owned()),
+                        Err(message) => (CommandBody::plain(message), "todo_add".to_owned()),
                     }
                 }
             }
@@ -165,8 +168,9 @@ impl RustRespondService {
                         )?
                     } else {
                         (
-                            "用法：/todo delete 待办ID或关键词；清理已完成任务用 /todo delete done"
-                                .to_owned(),
+                            CommandBody::plain(
+                                "用法：/todo delete 待办ID或关键词；清理已完成任务用 /todo delete done",
+                            ),
                             "todo_delete".to_owned(),
                         )
                     }
@@ -218,7 +222,7 @@ impl RustRespondService {
                     return Ok(Some(self.append_pending_response(
                         session,
                         user_text,
-                        "用法：/todo edit 待办ID或关键词 新内容",
+                        CommandBody::plain("用法：/todo edit 待办ID或关键词 新内容"),
                         "todo_edit",
                     )?));
                 };
@@ -258,7 +262,7 @@ impl RustRespondService {
                                 "todo_edit".to_owned(),
                             )
                         }
-                        Err(message) => (message, "todo_edit".to_owned()),
+                        Err(message) => (CommandBody::plain(message), "todo_edit".to_owned()),
                     },
                     _ => {
                         let candidates = candidates.into_iter().take(5).collect::<Vec<_>>();
@@ -279,7 +283,7 @@ impl RustRespondService {
             _ => {
                 session.last_todo_query = None;
                 (
-                    "用法：/todo [list|all|add|done|undo|edit|delete|search]".to_owned(),
+                    CommandBody::plain("用法：/todo [list|all|add|done|undo|edit|delete|search]"),
                     command.action,
                 )
             }
@@ -300,7 +304,7 @@ impl RustRespondService {
         owner: &TodoOwner,
         action: PendingTodoAction,
         target: &str,
-    ) -> Result<(String, String), LlmError> {
+    ) -> Result<(CommandBody, String), LlmError> {
         let command = match &action {
             PendingTodoAction::Done => "todo_done",
             PendingTodoAction::Edit => "todo_edit",
@@ -394,14 +398,14 @@ impl RustRespondService {
         session: &mut SessionRecord,
         owner: &TodoOwner,
         argument: &str,
-    ) -> Result<(String, String), LlmError> {
+    ) -> Result<(CommandBody, String), LlmError> {
         let numbers = match parse_todo_number_list(argument) {
             Ok(numbers) => numbers,
-            Err(message) => return Ok((message, "todo_done".to_owned())),
+            Err(message) => return Ok((CommandBody::plain(message), "todo_done".to_owned())),
         };
         let Some(query) = valid_last_todo_list_query(session, owner) else {
             return Ok((
-                "请先发送 /todo 查看未完成待办。".to_owned(),
+                CommandBody::plain("请先发送 /todo 查看未完成待办。"),
                 "todo_done".to_owned(),
             ));
         };
@@ -450,14 +454,14 @@ impl RustRespondService {
         session: &mut SessionRecord,
         owner: &TodoOwner,
         argument: &str,
-    ) -> Result<(String, String), LlmError> {
+    ) -> Result<(CommandBody, String), LlmError> {
         let numbers = match parse_todo_number_list(argument) {
             Ok(numbers) => numbers,
-            Err(message) => return Ok((message, "todo_undo".to_owned())),
+            Err(message) => return Ok((CommandBody::plain(message), "todo_undo".to_owned())),
         };
         let Some(query) = valid_last_completed_todo_list_query(session, owner) else {
             return Ok((
-                "请先发送 /todo done 查看已完成待办。".to_owned(),
+                CommandBody::plain("请先发送 /todo done 查看已完成待办。"),
                 "todo_undo".to_owned(),
             ));
         };
@@ -507,7 +511,7 @@ impl RustRespondService {
         owner: &TodoOwner,
         item_ids: Vec<String>,
         source_condition: String,
-    ) -> Result<(String, String), LlmError> {
+    ) -> Result<(CommandBody, String), LlmError> {
         let items = self
             .todo_store
             .list_completed_by_ids(owner, &item_ids)
@@ -522,10 +526,10 @@ impl RustRespondService {
         owner: &TodoOwner,
         items: Vec<TodoItem>,
         source_condition: String,
-    ) -> Result<(String, String), LlmError> {
+    ) -> Result<(CommandBody, String), LlmError> {
         if items.is_empty() {
             return Ok((
-                "没有可删除的已完成待办。".to_owned(),
+                CommandBody::plain("没有可删除的已完成待办。"),
                 "todo_delete".to_owned(),
             ));
         }

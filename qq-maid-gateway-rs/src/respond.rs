@@ -51,6 +51,8 @@ pub struct RespondResponse {
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
+    pub markdown: Option<String>,
+    #[serde(default)]
     pub handled: Option<bool>,
     #[serde(default)]
     pub session_id: Option<String>,
@@ -494,6 +496,7 @@ async fn send_stream_final_error(event_tx: &mpsc::Sender<RespondStreamEvent>, me
     let response = RespondResponse {
         ok: false,
         text: None,
+        markdown: None,
         handled: Some(false),
         session_id: None,
         command: None,
@@ -895,6 +898,7 @@ mod tests {
             serde_json::json!({
                 "ok": true,
                 "text": "完成",
+                "markdown": "# 完成",
                 "handled": true,
                 "error": null,
             })
@@ -905,8 +909,78 @@ mod tests {
             ParsedSseEvent::Final(response) => {
                 assert!(response.ok);
                 assert_eq!(response.text.as_deref(), Some("完成"));
+                assert_eq!(response.markdown.as_deref(), Some("# 完成"));
             }
             ParsedSseEvent::Delta(_) => panic!("expected final event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn respond_c2c_preserves_markdown_field_from_json_response() {
+        let url = spawn_one_response_server(
+            "HTTP/1.1 200 OK
+Content-Type: application/json
+Connection: close
+
+{\"ok\":true,\"text\":\"标题\\n· hello\",\"markdown\":\"# 标题\\n- hello\",\"handled\":true}"
+                .as_bytes(),
+        );
+        let client = RespondClient::new(reqwest::Client::new(), url);
+        let message = C2cMessage {
+            message_id: "msg-1".to_owned(),
+            user_openid: "user-1".to_owned(),
+            content: "你好".to_owned(),
+            reply: None,
+            timestamp: None,
+            attachments: Vec::new(),
+        };
+
+        let response = client
+            .respond_c2c(&message, build_respond_content(&message))
+            .await
+            .unwrap();
+
+        match response {
+            RespondTransport::Json(response) => {
+                assert_eq!(response.text.as_deref(), Some("标题\n· hello"));
+                assert_eq!(response.markdown.as_deref(), Some("# 标题\n- hello"));
+            }
+            RespondTransport::Stream(_) => panic!("expected json response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn respond_group_preserves_markdown_field_from_json_response() {
+        let url = spawn_one_response_server(
+            "HTTP/1.1 200 OK
+Content-Type: application/json
+Connection: close
+
+{\"ok\":true,\"text\":\"标题\\n· hello\",\"markdown\":\"# 标题\\n- hello\",\"handled\":true}"
+                .as_bytes(),
+        );
+        let client = RespondClient::new(reqwest::Client::new(), url);
+        let message = GroupMessage {
+            message_id: "msg-1".to_owned(),
+            group_openid: "group-1".to_owned(),
+            member_openid: Some("user-1".to_owned()),
+            content: "你好".to_owned(),
+            reply: None,
+            timestamp: None,
+            attachments: Vec::new(),
+        };
+
+        let response = client
+            .respond_group(&message, build_group_respond_content(&message))
+            .await
+            .unwrap();
+
+        match response {
+            RespondTransport::Json(response) => {
+                assert_eq!(response.text.as_deref(), Some("标题\n· hello"));
+                assert_eq!(response.markdown.as_deref(), Some("# 标题\n- hello"));
+            }
+            RespondTransport::Stream(_) => panic!("expected json response"),
         }
     }
 
@@ -1015,6 +1089,7 @@ mod tests {
         let response = RespondResponse {
             ok: false,
             text: None,
+            markdown: None,
             handled: Some(false),
             session_id: None,
             command: None,
@@ -1041,6 +1116,7 @@ mod tests {
         let response = RespondResponse {
             ok: false,
             text: None,
+            markdown: None,
             handled: Some(false),
             session_id: None,
             command: None,
@@ -1063,6 +1139,7 @@ mod tests {
         let response = RespondResponse {
             ok: false,
             text: Some("internal debug text".to_owned()),
+            markdown: None,
             handled: Some(false),
             session_id: None,
             command: None,

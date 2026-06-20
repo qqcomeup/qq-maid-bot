@@ -244,6 +244,7 @@ async fn respond(
             Json(RespondResponse {
                 ok: false,
                 text: None,
+                markdown: None,
                 handled: Some(false),
                 session_id: None,
                 command: None,
@@ -265,6 +266,7 @@ async fn respond(
             Json(RespondResponse {
                 ok: false,
                 text: None,
+                markdown: None,
                 handled: Some(false),
                 session_id: None,
                 command: None,
@@ -815,6 +817,7 @@ mod tests {
 
         assert_eq!(json["ok"], true);
         assert_eq!(json["text"], "标题\n· hello");
+        assert_eq!(json["markdown"], "# 标题\n- hello");
         assert!(json.get("reply").is_none());
         assert!(json.get("raw_reply").is_none());
         assert!(json.get("deltas").is_none());
@@ -822,10 +825,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn respond_keeps_structured_markdown() -> Result<(), Infallible> {
+    async fn respond_keeps_chat_markdown_and_plaintext_fallback() -> Result<(), Infallible> {
         let json = post_json("/v1/respond", standard_qq_payload("给 codex")).await;
 
-        assert_eq!(json["text"], "# 标题\n- hello");
+        assert_eq!(json["text"], "标题\n· hello");
+        assert_eq!(json["markdown"], "# 标题\n- hello");
         assert!(json.get("reply").is_none());
         assert!(json.get("raw_reply").is_none());
         Ok(())
