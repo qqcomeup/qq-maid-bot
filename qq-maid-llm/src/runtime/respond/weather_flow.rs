@@ -3,6 +3,7 @@
 //! 调用天气执行器获取实时天气、预报和可选增强摘要，并格式化为回复文本。
 //! 同时处理找不到城市、超时、上游异常等错误场景。
 
+use chrono::{Datelike, NaiveDate, Weekday};
 use serde_json::{Value, json};
 
 use crate::{
@@ -15,14 +16,12 @@ use crate::{
             WeatherOutcome, WeatherRequest, WeatherSupplement, WeatherSupplementStatus,
         },
     },
-    util::time_context::{
-        format_local_date_with_weekday_for_display, format_local_time_for_display,
-    },
+    util::time_context::{format_local_time_for_display, local_date_from_timestamp},
 };
 
 use super::{
     RespondResponse, RustRespondService,
-    common::{command_response, session_error, truncate_chars},
+    common::{clean_string, command_response, session_error, truncate_chars},
 };
 
 // 城市名最大长度限制
@@ -44,6 +43,16 @@ const WEATHER_TIMEOUT_REPLY: &str = "【天气】
 const WEATHER_UPSTREAM_ERROR_REPLY: &str = "【天气】
 
 天气服务暂时不可用，可能是上游接口、代理或网络配置异常。请稍后再试。";
+// 天气回复整体字符上限，避免 QQ 聊天窗口被极长天气消息挤满。
+const WEATHER_REPLY_MAX_CHARS: usize = 1200;
+// 预警正文摘要的最大长度。标题和有效时间不截断，只压缩说明正文。
+const WEATHER_ALERT_SUMMARY_MAX_CHARS: usize = 80;
+// 当前天气里最多展示的生活指数条目数，保持移动端一屏可读。
+const WEATHER_LIFE_INDEX_MAX_ITEMS: usize = 4;
+// 生活指数单项值的截断长度，避免某个指数说明异常拉长整行。
+const WEATHER_LIFE_INDEX_VALUE_MAX_CHARS: usize = 18;
+// 当前展示保持最多两条预警，延续原先消息长度控制策略。
+const WEATHER_ALERT_MAX_ITEMS: usize = 2;
 
 impl RustRespondService {
     /// 处理天气查询指令的主入口。校验参数、调用天气执行器、格式化结果或错误回复。
@@ -197,140 +206,105 @@ pub(super) fn parse_weather_command(text: &str) -> Option<ParsedCommand> {
 
 /// 格式化天气预报回复文本，包含当前实况和未来多日预报。
 fn format_weather_reply(outcome: &WeatherOutcome) -> String {
-    let location = format_location(
+    let full_location = format_location(
         &outcome.location.name,
         outcome.location.admin2.as_deref(),
         outcome.location.admin1.as_deref(),
         outcome.location.country.as_deref(),
     );
-    let current = &outcome.current;
-    let current_extra = format_current_extra(current);
-    let mut lines = vec![
-        format!("【天气】{location}"),
-        format!(
-            "当前（{}）：{}，{}°C{}{}",
-            format_short_time(&current.time),
-            weather_code_label(current.weather_code),
-            format_number(current.temperature_c),
-            current
-                .apparent_temperature_c
-                .map(|value| format!("，体感 {}°C", format_number(value)))
-                .unwrap_or_default(),
-            if current_extra.is_empty() {
-                String::new()
-            } else {
-                format!("，{current_extra}")
-            }
-        ),
-    ];
-
-    append_alert_lines(&mut lines, &outcome.alerts);
-    if let Some(air_quality) = outcome.air_quality.data.as_ref() {
-        lines.push(format!("空气：{}", format_air_quality(air_quality)));
+    let title_location = outcome.location.name.trim();
+    let reference_date = weather_reference_date(outcome);
+    let mut lines = vec![format_weather_title(title_location, &full_location)];
+    if let Some(location_detail) = format_location_detail(title_location, &full_location) {
+        lines.push(format!("**{location_detail}**"));
     }
-    if let Some(indices) = outcome.life_indices.data.as_ref()
-        && let Some(summary) = format_life_indices(indices)
-    {
-        lines.push(format!("生活指数：{summary}"));
-    }
-
     lines.push(String::new());
-    lines.push(format!("今天起 {} 天：", outcome.forecast_days));
+    lines.extend(format_current_summary(
+        &outcome.current,
+        outcome.air_quality.data.as_ref(),
+    ));
 
-    for day in outcome.daily.iter().take(outcome.forecast_days as usize) {
+    if should_render_alerts(&outcome.alerts) {
+        lines.push(String::new());
+        lines.push("## ⚠️ 预警".to_owned());
+        lines.push(String::new());
+        append_alert_lines(&mut lines, &outcome.alerts, reference_date);
+    }
+
+    let displayed_days = outcome.daily.len().min(outcome.forecast_days as usize);
+    lines.push(String::new());
+    lines.push(format!("## 📅 未来 {} 天", displayed_days));
+    lines.push(String::new());
+    for day in outcome.daily.iter().take(displayed_days) {
         lines.push(format!(
-            "- {}：{}，{}-{}°C{}",
-            format_local_date_with_weekday_for_display(&day.date),
-            format_daily_weather_label(day),
-            format_number(day.temperature_min_c),
-            format_number(day.temperature_max_c),
-            format_daily_extra(day)
+            "- **{}**：{}",
+            format_forecast_day_label(&day.date, reference_date),
+            format_daily_summary(day)
         ));
     }
 
+    if let Some(indices) = outcome.life_indices.data.as_ref()
+        && let Some(summary) = format_life_indices(indices)
+    {
+        lines.push(String::new());
+        lines.push("## 🧭 生活指数".to_owned());
+        lines.push(String::new());
+        lines.push(summary);
+    }
+
     lines.push(String::new());
-    lines.push("来源：和风天气".to_owned());
-    truncate_chars(&lines.join("\n"), 1200)
+    lines.push("> 数据来源：和风天气".to_owned());
+    truncate_chars(&lines.join("\n"), WEATHER_REPLY_MAX_CHARS)
 }
 
-fn append_alert_lines(lines: &mut Vec<String>, alerts: &WeatherSupplement<Vec<WeatherAlert>>) {
-    match alerts.status {
-        WeatherSupplementStatus::Empty => lines.push("预警：无生效预警".to_owned()),
-        WeatherSupplementStatus::Available => {
-            if let Some(alerts) = alerts.data.as_ref() {
-                for alert in alerts.iter().take(2) {
-                    lines.push(format!("预警：{}", format_alert(alert)));
-                }
-            }
-        }
-        WeatherSupplementStatus::NotRequested | WeatherSupplementStatus::Failed => {}
-    }
+fn format_weather_title(name: &str, full_location: &str) -> String {
+    let name = name.trim();
+    let title = if name.is_empty() {
+        full_location.trim()
+    } else {
+        name
+    };
+    format!("# 🌦 {title}天气")
 }
 
-fn format_alert(alert: &WeatherAlert) -> String {
-    let mut label = alert.headline.clone();
-    let mut tags = Vec::new();
-    if let Some(event_name) = alert.event_name.as_deref() {
-        tags.push(event_name);
+fn format_location_detail(name: &str, full_location: &str) -> Option<String> {
+    let name = name.trim();
+    let full_location = full_location.trim();
+    if full_location.is_empty() || full_location == name {
+        return None;
     }
-    if let Some(color) = alert.color_code.as_deref() {
-        tags.push(color);
+
+    if let Some(rest) = full_location.strip_prefix(name) {
+        return clean_string(rest.trim_start_matches('，').to_owned());
     }
-    if !tags.is_empty() {
-        label.push_str(&format!("（{}）", tags.join("/")));
-    }
-    if let Some(description) = alert.description.as_deref() {
-        label.push_str(&format!("：{}", truncate_chars(description, 72)));
-    }
-    truncate_chars(&label, 120)
+    Some(full_location.to_owned())
 }
 
-fn format_air_quality(air_quality: &AirQualitySummary) -> String {
-    let mut label = String::new();
-    if let Some(name) = air_quality.name.as_deref() {
-        label.push_str(name);
-        label.push(' ');
+fn format_current_summary(
+    current: &crate::runtime::weather::CurrentWeather,
+    air_quality: Option<&AirQualitySummary>,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "**当前 {}｜{}｜{}°C**  ",
+        format_short_time(&current.time),
+        weather_code_label(current.weather_code),
+        format_number(current.temperature_c)
+    )];
+    let details = format_current_details(current);
+    if !details.is_empty() {
+        lines.push(format!("{details}  "));
     }
-    label.push_str(&air_quality.aqi_display);
-    if let Some(category) = air_quality.category.as_deref() {
-        label.push_str(&format!("（{category}）"));
-    } else if let Some(level) = air_quality.level.as_deref() {
-        label.push_str(&format!("（{level}级）"));
+    if let Some(air_quality) = air_quality {
+        lines.push(format!("空气质量：{}", format_air_quality(air_quality)));
     }
-    if let Some(pollutant) = air_quality.primary_pollutant.as_deref() {
-        label.push_str(&format!("，首要污染物 {pollutant}"));
-    }
-    label
+    lines
 }
 
-fn format_life_indices(indices: &[WeatherLifeIndex]) -> Option<String> {
-    let first_date = indices.first()?.date.as_str();
-    let parts = indices
-        .iter()
-        .filter(|index| index.date == first_date)
-        .take(4)
-        .filter_map(|index| {
-            let category = index
-                .category
-                .as_deref()
-                .or(index.level.as_deref())
-                .or(index.text.as_deref())?;
-            Some(format!(
-                "{} {}",
-                trim_index_name(&index.name),
-                truncate_chars(category, 18)
-            ))
-        })
-        .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join("；"))
-}
-
-fn trim_index_name(name: &str) -> &str {
-    name.trim().strip_suffix("指数").unwrap_or(name.trim())
-}
-
-fn format_current_extra(current: &crate::runtime::weather::CurrentWeather) -> String {
+fn format_current_details(current: &crate::runtime::weather::CurrentWeather) -> String {
     let mut parts = Vec::new();
+    if let Some(apparent) = current.apparent_temperature_c {
+        parts.push(format!("体感 {}°C", format_number(apparent)));
+    }
     if let Some(humidity) = current.humidity_percent {
         parts.push(format!("湿度 {humidity}%"));
     }
@@ -340,7 +314,278 @@ fn format_current_extra(current: &crate::runtime::weather::CurrentWeather) -> St
     ) {
         parts.push(wind);
     }
-    parts.join("，")
+    parts.join(" · ")
+}
+
+fn should_render_alerts(alerts: &WeatherSupplement<Vec<WeatherAlert>>) -> bool {
+    matches!(alerts.status, WeatherSupplementStatus::Available)
+        && alerts
+            .data
+            .as_ref()
+            .is_some_and(|alerts| !alerts.is_empty())
+}
+
+fn append_alert_lines(
+    lines: &mut Vec<String>,
+    alerts: &WeatherSupplement<Vec<WeatherAlert>>,
+    reference_date: Option<NaiveDate>,
+) {
+    let Some(alerts) = alerts.data.as_ref() else {
+        return;
+    };
+    for (index, alert) in alerts.iter().take(WEATHER_ALERT_MAX_ITEMS).enumerate() {
+        lines.push(format!(
+            "- {} **{}**  ",
+            alert_icon(alert.color_code.as_deref()),
+            format_alert_title(alert)
+        ));
+        if let Some(detail) = format_alert_detail(alert, reference_date) {
+            lines.push(format!("  {detail}"));
+        }
+        if index + 1 < alerts.len().min(WEATHER_ALERT_MAX_ITEMS) {
+            lines.push(String::new());
+        }
+    }
+}
+
+fn alert_icon(color_code: Option<&str>) -> &'static str {
+    match alert_color_name(color_code) {
+        Some("蓝色") => "🔵",
+        Some("黄色") => "🟡",
+        Some("橙色") => "🟠",
+        Some("红色") => "🔴",
+        _ => "⚠️",
+    }
+}
+
+fn alert_color_name(color_code: Option<&str>) -> Option<&'static str> {
+    match color_code?.trim().to_ascii_lowercase().as_str() {
+        "blue" | "蓝" => Some("蓝色"),
+        "yellow" | "黄" => Some("黄色"),
+        "orange" | "橙" => Some("橙色"),
+        "red" | "红" => Some("红色"),
+        _ => None,
+    }
+}
+
+fn format_alert_title(alert: &WeatherAlert) -> String {
+    if let Some(event_name) = alert
+        .event_name
+        .as_deref()
+        .map(normalize_alert_event_name)
+        .filter(|name| !name.is_empty())
+    {
+        if let Some(color_name) = alert_color_name(alert.color_code.as_deref()) {
+            return format!("{event_name}{color_name}预警");
+        }
+        return if event_name.ends_with("预警") {
+            event_name.to_owned()
+        } else {
+            format!("{event_name}预警")
+        };
+    }
+    trim_alert_headline(&alert.headline, alert.sender_name.as_deref())
+}
+
+fn normalize_alert_event_name(name: &str) -> &str {
+    name.trim()
+        .trim_end_matches("预警信号")
+        .trim_end_matches("预警")
+        .trim()
+}
+
+fn trim_alert_headline(headline: &str, sender_name: Option<&str>) -> String {
+    let original = headline.trim();
+    let mut value = original;
+    if let Some(sender_name) = sender_name.map(str::trim).filter(|value| !value.is_empty())
+        && let Some(rest) = value.strip_prefix(sender_name)
+    {
+        value = rest.trim_start();
+    }
+    for prefix in ["继续发布", "升级发布", "发布了", "发布", "解除"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            value = rest.trim_start();
+            break;
+        }
+    }
+    value = value.trim_start_matches(['：', ':', '，', ',', '。', ' ']);
+    if value.is_empty() {
+        original.to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn format_alert_detail(alert: &WeatherAlert, reference_date: Option<NaiveDate>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(time_range) = format_alert_time_range(alert, reference_date) {
+        parts.push(time_range);
+    }
+    if let Some(summary) = format_alert_summary(alert) {
+        parts.push(summary);
+    }
+    (!parts.is_empty()).then(|| parts.join("｜"))
+}
+
+fn format_alert_time_range(
+    alert: &WeatherAlert,
+    reference_date: Option<NaiveDate>,
+) -> Option<String> {
+    match (alert.issued_time.as_deref(), alert.expire_time.as_deref()) {
+        (Some(issued), Some(expire)) => Some(format!(
+            "{}—{}",
+            format_alert_time_point(issued, reference_date),
+            format_alert_time_point(expire, reference_date)
+        )),
+        (None, Some(expire)) => Some(format!(
+            "截至 {}",
+            format_alert_time_point(expire, reference_date)
+        )),
+        (Some(issued), None) => Some(format!(
+            "发布于 {}",
+            format_alert_time_point(issued, reference_date)
+        )),
+        (None, None) => None,
+    }
+}
+
+fn format_alert_time_point(value: &str, reference_date: Option<NaiveDate>) -> String {
+    let time = format_short_time(value);
+    let Some(date) = local_date_from_timestamp(value) else {
+        return time;
+    };
+    let date_label =
+        match reference_date.map(|reference| date.signed_duration_since(reference).num_days()) {
+            Some(0) => "今日".to_owned(),
+            Some(1) => "明日".to_owned(),
+            Some(2) => "后天".to_owned(),
+            Some(-1) => "昨日".to_owned(),
+            _ => date.format("%m-%d").to_string(),
+        };
+    format!("{date_label} {time}")
+}
+
+fn format_alert_summary(alert: &WeatherAlert) -> Option<String> {
+    let description = collapse_inline_whitespace(alert.description.as_deref()?);
+    if description.is_empty() {
+        return None;
+    }
+
+    // 和风预警正文里常重复“发布单位 + 时间 + 标题：正文”，标题和时间已单独展示，
+    // 这里优先去掉前置样板，只保留用户真正要看的风险描述。
+    let mut summary = strip_alert_description_prefix(&description, alert);
+    if let Some((prefix, rest)) = split_once_alert_separator(&summary)
+        && prefix.contains("预警")
+    {
+        summary = rest.to_owned();
+    }
+    summary = summary
+        .trim_start_matches(['：', ':', '，', ',', '。', '；', ';', '、', ' '])
+        .to_owned();
+    let summary = if summary.is_empty() {
+        description
+    } else {
+        summary
+    };
+    Some(truncate_chars(&summary, WEATHER_ALERT_SUMMARY_MAX_CHARS))
+}
+
+fn strip_alert_description_prefix(description: &str, alert: &WeatherAlert) -> String {
+    let mut value = description.trim().to_owned();
+    if let Some(headline) = clean_string(alert.headline.clone())
+        && let Some(rest) = value.strip_prefix(headline.as_str())
+    {
+        value = rest.trim_start().to_owned();
+    }
+    if let Some(sender_name) = alert
+        .sender_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && let Some(rest) = value.strip_prefix(sender_name)
+    {
+        value = rest.trim_start().to_owned();
+    }
+    for prefix in ["继续发布", "升级发布", "发布了", "发布", "解除"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            value = rest.trim_start().to_owned();
+            break;
+        }
+    }
+    value
+}
+
+fn split_once_alert_separator(text: &str) -> Option<(&str, &str)> {
+    text.split_once('：').or_else(|| text.split_once(':'))
+}
+
+fn collapse_inline_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_air_quality(air_quality: &AirQualitySummary) -> String {
+    let mut parts = vec![format!(
+        "**AQI {}{}**",
+        air_quality.aqi_display,
+        air_quality
+            .category
+            .as_deref()
+            .map(|category| format!("（{category}）"))
+            .or_else(|| {
+                air_quality
+                    .level
+                    .as_deref()
+                    .map(|level| format!("（{level}级）"))
+            })
+            .unwrap_or_default()
+    )];
+    if let Some(name) = air_quality
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.to_ascii_uppercase().contains("AQI"))
+    {
+        parts.push(name.to_owned());
+    }
+    if let Some(pollutant) = air_quality.primary_pollutant.as_deref() {
+        parts.push(format!("首要污染物 {pollutant}"));
+    }
+    parts.join(" · ")
+}
+
+fn format_life_indices(indices: &[WeatherLifeIndex]) -> Option<String> {
+    let first_date = indices.first()?.date.as_str();
+    let parts = indices
+        .iter()
+        .filter(|index| index.date == first_date)
+        .take(WEATHER_LIFE_INDEX_MAX_ITEMS)
+        .filter_map(|index| {
+            let category = index
+                .category
+                .as_deref()
+                .or(index.level.as_deref())
+                .or(index.text.as_deref())?;
+            Some(format!(
+                "{}：{}",
+                trim_index_name(&index.name),
+                truncate_chars(category, WEATHER_LIFE_INDEX_VALUE_MAX_CHARS)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("｜"))
+}
+
+fn trim_index_name(name: &str) -> &str {
+    name.trim().strip_suffix("指数").unwrap_or(name.trim())
+}
+
+fn weather_reference_date(outcome: &WeatherOutcome) -> Option<NaiveDate> {
+    local_date_from_timestamp(&outcome.current.time).or_else(|| {
+        outcome
+            .daily
+            .first()
+            .and_then(|day| local_date_from_timestamp(&day.date))
+    })
 }
 
 fn format_daily_weather_label(day: &crate::runtime::weather::DailyWeather) -> String {
@@ -353,18 +598,47 @@ fn format_daily_weather_label(day: &crate::runtime::weather::DailyWeather) -> St
     }
 }
 
-fn format_daily_extra(day: &crate::runtime::weather::DailyWeather) -> String {
-    let mut parts = Vec::new();
+fn format_daily_summary(day: &crate::runtime::weather::DailyWeather) -> String {
+    let mut parts = vec![
+        format_daily_weather_label(day),
+        format!(
+            "{}～{}°C",
+            format_number(day.temperature_min_c),
+            format_number(day.temperature_max_c)
+        ),
+    ];
     if let Some(wind) = format_wind(
         day.wind_direction_day.as_deref(),
         day.wind_scale_day.as_deref(),
     ) {
         parts.push(wind);
     }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("，{}", parts.join("，"))
+    parts.join("，")
+}
+
+fn format_forecast_day_label(value: &str, reference_date: Option<NaiveDate>) -> String {
+    let Some(date) = local_date_from_timestamp(value) else {
+        return value.trim().to_owned();
+    };
+    let date_label =
+        match reference_date.map(|reference| date.signed_duration_since(reference).num_days()) {
+            Some(0) => "今天".to_owned(),
+            Some(1) => "明天".to_owned(),
+            Some(2) => "后天".to_owned(),
+            _ => date.format("%m-%d").to_string(),
+        };
+    format!("{date_label} {}", weekday_label(date.weekday()))
+}
+
+fn weekday_label(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Mon => "周一",
+        Weekday::Tue => "周二",
+        Weekday::Wed => "周三",
+        Weekday::Thu => "周四",
+        Weekday::Fri => "周五",
+        Weekday::Sat => "周六",
+        Weekday::Sun => "周日",
     }
 }
 
@@ -536,6 +810,15 @@ mod tests {
                 }),
             },
             Case {
+                name: "parse_weather_command_accepts_english_alias",
+                input: "/weather Hangzhou",
+                expected: Some(ExpectedCommand {
+                    action: "weather",
+                    argument: "Hangzhou",
+                    raw_command: "weather",
+                }),
+            },
+            Case {
                 name: "parse_weather_command_ignores_plain_city_weather_suffix",
                 input: "杭州天气",
                 expected: None,
@@ -585,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn format_weather_reply_includes_current_and_three_forecast_days() {
+    fn format_weather_reply_uses_compact_markdown_sections() {
         let reply = format_weather_reply(&WeatherOutcome {
             location: WeatherLocation {
                 id: Some("101210101".to_owned()),
@@ -687,25 +970,28 @@ mod tests {
             ]),
         });
 
-        assert!(reply.contains("【天气】杭州，浙江，中国"));
-        assert!(reply.contains("当前（20:15）"));
-        assert!(reply.contains("今天起 3 天"));
-        assert!(reply.contains("06-12（五）"));
-        assert!(reply.contains("06-13（六）"));
-        assert!(reply.contains("06-14（日）"));
-        assert!(reply.contains("湿度 86%"));
+        assert!(reply.starts_with("# 🌦 杭州天气"));
+        assert!(reply.contains("**浙江，中国**"));
+        assert!(reply.contains("**当前 20:15｜阴｜27.7°C**"));
+        assert!(reply.contains("体感 28.5°C · 湿度 86% · 东北风 3级"));
+        assert!(reply.contains("空气质量：**AQI 42（优）** · 首要污染物 PM2.5"));
+        assert!(reply.contains("## ⚠️ 预警"));
+        assert!(reply.contains("- 🔵 **大风蓝色预警**"));
+        assert!(reply.contains("- 🟡 **雷电黄色预警**"));
+        assert!(reply.contains("今日 18:00—明日 18:00"));
+        assert!(reply.contains("## 📅 未来 3 天"));
+        assert!(reply.contains("- **今天 周五**：小雨转阴，21～32.5°C，东风 1-3级"));
+        assert!(reply.contains("- **明天 周六**：小雨转阴，21～32.5°C，东风 1-3级"));
+        assert!(reply.contains("- **后天 周日**：小雨转阴，21～32.5°C，东风 1-3级"));
+        assert!(reply.contains("## 🧭 生活指数"));
+        assert!(reply.contains("生活指数"));
+        assert!(reply.contains("运动：较适宜｜穿衣：热"));
+        assert!(reply.contains("> 数据来源：和风天气"));
         assert!(!reply.contains("气压"));
-        assert!(!reply.contains("降水 1.2 mm"));
-        assert!(reply.contains("东北风 3级"));
-        assert!(reply.contains("预警：杭州市气象台发布大风蓝色预警"));
-        assert!(reply.contains("预警：杭州市气象台发布雷电黄色预警"));
         assert!(!reply.contains("第三条预警不应展示"));
-        assert!(reply.contains("空气：AQI（CN） 42（优），首要污染物 PM2.5"));
-        assert!(reply.contains("生活指数：运动 较适宜；穿衣 热"));
         assert!(!reply.contains("次日不在摘要中展示"));
-        assert!(reply.contains("小雨转阴"));
-        assert!(!reply.contains("雨量"));
-        assert!(reply.contains("来源：和风天气"));
+        assert!(!reply.contains("\n| "));
+        assert!(!reply.contains("\n|-"));
     }
 
     #[test]
@@ -723,9 +1009,158 @@ mod tests {
         append_alert_lines(
             &mut lines,
             &WeatherSupplement::<Vec<WeatherAlert>>::empty(Some(true)),
+            Some(NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()),
         );
 
-        assert_eq!(lines, vec!["预警：无生效预警"]);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn format_weather_reply_omits_empty_alert_section_and_missing_fields() {
+        let reply = format_weather_reply(&WeatherOutcome {
+            location: WeatherLocation {
+                id: Some("101210101".to_owned()),
+                name: "杭州".to_owned(),
+                country: Some("中国".to_owned()),
+                admin1: Some("浙江".to_owned()),
+                admin2: Some("杭州".to_owned()),
+                timezone: Some("Asia/Shanghai".to_owned()),
+                latitude: 30.29,
+                longitude: 120.16,
+            },
+            current: CurrentWeather {
+                time: "2026-06-12T20:15".to_owned(),
+                temperature_c: 27.0,
+                apparent_temperature_c: None,
+                weather_code: 104,
+                humidity_percent: None,
+                precipitation_mm: None,
+                pressure_hpa: None,
+                wind_direction: None,
+                wind_scale: None,
+                wind_speed_kmh: None,
+            },
+            daily: vec![daily("2026-06-12", 104), daily("2026-06-13", 306)],
+            provider: "mock-weather".to_owned(),
+            elapsed_ms: 7,
+            forecast_days: 3,
+            alerts: WeatherSupplement::empty(Some(true)),
+            air_quality: WeatherSupplement::empty(Some(true)),
+            life_indices: WeatherSupplement::available(vec![
+                WeatherLifeIndex {
+                    date: "2026-06-12".to_owned(),
+                    type_id: "1".to_owned(),
+                    name: "运动指数".to_owned(),
+                    level: None,
+                    category: Some("较适宜".to_owned()),
+                    text: None,
+                },
+                WeatherLifeIndex {
+                    date: "2026-06-12".to_owned(),
+                    type_id: "3".to_owned(),
+                    name: "穿衣指数".to_owned(),
+                    level: None,
+                    category: None,
+                    text: None,
+                },
+            ]),
+        });
+
+        assert!(reply.contains("**当前 20:15｜阴｜27°C**"));
+        assert!(!reply.contains("## ⚠️ 预警"));
+        assert!(!reply.contains("空气质量："));
+        assert!(reply.contains("## 📅 未来 2 天"));
+        assert!(reply.contains("- **今天 周五**"));
+        assert!(reply.contains("- **明天 周六**"));
+        assert!(!reply.contains("后天"));
+        assert!(reply.contains("运动：较适宜"));
+        assert!(!reply.contains("穿衣："));
+        assert!(!reply.contains("None"));
+        assert!(!reply.contains("null"));
+        assert!(!reply.contains("··"));
+        assert!(!reply.contains("｜｜"));
+    }
+
+    #[test]
+    fn format_alert_summary_truncates_long_chinese_body_and_keeps_unknown_color_icon() {
+        let alert = WeatherAlert {
+            headline: "北京市气象台发布台风预警".to_owned(),
+            event_name: Some("台风".to_owned()),
+            severity: None,
+            color_code: Some("purple".to_owned()),
+            sender_name: Some("北京市气象台".to_owned()),
+            issued_time: Some("2026-06-12T18:00+08:00".to_owned()),
+            expire_time: Some("2026-06-13T06:00+08:00".to_owned()),
+            description: Some("北京市气象台发布台风预警：预计今天夜间到明天上午，朝阳区、通州区和顺义区将出现强风和明显降雨，请及时加固临时搭建物，远离广告牌、树木和临时围挡，并注意低洼路段积水风险，同时防范临时工棚、简易板房和高空悬挂物受损，山区道路注意短时积水、树枝坠落和能见度下降风险。".to_owned()),
+        };
+
+        let detail =
+            format_alert_detail(&alert, Some(NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()))
+                .unwrap();
+
+        assert_eq!(alert_icon(alert.color_code.as_deref()), "⚠️");
+        assert_eq!(format_alert_title(&alert), "台风预警");
+        assert!(detail.contains("今日 18:00—明日 06:00"));
+        assert!(detail.contains("预计今天夜间到明天上午"));
+        assert!(detail.ends_with('…'));
+        assert!(!detail.contains("北京市气象台发布台风预警："));
+    }
+
+    #[test]
+    fn truncate_chars_preserves_utf8_for_weather_text() {
+        assert_eq!(truncate_chars("中文天气预警说明", 6), "中文天气预…");
+    }
+
+    #[test]
+    fn forecast_day_label_uses_local_timezone_instead_of_array_index() {
+        let reference = weather_reference_date(&WeatherOutcome {
+            location: WeatherLocation {
+                id: None,
+                name: "测试".to_owned(),
+                country: None,
+                admin1: None,
+                admin2: None,
+                timezone: Some("Asia/Shanghai".to_owned()),
+                latitude: 0.0,
+                longitude: 0.0,
+            },
+            current: CurrentWeather {
+                time: "2026-06-12T23:30:00+00:00".to_owned(),
+                temperature_c: 30.0,
+                apparent_temperature_c: None,
+                weather_code: 100,
+                humidity_percent: None,
+                precipitation_mm: None,
+                pressure_hpa: None,
+                wind_direction: None,
+                wind_scale: None,
+                wind_speed_kmh: None,
+            },
+            daily: vec![
+                daily("2026-06-13", 100),
+                daily("2026-06-14", 100),
+                daily("2026-06-15", 100),
+            ],
+            provider: "mock".to_owned(),
+            elapsed_ms: 1,
+            forecast_days: 3,
+            alerts: WeatherSupplement::default(),
+            air_quality: WeatherSupplement::default(),
+            life_indices: WeatherSupplement::default(),
+        });
+
+        assert_eq!(
+            format_forecast_day_label("2026-06-13", reference),
+            "今天 周六"
+        );
+        assert_eq!(
+            format_forecast_day_label("2026-06-14", reference),
+            "明天 周日"
+        );
+        assert_eq!(
+            format_forecast_day_label("2026-06-15", reference),
+            "后天 周一"
+        );
     }
 
     fn daily(date: &str, weather_code: u16) -> DailyWeather {
