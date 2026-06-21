@@ -975,7 +975,7 @@ mod tests {
             request_text_response(state, "GET", "/console/", None, None).await;
 
         assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(body.contains("QQ Maid Console"));
+        assert!(body.contains("QQ Maid Bot"));
         assert!(
             headers
                 .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
