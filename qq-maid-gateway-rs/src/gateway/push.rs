@@ -121,14 +121,14 @@ async fn push_message(
     record_qq_send_result(&state.runtime, &result);
     // 群推送成功后，把返回的 message_id 写入共享的 BotOutboundCache，
     // 确保 mention 模式下用户回复该消息能被 is_reply_to_bot 识别。
-    if req.target_type.trim() == "group" {
-        if let Ok(Some(message_id)) = result.as_ref() {
-            state
-                .group_outbound_cache
-                .lock()
-                .unwrap()
-                .insert(Some(message_id.clone()));
-        }
+    if req.target_type.trim() == "group"
+        && let Ok(Some(message_id)) = result.as_ref()
+    {
+        state
+            .group_outbound_cache
+            .lock()
+            .unwrap()
+            .insert(Some(message_id.clone()));
     }
     match result {
         Ok(_) => {
