@@ -115,6 +115,10 @@ main() {
     # logs/ 和 run/ 由控制脚本启动时创建，不写进归档以避免混入运行产物。
     : > "${STAGING_DIR}/data/storage/.gitkeep"
 
+    # 归档前先用统一 helper 校验 staging 目录，避免 deploy/package 两条链路的
+    # 文件完整性约束出现漂移。
+    bash scripts/validate-release-runtime.sh "${STAGING_DIR}"
+
     printf '%s\n' "${VERSION}" > "${STAGING_DIR}/VERSION"
 
     case "${ARCHIVE_FORMAT}" in

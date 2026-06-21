@@ -14,7 +14,7 @@ runtime/
 ├── llmctl.sh                        # 部署后的 LLM 控制脚本，不提交
 ├── gatewayctl.sh                    # 部署后的 gateway 控制脚本，不提交
 ├── botctl.sh                        # 部署后的聚合控制脚本，不提交
-├── validate-runtime.sh              # 部署后的运行目录校验脚本，不提交
+├── validate-runtime.sh              # 部署后的运行诊断脚本，不提交
 ├── README.md                        # 本文件
 ├── static/
 │   └── index.html                   # 可提交的本地 Web 控制台静态页
@@ -336,7 +336,7 @@ make diagnose
 
 ```bash
 ./diagnose-network.sh
-./validate-runtime.sh .
+./validate-runtime.sh check
 ```
 
 诊断输出只应展示 secret 是否存在、脱敏后的 ID / URL、代理和公网出口检查结果，不应打印完整 token、AppSecret、API Key、openid、群 ID 或聊天内容。

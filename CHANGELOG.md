@@ -4,7 +4,7 @@
 
 ### Added
 - Web 控制台路由安全头中间件（X-Content-Type-Options、X-Frame-Options、CSP）
-- `scripts/validate-runtime.sh` — runtime 目录完整性校验脚本
+- `scripts/validate-release-runtime.sh` — 待发布 runtime 目录完整性校验脚本
 - `scripts/botctl.sh` — 统一启停控制脚本（start/stop/restart/status/logs/health/console）
 - 群消息 `group_message_mode` 配置项，支持 `off` / `command` / `mention` / `active`
 - OpenAI 兼容 GLM provider 支持

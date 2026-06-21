@@ -40,10 +40,10 @@ make build
 BUILD_ELAPSED="${SECONDS}"
 
 echo "==> Validating release payload..."
-# validate-runtime 只适合检查待发布包；live runtime 目录天然会包含 .env、
-# 数据库、日志和 pid 等运行产物，不能在重启后的运行目录上执行这一步。
+# 这里校验的是待上传的离线 runtime 目录结构；在线服务状态检查应使用
+# scripts/validate-runtime.sh 的 check/glm/console 等子命令，不能混用。
 prepare_validate_runtime
-bash scripts/validate-runtime.sh "${LOCAL_VALIDATE_DIR}"
+bash scripts/validate-release-runtime.sh "${LOCAL_VALIDATE_DIR}"
 
 echo "==> Uploading artifacts..."
 # runtime 是远端运行目录，专门放二进制、控制脚本、配置模板和运行期文件。

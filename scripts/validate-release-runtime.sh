@@ -17,6 +17,8 @@ require_executable() {
     [[ -x "${RUNTIME_DIR}/$1" ]] || die "$1 is not executable"
 }
 
+# 这里只校验待发布 runtime 目录的离线结构是否完整，以及是否混入敏感/运行产物。
+# 服务状态、/healthz、上游调用和 /console 等在线检查由 scripts/validate-runtime.sh 负责。
 require_executable qq-maid-llm
 require_executable qq-maid-gateway-rs
 require_executable llmctl.sh
@@ -32,4 +34,4 @@ if find "${RUNTIME_DIR}" -path '*/logs/*' -o -path '*/run/*.pid' -o -name '.env'
     die "runtime contains forbidden private or generated files"
 fi
 
-echo "runtime validation ok: ${RUNTIME_DIR}"
+echo "runtime payload validation ok: ${RUNTIME_DIR}"
