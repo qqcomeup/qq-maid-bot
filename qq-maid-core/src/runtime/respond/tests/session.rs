@@ -23,10 +23,16 @@ async fn help_without_argument_returns_concise_overview() {
     assert!(text.contains("/help all"));
     assert!(text.contains("/help <模块>"));
     assert!(!text.contains("`/rss test RSS地址`"));
+    // 纯文本侧不能带反引号，否则 QQ 纯文本渲染会吞掉命令内容
+    assert!(text.contains("✅ 待办：/todo"));
+    assert!(text.contains("🩺 状态：私聊发送 /ping"));
+    assert!(!text.contains('`'));
     assert!(markdown.starts_with("# 女仆长助手"));
     assert!(markdown.contains("## 常用功能"));
     assert!(markdown.contains("`/help all`"));
     assert!(markdown.contains("`/help <模块>`"));
+    assert!(markdown.contains("`/todo`"));
+    assert!(markdown.contains("`/ping`"));
 }
 
 #[tokio::test]

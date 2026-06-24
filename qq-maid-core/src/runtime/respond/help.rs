@@ -173,13 +173,37 @@ fn format_help_home() -> CommandBody {
     render.blank();
     render.subtitle("常用功能");
     render.bullet("💬 对话：直接发送消息");
-    render.bullet("✅ 待办：`/todo`");
-    render.bullet("📰 RSS / Atom：`/rss`");
-    render.bullet("🌤 天气：`/天气 杭州`");
-    render.bullet("🔎 查询：`/查 问题`、`/火车 G1`");
-    render.bullet("🧠 记忆：`/memory`");
-    render.bullet("🗂 会话：`/state`");
-    render.bullet("🩺 状态：私聊发送 `/ping`");
+    // 常用功能里的命令示例需要同时给出纯文本和 Markdown 两通道：
+    // 纯文本侧不能带反引号，否则 QQ 纯文本渲染会把反引号内容吞掉；
+    // Markdown 侧保留行内代码反引号，便于支持 Markdown 的客户端高亮命令。
+    render.push_pair(
+        "· ✅ 待办：/todo".to_owned(),
+        "- ✅ 待办：`/todo`".to_owned(),
+    );
+    render.push_pair(
+        "· 📰 RSS / Atom：/rss".to_owned(),
+        "- 📰 RSS / Atom：`/rss`".to_owned(),
+    );
+    render.push_pair(
+        "· 🌤 天气：/天气 杭州".to_owned(),
+        "- 🌤 天气：`/天气 杭州`".to_owned(),
+    );
+    render.push_pair(
+        "· 🔎 查询：/查 问题、/火车 G1".to_owned(),
+        "- 🔎 查询：`/查 问题`、`/火车 G1`".to_owned(),
+    );
+    render.push_pair(
+        "· 🧠 记忆：/memory".to_owned(),
+        "- 🧠 记忆：`/memory`".to_owned(),
+    );
+    render.push_pair(
+        "· 🗂 会话：/state".to_owned(),
+        "- 🗂 会话：`/state`".to_owned(),
+    );
+    render.push_pair(
+        "· 🩺 状态：私聊发送 /ping".to_owned(),
+        "- 🩺 状态：私聊发送 `/ping`".to_owned(),
+    );
     render.blank();
     render.subtitle("查看详细帮助");
     render.push_pair(
