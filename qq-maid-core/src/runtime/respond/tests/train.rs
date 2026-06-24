@@ -32,10 +32,16 @@ async fn train_command_defaults_to_today_and_uses_executor() {
     assert!(text.contains("日期："));
     assert!(text.contains("行程：北京南 → 上海虹桥"));
     assert!(text.contains("站序 / 车站 / 到达 / 出发 / 停留"));
-    assert!(text.contains("1 / 北京南 / --:-- / 06:30 / --"));
+    // 始发站：到达 --，出发取实际发车时间，停留显示始发。
+    assert!(text.contains("1 / 北京南 / -- / 06:30 / 始发"));
+    // 中间站：到发时间和停留分钟数保持原逻辑。
     assert!(text.contains("2 / 南京南 / 10:13 / 10:15 / 2 分钟"));
+    // 终到站：到达取实际到达时间，出发 --，停留显示终到。
+    assert!(text.contains("3 / 上海虹桥 / 11:24 / -- / 终到"));
     assert!(markdown.contains("| 站序 | 车站 | 到达 | 出发 | 停留 |"));
-    assert!(markdown.contains("> 时刻信息来自铁路查询服务"));
+    assert!(markdown.contains("| 1 | 北京南 | -- | 06:30 | 始发 |"));
+    assert!(markdown.contains("| 3 | 上海虹桥 | 11:24 | -- | 终到 |"));
+    assert!(markdown.contains("> 当前展示为当日计划时刻"));
 
     let requests = inspector.requests();
     assert_eq!(requests.len(), 1);
@@ -160,21 +166,45 @@ async fn train_command_surfaces_timeout_error() {
 
 #[test]
 fn train_api_response_parses_cross_day_stop() {
+    // 使用三站时刻表，让跨日站落在中间站位置，既覆盖 (+N天) 后缀渲染，
+    // 也保持中间站停留分钟数原逻辑。
     let schedule = crate::runtime::train::TrainSchedule {
         train_code: "1461".to_owned(),
         travel_date: NaiveDate::from_ymd_opt(2026, 6, 24).unwrap(),
         start_station: "北京".to_owned(),
         end_station: "上海".to_owned(),
-        stops: vec![crate::runtime::train::TrainStop {
-            station_no: 16,
-            station_name: "蚌埠".to_owned(),
-            arrive_time: Some("00:47".to_owned()),
-            departure_time: Some("00:51".to_owned()),
-            stopover_minutes: Some(4),
-            day_difference: 1,
-            day_difference_reliable: true,
-            station_train_code: "1461".to_owned(),
-        }],
+        stops: vec![
+            crate::runtime::train::TrainStop {
+                station_no: 1,
+                station_name: "北京".to_owned(),
+                arrive_time: None,
+                departure_time: Some("21:17".to_owned()),
+                stopover_minutes: None,
+                day_difference: 0,
+                day_difference_reliable: true,
+                station_train_code: "1461".to_owned(),
+            },
+            crate::runtime::train::TrainStop {
+                station_no: 16,
+                station_name: "蚌埠".to_owned(),
+                arrive_time: Some("00:47".to_owned()),
+                departure_time: Some("00:51".to_owned()),
+                stopover_minutes: Some(4),
+                day_difference: 1,
+                day_difference_reliable: true,
+                station_train_code: "1461".to_owned(),
+            },
+            crate::runtime::train::TrainStop {
+                station_no: 25,
+                station_name: "上海".to_owned(),
+                arrive_time: Some("08:00".to_owned()),
+                departure_time: None,
+                stopover_minutes: None,
+                day_difference: 1,
+                day_difference_reliable: true,
+                station_train_code: "1461".to_owned(),
+            },
+        ],
     };
 
     let rendered = super::super::train_flow::format_train_schedule_reply(&schedule);
@@ -183,4 +213,31 @@ fn train_api_response_parses_cross_day_stop() {
             .text
             .contains("16 / 蚌埠（+1天） / 00:47 / 00:51 / 4 分钟")
     );
+}
+
+#[test]
+fn train_schedule_renders_single_stop_without_origin_terminal_marks() {
+    // 接口意外只返回一个站点时，不应同时硬标为始发和终到，
+    // 保留原始到发数据，停留显示 --。
+    let schedule = crate::runtime::train::TrainSchedule {
+        train_code: "G1".to_owned(),
+        travel_date: NaiveDate::from_ymd_opt(2026, 6, 25).unwrap(),
+        start_station: "北京南".to_owned(),
+        end_station: "上海虹桥".to_owned(),
+        stops: vec![crate::runtime::train::TrainStop {
+            station_no: 1,
+            station_name: "北京南".to_owned(),
+            arrive_time: Some("06:30".to_owned()),
+            departure_time: Some("06:30".to_owned()),
+            stopover_minutes: Some(0),
+            day_difference: 0,
+            day_difference_reliable: true,
+            station_train_code: "G1".to_owned(),
+        }],
+    };
+
+    let rendered = super::super::train_flow::format_train_schedule_reply(&schedule);
+    assert!(rendered.text.contains("1 / 北京南 / 06:30 / 06:30 / --"));
+    assert!(!rendered.text.contains("始发"));
+    assert!(!rendered.text.contains("终到"));
 }

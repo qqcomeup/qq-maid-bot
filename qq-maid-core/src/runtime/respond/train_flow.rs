@@ -321,10 +321,11 @@ pub(super) fn format_train_schedule_reply(schedule: &TrainSchedule) -> super::co
         "| 站序 | 车站 | 到达 | 出发 | 停留 |".to_owned(),
         "| ---: | --- | ---: | ---: | ---: |".to_owned(),
     ];
-    for stop in &schedule.stops {
-        let arrive = stop.arrive_time.as_deref().unwrap_or("--:--");
-        let departure = stop.departure_time.as_deref().unwrap_or("--:--");
-        let stopover = format_stopover(stop);
+    let stop_count = schedule.stops.len();
+    for (index, stop) in schedule.stops.iter().enumerate() {
+        // 始发站 / 终到站 / 中间站 / 单站异常数据分别按位置渲染到发和停留三列，
+        // 避免始发站也显示到达时间、终到站也显示出发时间造成误解。
+        let (arrive, departure, stopover) = format_stop_columns(stop, index, stop_count);
         let station_name = format_station_name(stop);
         markdown_rows.push(format!(
             "| {} | {} | {} | {} | {} |",
@@ -340,10 +341,44 @@ pub(super) fn format_train_schedule_reply(schedule: &TrainSchedule) -> super::co
         ));
     }
     text_rows.push(String::new());
-    text_rows.push("时刻信息来自铁路查询服务，请以车站实际公告为准。".to_owned());
+    text_rows.push(TRAIN_SCHEDULE_FOOTER_REPLY.to_owned());
     markdown_rows.push(String::new());
-    markdown_rows.push("> 时刻信息来自铁路查询服务，请以车站实际公告为准。".to_owned());
+    markdown_rows.push(format!("> {}", TRAIN_SCHEDULE_FOOTER_REPLY));
     super::common::CommandBody::dual(text_rows.join("\n"), markdown_rows.join("\n"))
+}
+
+/// 时刻表底部提示，强调当日计划时刻与实时信息的差异。
+const TRAIN_SCHEDULE_FOOTER_REPLY: &str =
+    "当前展示为当日计划时刻，不含实时正晚点、余票及临时停运信息，请以铁路12306或车站公告为准。";
+
+/// 根据经停站在时刻表中的位置渲染到达、出发和停留三列。
+///
+/// - 始发站（第一站）：到达显示 `--`，出发取实际发车时间，停留显示 `始发`；
+/// - 终到站（最后一站）：到达取实际到达时间，出发显示 `--`，停留显示 `终到`；
+/// - 中间站：保持原来到发时间和停留分钟数逻辑；
+/// - 仅一站的异常数据：不同时硬标为始发和终到，保留原始到发数据，停留显示 `--`。
+fn format_stop_columns(
+    stop: &TrainStop,
+    index: usize,
+    stop_count: usize,
+) -> (String, String, String) {
+    let arrive = stop.arrive_time.as_deref().unwrap_or("--");
+    let departure = stop.departure_time.as_deref().unwrap_or("--");
+    if stop_count <= 1 {
+        // 只有一站的异常数据，保留原始到发，停留用 -- 占位，避免同时硬标始发/终到。
+        return (arrive.to_owned(), departure.to_owned(), "--".to_owned());
+    }
+    if index == 0 {
+        // 始发站：到达无意义，统一显示 --；停留固定为始发。
+        return ("--".to_owned(), departure.to_owned(), "始发".to_owned());
+    }
+    if index == stop_count - 1 {
+        // 终到站：出发无意义，统一显示 --；停留固定为终到。
+        return (arrive.to_owned(), "--".to_owned(), "终到".to_owned());
+    }
+    // 中间站保持原有停留分钟数逻辑。
+    let stopover = format_stopover(stop);
+    (arrive.to_owned(), departure.to_owned(), stopover)
 }
 
 fn format_station_name(stop: &TrainStop) -> String {
