@@ -173,17 +173,9 @@ struct TrainApiDetail {
     #[serde(rename = "stopTime", default)]
     stop_time: Vec<TrainApiStop>,
     /// 完整车次（跨线车可能形如 `D3233/D3234`），12306 部分车次可能不返回。
+    /// 该字段位于 `trainDetail` 顶层，对整趟车唯一。
     #[serde(rename = "stationTrainCodeAll", default)]
     station_train_code_all: Option<String>,
-    /// 担当客运段，12306 部分车次可能不返回。
-    #[serde(rename = "jiaolu_corporation_code", default)]
-    jiaolu_corporation_code: Option<String>,
-    /// 车型信息，12306 部分车次可能不返回。
-    #[serde(rename = "jiaolu_train_style", default)]
-    jiaolu_train_style: Option<String>,
-    /// 配属，12306 部分车次可能不返回。
-    #[serde(rename = "jiaolu_dept_train", default)]
-    jiaolu_dept_train: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +202,18 @@ struct TrainApiStop {
     day_difference: Option<String>,
     #[serde(rename = "stationTrainCode", default)]
     station_train_code: Option<String>,
+    /// 担当客运段，12306 部分车次可能不返回。
+    /// 该字段位于每个 `stopTime` 站点内，同一趟车各站值一致，取首站即可。
+    #[serde(rename = "jiaolu_corporation_code", default)]
+    jiaolu_corporation_code: Option<String>,
+    /// 车型信息，12306 部分车次可能不返回。
+    /// 该字段位于每个 `stopTime` 站点内，同一趟车各站值一致，取首站即可。
+    #[serde(rename = "jiaolu_train_style", default)]
+    jiaolu_train_style: Option<String>,
+    /// 配属，12306 部分车次可能不返回。
+    /// 该字段位于每个 `stopTime` 站点内，同一趟车各站值一致，取首站即可。
+    #[serde(rename = "jiaolu_dept_train", default)]
+    jiaolu_dept_train: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,7 +255,17 @@ impl TrainApiResponse {
         }
 
         let mut stops = Vec::with_capacity(detail.stop_time.len());
+        // `jiaolu_corporation_code`、`jiaolu_train_style`、`jiaolu_dept_train` 位于
+        // 每个 `stopTime` 站点内，同一趟车各站值一致，取首站即可。
+        let mut first_corporation: Option<String> = None;
+        let mut first_train_style: Option<String> = None;
+        let mut first_dept_train: Option<String> = None;
         for (index, stop) in detail.stop_time.into_iter().enumerate() {
+            if index == 0 {
+                first_corporation = trim_optional_field(stop.jiaolu_corporation_code.clone());
+                first_train_style = trim_optional_field(stop.jiaolu_train_style.clone());
+                first_dept_train = trim_optional_field(stop.jiaolu_dept_train.clone());
+            }
             let (day_difference, day_difference_reliable) =
                 parse_day_difference_field(stop.day_difference.as_deref());
             stops.push(TrainStop {
@@ -295,13 +309,14 @@ impl TrainApiResponse {
             start_station,
             end_station,
             stops,
-            // 以下 4 个字段来自 12306 `trainDetail` 中的可选属性，
-            // 缺失或为空时统一存为 `None`，渲染层据此省略对应行，
-            // 不推测、不补造。
+            // 以下 4 个字段来自 12306 可选属性，缺失或为空时统一存为 `None`，
+            // 渲染层据此省略对应行，不推测、不补造。
+            // `stationTrainCodeAll` 位于 `trainDetail` 顶层；
+            // 其余 3 个 `jiaolu_*` 字段位于 `stopTime` 站点内，取首站值。
             full_train_code: trim_optional_field(detail.station_train_code_all),
-            corporation: trim_optional_field(detail.jiaolu_corporation_code),
-            train_style: trim_optional_field(detail.jiaolu_train_style),
-            dept_train: trim_optional_field(detail.jiaolu_dept_train),
+            corporation: first_corporation,
+            train_style: first_train_style,
+            dept_train: first_dept_train,
         })
     }
 }
@@ -943,6 +958,9 @@ mod tests {
                             stopover_time: None,
                             day_difference: None,
                             station_train_code: None,
+                            jiaolu_corporation_code: None,
+                            jiaolu_train_style: None,
+                            jiaolu_dept_train: None,
                         },
                         TrainApiStop {
                             station_no: Some(String::new()),
@@ -952,12 +970,12 @@ mod tests {
                             stopover_time: Some("5".to_owned()),
                             day_difference: Some(String::new()),
                             station_train_code: Some("1461".to_owned()),
+                            jiaolu_corporation_code: None,
+                            jiaolu_train_style: None,
+                            jiaolu_dept_train: None,
                         },
                     ],
                     station_train_code_all: None,
-                    jiaolu_corporation_code: None,
-                    jiaolu_train_style: None,
-                    jiaolu_dept_train: None,
                 }),
             }),
         }
@@ -991,11 +1009,11 @@ mod tests {
                         stopover_time: Some("4".to_owned()),
                         day_difference: Some("oops".to_owned()),
                         station_train_code: Some("1461".to_owned()),
+                        jiaolu_corporation_code: None,
+                        jiaolu_train_style: None,
+                        jiaolu_dept_train: None,
                     }],
                     station_train_code_all: None,
-                    jiaolu_corporation_code: None,
-                    jiaolu_train_style: None,
-                    jiaolu_dept_train: None,
                 }),
             }),
         }
@@ -1047,7 +1065,9 @@ mod tests {
 
     #[test]
     fn train_api_response_parses_optional_train_detail_fields() {
-        // 12306 `trainDetail` 中的担当客运段、车型信息、配属、完整车次为可选字段，
+        // 12306 可选字段：`stationTrainCodeAll` 位于 `trainDetail` 顶层；
+        // `jiaolu_corporation_code`、`jiaolu_train_style`、`jiaolu_dept_train`
+        // 位于每个 `stopTime` 站点内，同一趟车各站值一致，取首站即可。
         // 存在且非空时应解析到 TrainSchedule 对应字段。
         let response = serde_json::from_value::<TrainApiResponse>(serde_json::json!({
             "status": true,
@@ -1056,9 +1076,6 @@ mod tests {
                 "trainDetail": {
                     "trainCode": "D3233",
                     "stationTrainCodeAll": "D3233/D3234",
-                    "jiaolu_corporation_code": "南昌客运段",
-                    "jiaolu_train_style": "CRH2A",
-                    "jiaolu_dept_train": "南昌车辆段",
                     "stopTime": [
                         {
                             "stationNo": 1,
@@ -1067,7 +1084,10 @@ mod tests {
                             "startTime": "14:32",
                             "stopover_time": "0",
                             "dayDifference": 0,
-                            "stationTrainCode": "D3233"
+                            "stationTrainCode": "D3233",
+                            "jiaolu_corporation_code": "南昌客运段",
+                            "jiaolu_train_style": "CRH2A",
+                            "jiaolu_dept_train": "南昌车辆段"
                         }
                     ]
                 }
@@ -1135,9 +1155,6 @@ mod tests {
                 "trainDetail": {
                     "trainCode": "G1",
                     "stationTrainCodeAll": "   ",
-                    "jiaolu_corporation_code": "",
-                    "jiaolu_train_style": "",
-                    "jiaolu_dept_train": "",
                     "stopTime": [
                         {
                             "stationNo": 1,
@@ -1146,7 +1163,10 @@ mod tests {
                             "startTime": "06:30",
                             "stopover_time": "0",
                             "dayDifference": 0,
-                            "stationTrainCode": "G1"
+                            "stationTrainCode": "G1",
+                            "jiaolu_corporation_code": "",
+                            "jiaolu_train_style": "",
+                            "jiaolu_dept_train": ""
                         }
                     ]
                 }
@@ -1164,5 +1184,52 @@ mod tests {
         assert!(schedule.corporation.is_none());
         assert!(schedule.train_style.is_none());
         assert!(schedule.dept_train.is_none());
+    }
+
+    #[test]
+    fn train_api_response_parses_real_g2_optional_fields() {
+        // 用 12306 真实返回的 G2 数据验证字段位置解析正确：
+        // - `stationTrainCodeAll` 在 trainDetail 顶层；
+        // - `jiaolu_corporation_code`、`jiaolu_train_style`、`jiaolu_dept_train`
+        //   在 stopTime 站点内，取首站值。
+        let response = serde_json::from_value::<TrainApiResponse>(serde_json::json!({
+            "status": true,
+            "errorMsg": "",
+            "data": {
+                "trainDetail": {
+                    "trainCode": "G2",
+                    "stationTrainCodeAll": "G2",
+                    "stopTime": [
+                        {
+                            "stationNo": "01",
+                            "stationName": "上海虹桥",
+                            "arriveTime": "0643",
+                            "startTime": "0643",
+                            "stopover_time": "0",
+                            "dayDifference": "0",
+                            "stationTrainCode": "G2",
+                            "jiaolu_corporation_code": "天津客运段",
+                            "jiaolu_train_style": "CR400BF-Z",
+                            "jiaolu_dept_train": "北京动车段"
+                        }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        let schedule = response
+            .into_schedule(TrainScheduleRequest {
+                train_code: "G2".to_owned(),
+                travel_date: NaiveDate::from_ymd_opt(2026, 6, 25).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(schedule.train_code, "G2");
+        assert_eq!(schedule.full_train_code.as_deref(), Some("G2"));
+        assert_eq!(schedule.corporation.as_deref(), Some("天津客运段"));
+        assert_eq!(schedule.train_style.as_deref(), Some("CR400BF-Z"));
+        assert_eq!(schedule.dept_train.as_deref(), Some("北京动车段"));
+        // 首站到发时间应被规范化为 HH:MM。
+        assert_eq!(schedule.stops[0].departure_time.as_deref(), Some("06:43"));
     }
 }
