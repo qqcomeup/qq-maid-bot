@@ -24,7 +24,7 @@
 
 ### Changed
 - README 补充 Todo 每日提醒能力说明
-- `.env.example` 补充默认推送入口说明
+- `.env.example` 补充推送入口说明
 
 ## [v0.3.3] - 2026-06-21
 
@@ -39,8 +39,7 @@
 ### Changed
 - `deploy.sh` 增加构建产物校验和缺失检测
 - `Makefile install` target 正确拷贝 release 二进制和控制脚本到 `runtime/`
-- `scripts/llmctl.sh` 增加 `LINES` 日志行数配置支持
-- `scripts/llmctl.sh` 增加 `console` 子命令
+- `scripts/llmctl.sh` 增加 `LINES` 日志行数配置支持与 `console` 子命令
 - `runtime/.env.example` 更新配置项
 - `qq-maid-llm` Web 控制台功能：配置开关、CORS 管理、Markdown 渲染接口
 
@@ -52,27 +51,24 @@
 ## [v0.3.2] - 2026-06-20
 
 ### Added
-- 拆分运行时目录校验与发布包校验脚本
-- 新增 OpenAI `chat_only` 模式、可选群聊处理与运维脚本
-- 新增 `git clone` 后本地部署快速开始指南
-- 添加本地一键部署脚本 `scripts/deploy-local.sh`
+- 运行时目录校验与发布包校验脚本
+- OpenAI `chat_only` 模式、可选群聊处理与运维脚本
+- `git clone` 后本地部署快速开始指南与 `scripts/deploy-local.sh`
+- todo ID 隐藏，统一使用列表序号和关键词匹配
+- 命令回复独立的 Markdown 与纯文本双通道
+- LLM 上游调用健康状态观测，支持 `/ping check` 诊断
+- install 目标将构建产物安装到 `runtime/`
 
 ### Changed
-- 隐藏 todo 内部 ID，统一使用列表序号和关键词匹配
-- 为命令回复引入独立的 Markdown 与纯文本双通道
-- 拆分天气模块为 `types/qweather` 子模块，添加格式单测
-- 更新天气回复格式为 Markdown 并添加诊断字段
-- 为 LLM 上游调用添加健康状态观测并支持 `/ping check` 诊断
-- 添加 install 目标将构建产物安装到 `runtime/`
-- 抽取分层帮助模块并替换内联 `/help` 回复
-- 简化 todo target 解析分支，消除无意义条件判断
+- 天气模块拆分为 `types/qweather` 子模块，回复格式改为 Markdown
+- 抽取分层帮助模块替换内联 `/help` 回复
+- 简化 todo target 解析分支
 - `README-dev.md` 重命名为 `DEVELOPMENT.md`
 
 ### Fixed
 - 群 push 返回的 message_id 写入共享 BotOutboundCache
 - 修复群聊作用域与部署控制台回归
 - 安全增强、部署加固及脚本一致性优化
-- 合并嵌套 if 满足 clippy 警告
 
 ## [v0.3.1] - 2026-06-19
 
@@ -83,27 +79,71 @@
 
 ### Added
 - 扩展多平台发布矩阵，支持 Linux/Windows/macOS/Android 六平台构建
-- 添加超长文件拆分审计报告
-- 精简 `markdown_cell` 中的换行替换逻辑
 
 ### Changed
-- 将 `/ping` 模块拆分为子模块
+- `/ping` 模块拆分为子模块
+- 超长文件拆分与 `markdown_cell` 换行逻辑精简
 
 ## [v0.2.0] - 2026-06-18
 
 ### Added
-- 为 `/ping` 添加摘要/详情双视图和 Markdown 支持
-- 升级 GitHub Actions 依赖版本
+- `/ping` 添加摘要/详情双视图和 Markdown 支持
+- GitHub Actions 依赖版本升级
 
 ## [v0.1.0] - 2026-06-18
 
-### Added
-- 首个公开可用版本
-- Rust Gateway + LLM 双服务架构
-- QQ 官方机器人接入（C2C 私聊、群聊 at 消息）
-- 普通聊天、会话管理、长期记忆、Todo、RSS/Atom 订阅
-- 联网查询、天气、翻译等命令
-- SQLite 持久化（Session、Todo、Memory、RSS）
+首个公开可用版本，从私有仓库迁移而来。
+
+### 项目基础设施
+- Rust 双服务架构：Gateway 接收 QQ 事件，LLM 承载业务逻辑
+- Cargo Workspace 统一管理 `qq-maid-gateway-rs`、`qq-maid-llm`、`qq-maid-common`
+- QQ 官方机器人接入，处理 C2C 私聊和群聊 @ 消息
+- SQLite 统一持久化 Session、Todo、Memory、RSS 状态
+- OpenAI / DeepSeek 多 Provider 支持，候选链 fallback
+- LLM 流式回复、空回复重试、verbose trace
+- 服务控制脚本、make 诊断、部署脚本
+
+### 会话管理
+- 新建、重命名、恢复、清空会话
+- 会话上下文自动压缩与标题自动生成
+- Session 存储从 JSON 文件迁移至 SQLite
+
+### 长期记忆
+- `/memory` 指令生成草稿，用户确认后写入
+- 记忆编辑、删除、查看，按序号管理
+- 记忆存储从 JSONL 迁移至 SQLite
+
+### Todo
+- 新增、查询、完成、恢复、修改、删除待办
+- 按截止时间排序，软删除语义
+- `/todo done` 无参列出已完成，`/todo all` 列出全部状态
+- Todo 存储从 JSON 文件迁移至 SQLite
+
+### RSS / Atom
+- 订阅管理、后台轮询、去重
+- 通过 Gateway `/internal/push` 主动推送
+- 外语标题/摘要自动翻译为简体中文
+- RSS 专用 SQLite 迁移为通用数据库模块
+
+### 查询与命令
+- `/查`、`/查询`、`/search` 联网查询
+- `/火车` 列车时刻查询
+- `/天气` 和风天气查询（含预警、空气质量、生活指数）
+- `/翻译` 多语言翻译
+- 命令回复支持 Markdown 渲染
+
+### 配置与运维
+- 环境变量统一配置入口
+- Prompt 目录外部配置与内置回退
+- 成员 ID 映射、世界观文件支持
+- 日志时间固定上海时区、默认脱敏
+- Gateway 运行时诊断与状态快照
+
+### 代码质量
+- todo_flow、openai、respond 等模块持续拆分为子模块
+- SSE 解析工具、公共 chat primitives 抽取复用
+- 移除已废弃的 Python 接入层和旧 Provider
+- rig-core 升级至 0.38.2
 
 [v0.3.4]: https://github.com/kuliantnt/qq-maid-bot/compare/v0.3.3...v0.3.4
 [v0.3.3]: https://github.com/kuliantnt/qq-maid-bot/compare/v0.3.2...v0.3.3
