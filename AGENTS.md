@@ -243,6 +243,25 @@ commit message 使用简洁中文：
 * 涉及配置、启动方式、环境变量时，commit 说明里要体现。
 * 不要提交密钥、token、账号、私聊记录或真实用户数据。
 
+## 发版本流程
+
+每个发布版本对应一个 `vX.Y.Z` git tag（历史 tag 见 `git tag --list 'v*'`）。
+发版本时按顺序执行：
+
+1. 改版本号：根 `Cargo.toml` 的 `version` 字段（如 `0.4.1` → `0.4.2`）。
+   * 子 crate（`qq-maid-core`、`qq-maid-gateway-rs`、`qq-maid-common`）的版本号独立维护，不跟随根包，除非该 crate 本身有变更需要发布。
+   * 改完 `cargo build` 让 `Cargo.lock` 同步更新，一并提交。
+2. 更新 `CHANGELOG.md`：在顶部新增 `## [vX.Y.Z] - YYYY-MM-DD` 条目，按 keep a changelog 格式写变更。
+3. 提交：`git commit -m "chore: 发布 vX.Y.Z"` 或与版本内容合并的 commit。
+4. 打 tag：`git tag vX.Y.Z`（annotated tag 可加 `-a -m "release vX.Y.Z"`，历史均为轻量 tag，保持一致即可）。
+5. 推送：`git push && git push --tags`（或 `git push origin vX.Y.Z` 单独推 tag）。
+
+注意：
+
+* tag 必须打在对应版本的 commit 上，不要漏打或打错版本号。
+* 发版本前先跑完"常用验证"里的 CI 四步。
+* 不要把未发布的版本号写进 README 或文档里提前预告。
+
 ## 修改前后检查
 
 修改前：
