@@ -2,6 +2,19 @@
 
 本文档基于 [keep a changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，记录每个已发布版本的变更。
 
+## [v0.4.4] - 2026-06-25
+
+### Added
+
+- 新增可配置上下文模块：支持通过 `CONTEXT_MODULES_FILE` 指向 TOML 索引文件，按关键词动态注入普通聊天的 system prompt 模块
+- 模块支持 `always` 常驻、`keywords` 关键词命中、`priority` 优先级排序、`max_dynamic_modules` / `max_total_chars` 预算控制、路径逃逸校验
+- 新增 `context_modules.example.toml` 公开模板，新增 `context/deploy.example.md` / `context/ops.example.md` 示例模块
+
+### Changed
+
+- 重构 `runtime::prompt` 模块，拆分为 `prompt_files`（固定 prompt 加载）、`member_mapping`（成员编号映射）、`context_modules`（可配置上下文模块）三个子模块
+- 世界观不再强绑定 `innerworld_lore.md`，改为通过 `WORLD_FILE` 环境变量独立指定
+
 ## [v0.4.3] - 2026-06-25
 
 ### Fixed
