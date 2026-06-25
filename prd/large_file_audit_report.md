@@ -8,9 +8,20 @@
 
 项目此前已陆续完成若干结构整理，Gateway 侧已拆出 `ping/`、`event.rs`、`protocol.rs`、`logging.rs`、`outbound.rs`、`push.rs`、`dedupe.rs` 等子模块。随着功能持续迭代，部分文件重新增长到 1000 行以上。本报告重新梳理当前所有 1000 行以上的 Rust 文件，作为后续低风险整理的依据，不要求一次性重写。
 
+## 已完成拆分
+
+以下两项为本轮已落地的拆分，对应文件已退出 1000 行清单：
+
+| 文件 | 拆分前 | 拆分后 | 提取目标 | 提交 |
+|------|------:|------:|---------|------|
+| `qq-maid-core/src/runtime/respond/llm_service.rs` | 1130 | 837 | 新增 `runtime/respond/markdown_strip.rs`（315 行），承载 `strip_markdown_for_chat` 及全部 Markdown 剥离辅助函数 | `refactor: 提取 llm_service Markdown 剥离逻辑` |
+| `qq-maid-gateway-rs/src/gateway/mod.rs` | 1121 | 825 | 新增 `gateway/group_filter.rs`（158 行，群聊判定与冷却）、`gateway/streaming.rs`（228 行，流式响应消费） | `refactor: 提取 gateway 群聊判定与流式消费` |
+
+两项拆分均为纯代码移动与可见性调整，未改变外部行为、配置、日志语义；CI 四步（fmt / clippy / test / release build）全过。
+
 ## 当前清单
 
-全仓库 Rust 文件约 46419 行，1000 行以上的文件共 11 个：
+全仓库 Rust 文件约 46532 行，1000 行以上的文件共 9 个：
 
 | # | 文件 | 总行数 | 生产 | 测试 | 所属 crate |
 |---|------|-------:|-----:|-----:|-----------|
@@ -23,14 +34,13 @@
 | 7 | `qq-maid-gateway-rs/src/respond.rs` | 1214 | 690 | 524 | gateway |
 | 8 | `qq-maid-core/src/storage/session.rs` | 1153 | 935 | 218 | core |
 | 9 | `qq-maid-common/src/time_context.rs` | 1144 | 826 | 318 | common |
-| 10 | `qq-maid-core/src/runtime/respond/llm_service.rs` | 1130 | 907 | 223 | core |
-| 11 | `qq-maid-gateway-rs/src/gateway/mod.rs` | 1121 | 916 | 205 | gateway |
 
 说明：
 
 - 第 2、3 项为纯测试文件，行数大但拆分价值低，单独在“不建议拆分”一节说明。
 - 第 4 项 `http/routes.rs` 总行数 1343，但生产代码仅 560 行，测试占 783 行；实际生产规模并不超标。
-- 真正“生产代码超过 800 行”的文件为：`storage/todo.rs`（1303）、`storage/session.rs`（935）、`runtime/respond/llm_service.rs`（907）、`gateway/mod.rs`（916）、`storage/rss.rs`（869）、`time_context.rs`（826）。
+- 真正“生产代码超过 800 行”的文件为：`storage/todo.rs`（1303）、`storage/session.rs`（935）、`storage/rss.rs`（869）、`time_context.rs`（826）。
+- `llm_service.rs`（837）与 `gateway/mod.rs`（825）经本轮拆分后已降至 800 行左右，不再列入主清单，仅在“已完成拆分”一节记录。
 
 ## 逐文件分析
 
@@ -217,69 +227,33 @@
 
 结论：`AGENTS.md` 明确要求“日期、时间和时区语义优先复用 `qq-maid-common/src/time_context.rs`”，该文件是共享基础工具，内聚度高。虽然 826 行生产代码偏大，但拆分可能破坏单一入口语义。如需整理，仅可考虑将“诊断时间格式化”与“业务时间格式化”分组，但不要引入跨模块依赖。优先级低，谨慎处理。
 
-### 10. `qq-maid-core/src/runtime/respond/llm_service.rs` — 1130 行
+### 10. `qq-maid-core/src/runtime/respond/llm_service.rs` — 已拆分（1130 → 837）
 
-职责：LLM 聊天服务核心，消息构建、provider 调用、回复截断、Markdown 剥离、trace 日志。
+本轮已将 Markdown 剥离逻辑提取为 `runtime/respond/markdown_strip.rs`（315 行），包含 `strip_markdown_for_chat` 及其全部辅助函数。`llm_service.rs` 现保留消息构建、provider 调用、trace 日志、`truncate_reply`、`clean_memory_draft_output`、`format_chat_reply_channels` 等职责，降至 837 行，已退出 1000 行清单。
 
-内部结构：
+剩余结构（消息构建函数族、trace 函数族）内聚度尚可，暂无进一步拆分计划。
 
-- 常量：`MAX_REPLY_LENGTH`、`MAX_MEMORY_DRAFT_LENGTH`、`CHAT_TRACE_TEXT_LIMIT`
-- `ChatService` trait、`RespondOutput`、`LlmChatService` 及 `impl ChatService`
-- trace 函数族：`trace_chat_messages`、`trace_chat_raw_reply`、`trace_chat_final_reply`、`trace_chat_*_enabled`、`format_chat_message_trace`、`chat_role_name`、`respond_purpose_name`、`trace_session_id`、`trace_scope_key`、`trace_text`
-- 消息构建：`build_respond_messages`、`with_request_time_context`、`llm_time_context_prompt`、`has_request_time_context`、`build_chat_messages`、`build_memory_draft_messages`、`build_legacy_memory_draft_messages`、`build_memory_create_messages`、`build_memory_revise_messages`、`build_todo_parse_messages`、`build_compact_messages`
-- 回复处理：`truncate_reply`、`strip_markdown_for_chat`、`flatten_markdown_tables`、`strip_markdown_line`、`strip_*_prefix`、`strip_inline_markdown`、`count_run`、`find_backtick_run`、`parse_markdown_link`、`find_closing_*`、`strip_emphasis_markers`、`protect_inline_literal`、`restore_inline_literals`
-- `clean_memory_draft_output`、`response_from_output`、`format_chat_reply_channels`
-- `mod tests`（223 行）
+### 11. `qq-maid-gateway-rs/src/gateway/mod.rs` — 已拆分（1121 → 825）
 
-潜在拆分边界：
+本轮已提取两个子模块：
 
-- Markdown 剥离逻辑（`strip_markdown_for_chat` 及其全部辅助函数 `flatten_markdown_tables`、`strip_markdown_line`、`strip_*_prefix`、`strip_inline_markdown`、`count_run`、`find_backtick_run`、`parse_markdown_link`、`strip_emphasis_markers`、`protect_inline_literal` 等）是自包含的纯文本处理，约 300+ 行，可提取为 `runtime/respond/markdown_strip.rs`。这是本文件最明确的自然边界。
-- trace 函数族可考虑分组，但与 `RespondRequest` 紧密耦合，且涉及脱敏开关，不建议强行移动。
-- 消息构建函数族按 purpose 分散，但共享 `RespondRequest` 上下文，内聚度尚可。
+- `gateway/group_filter.rs`（158 行）：`GroupCooldowns`、`should_ignore_group_message`、`should_process_group_message`、`is_group_command`、`contains_bot_mention`、`is_reply_to_bot`、`group_user_key` 及冷却常量。
+- `gateway/streaming.rs`（228 行）：`build_streaming_buffered_response`、`collect_streaming_final_response`、`handle_streaming_respond_response`。
 
-风险：Markdown 剥离策略直接影响用户可见回复格式，必须保持现有行为；`strip_markdown_for_chat` 被 `chat_flow` 等调用，移动后签名不变。优先级中高（Markdown 剥离提取收益明确、风险低）。
+`mod.rs` 现保留主循环 `run`、`handle_group_message`、`handle_c2c_message`、`send_group_respond_response`、`render_local_ping_reply`、`resolve_signals`、`BotOutboundCache`、日志函数，降至 825 行，已退出 1000 行清单。
 
-### 11. `qq-maid-gateway-rs/src/gateway/mod.rs` — 1121 行
-
-职责：Gateway 主循环与消息处理编排，WebSocket 连接生命周期、C2C / Group 消息处理、流式响应消费、群聊冷却。
-
-内部结构（已拆出 `dedupe` / `event` / `logging` / `protocol` / `outbound` / `ping` / `push` 子模块）：
-
-- 模块声明、常量（`DEDUPE_TTL`、`GROUP_COOLDOWN`、`GROUP_USER_COOLDOWN`）、`BotOutboundCache`、`GroupCooldowns`
-- `resolve_signals`
-- `run`（约 129–208 行）：主循环、建连、事件分发顶层编排
-- `handle_group_message`（约 209–320 行）
-- `send_group_respond_response`（约 321–371 行）
-- `collect_streaming_final_response`（约 372–395 行）
-- `handle_c2c_message`（约 396–607 行）
-- `render_local_ping_reply`（约 608–619 行）
-- `handle_streaming_respond_response`（约 620–771 行）
-- 群聊判定 helper：`should_ignore_group_message`、`should_process_group_message`、`is_group_command`、`contains_bot_mention`、`is_reply_to_bot`、`group_user_key`
-- `build_streaming_buffered_response`
-- 日志：`log_c2c_message_received`、`log_group_message_received`
-- `mod tests`（205 行）
-
-潜在拆分边界：
-
-- 群聊判定 helper（`should_ignore_group_message`、`should_process_group_message`、`is_group_command`、`contains_bot_mention`、`is_reply_to_bot`、`group_user_key`）是纯判定逻辑，可提取为 `gateway/group_filter.rs` 或并入现有 `event.rs`。
-- 流式响应消费（`handle_streaming_respond_response`、`collect_streaming_final_response`、`build_streaming_buffered_response`）可提取为 `gateway/streaming.rs`，C2C 与 Group 共用。
-- `handle_c2c_message` 与 `handle_group_message` 是各自流程的编排，保留在 `mod.rs` 或提取为 `gateway/c2c.rs` / `gateway/group.rs`，但需先确认两者是否真有可复用的流式 / 发送逻辑，不要为复用创建万能 handler。
-- 日志函数可并入现有 `logging.rs`。
-
-风险：C2C 与 Group 在引用方式、目标标识、权限上存在差异，必须显式保留。群聊冷却、消息去重、`/ping` 本地处理、发送状态记录语义不变。`run` 主循环的连接生命周期与事件分发顶层编排应保留在 `mod.rs`。优先级中高（群聊判定 helper 与流式消费提取收益明确）。
+`handle_c2c_message` 与 `handle_group_message` 是各自流程的编排，保留在 `mod.rs`；如未来继续增长，可考虑提取为 `gateway/c2c.rs` / `gateway/group.rs`，但需先确认两者是否真有可复用的流式 / 发送逻辑，不要为复用创建万能 handler。
 
 ## 拆分优先级建议
 
-按“收益明确、风险低”排序：
+按“收益明确、风险低”排序（已完成的不再列入）：
 
-1. **高**：`llm_service.rs` 提取 Markdown 剥离逻辑为独立模块（自包含纯文本处理，约 300+ 行，调用方少）。
-2. **高**：`gateway/mod.rs` 提取群聊判定 helper 与流式响应消费（纯判定 / 共用消费逻辑，边界清晰）。
-3. **中**：`respond.rs` 提取 SSE 解析与错误转换（纯协议 / 纯文本，但涉及 gateway-core 边界类型）。
-4. **中**：`runtime/train/mod.rs` 提取 API 反序列化与行程校验（近期有字段改动，需基于最新语义）。
-5. **中低**：`storage/todo.rs` 提取排序逻辑（纯函数，但被 todo_flow 多处依赖）。
-6. **中低**：`http/routes.rs` 提取 console / markdown render（生产代码仅 560 行，收益有限）。
-7. **低**：`storage/rss.rs` legacy 兼容集中、`storage/session.rs` 脱敏独立（内聚度高，风险高于收益）。
-8. **低 / 谨慎**：`time_context.rs`（共享基础工具，`AGENTS.md` 明确要求复用，不建议轻易拆分）。
+1. **中**：`respond.rs` 提取 SSE 解析与错误转换（纯协议 / 纯文本，但涉及 gateway-core 边界类型）。
+2. **中**：`runtime/train/mod.rs` 提取 API 反序列化与行程校验（近期有字段改动，需基于最新语义）。
+3. **中低**：`storage/todo.rs` 提取排序逻辑（纯函数，但被 todo_flow 多处依赖）。
+4. **中低**：`http/routes.rs` 提取 console / markdown render（生产代码仅 560 行，收益有限）。
+5. **低**：`storage/rss.rs` legacy 兼容集中、`storage/session.rs` 脱敏独立（内聚度高，风险高于收益）。
+6. **低 / 谨慎**：`time_context.rs`（共享基础工具，`AGENTS.md` 明确要求复用，不建议轻易拆分）。
 
 ## 不建议拆分的文件
 
@@ -320,5 +294,5 @@ cargo build --workspace --release --all-features
 
 ## 备注
 
-- 本报告行数与结构基于当前 master 真实代码，后续若 codex 或其他改动导致结构变化，需重新统计。
+- 本报告行数与结构基于本轮拆分完成后的真实代码，后续若 codex 或其他改动导致结构变化，需重新统计。
 - `storage/todo.rs` 的 `infer_due_date_from_text` 与 `qq-maid-common/src/time_context.rs` 同名函数存在重复，整理前需先确认调用关系，避免盲目合并破坏 todo 时间推断语义。
