@@ -1,6 +1,6 @@
 //! OpenAI 聊天链路的 fallback 判定策略。
 //!
-//! 这些策略需要同时服务 Responses 主链路和 rig-core Chat Completions fallback，
+//! 这些策略需要同时服务 Responses 主链路和 Chat Completions fallback，
 //! 因此单独拆出来，避免各条链路复制同一套“是否值得再试一次”的规则。
 
 use crate::{error::LlmError, provider::ChatOutcome};
@@ -18,8 +18,8 @@ pub(crate) fn should_retry_non_stream_after_stream_error(err: &LlmError) -> bool
     ) && matches!(err.stage.as_str(), "provider" | "stream" | "http")
 }
 
-/// 当 Responses 主链路失败时，是否允许降级到 rig-core Chat Completions。
-pub(crate) fn should_fallback_to_rig_after_responses_error(err: &LlmError) -> bool {
+/// 当 Responses 主链路失败时，是否允许降级到 Chat Completions。
+pub(crate) fn should_fallback_to_chat_after_responses_error(err: &LlmError) -> bool {
     matches!(
         err.code.as_str(),
         "provider_error" | "http_error" | "timeout"
@@ -29,7 +29,7 @@ pub(crate) fn should_fallback_to_rig_after_responses_error(err: &LlmError) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::metrics::LlmMetrics;
+    use crate::metrics::LlmMetrics;
 
     fn mock_outcome(reply: &str) -> ChatOutcome {
         ChatOutcome {
@@ -79,21 +79,21 @@ mod tests {
     }
 
     #[test]
-    fn responses_errors_trigger_rig_fallback_only_for_upstream_failures() {
-        assert!(should_fallback_to_rig_after_responses_error(
+    fn responses_errors_trigger_chat_fallback_only_for_upstream_failures() {
+        assert!(should_fallback_to_chat_after_responses_error(
             &LlmError::http("OpenAI chat returned HTTP 400")
         ));
-        assert!(should_fallback_to_rig_after_responses_error(
+        assert!(should_fallback_to_chat_after_responses_error(
             &LlmError::provider("invalid OpenAI chat stream JSON", "sse")
         ));
-        assert!(!should_fallback_to_rig_after_responses_error(
+        assert!(!should_fallback_to_chat_after_responses_error(
             &LlmError::new(
                 "bad_request",
                 "messages must contain non-empty content",
                 "request"
             )
         ));
-        assert!(!should_fallback_to_rig_after_responses_error(
+        assert!(!should_fallback_to_chat_after_responses_error(
             &LlmError::config("OPENAI_API_KEY is required")
         ));
     }

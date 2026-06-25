@@ -1,27 +1,26 @@
-//! DeepSeek (Rig) 提供商实现。
+//! DeepSeek 提供商实现。
 //!
-//! 基于 `rig-core` 的 DeepSeek 客户端封装，复用 `provider/openai`
-//! 顶层导出的通用补全函数（`completion_with_stream_fallback`、`to_rig_messages`）。
+//! DeepSeek 使用 OpenAI 兼容 Chat Completions 协议；本模块只维护
+//! DeepSeek 的 base URL、认证和模型前缀规则差异。
 
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rig_core::{client::CompletionClient, completion::CompletionModel, providers::deepseek};
 
 use crate::{
-    config::AppConfig,
+    config::LlmConfig,
     error::LlmError,
     provider::{
         ChatOutcome, LlmProvider,
-        openai::{completion_with_stream_fallback, to_rig_messages},
+        openai::{ChatCompletionsClient, chat_completions_with_stream_fallback},
         types::{ChatRequest, ModelId, ModelProvider},
     },
 };
 
-/// 基于 rig-core 的 DeepSeek 提供商实现。
-pub struct DeepSeekRigProvider {
-    /// rig-core DeepSeek HTTP 客户端。
-    client: deepseek::Client,
+/// DeepSeek 提供商实现。
+pub struct DeepSeekProvider {
+    /// OpenAI 兼容 Chat Completions 客户端。
+    client: ChatCompletionsClient,
     /// 默认模型名称（如 `"deepseek-chat"`）。
     model: String,
     /// 是否启用流式传输。
@@ -30,11 +29,9 @@ pub struct DeepSeekRigProvider {
     max_output_tokens: u64,
 }
 
-impl DeepSeekRigProvider {
-    /// 从应用配置创建 DeepSeek 提供商实例。
-    ///
-    /// 需要配置 `deepseek_api_key` 和 `deepseek_base_url`。
-    pub fn new(config: &AppConfig) -> Result<Self, LlmError> {
+impl DeepSeekProvider {
+    /// 从 LLM 配置创建 DeepSeek 提供商实例。
+    pub fn new(config: &LlmConfig) -> Result<Self, LlmError> {
         let api_key = config
             .deepseek_api_key
             .clone()
@@ -45,14 +42,11 @@ impl DeepSeekRigProvider {
             .map_err(|err| {
                 LlmError::config(format!("failed to build DeepSeek HTTP client: {err}"))
             })?;
-        let client = deepseek::Client::builder()
-            .api_key(api_key)
-            .base_url(&config.deepseek_base_url)
-            .http_client(http_client)
-            .build()
-            .map_err(|err| {
-                LlmError::config(format!("failed to build DeepSeek rig client: {err}"))
-            })?;
+        let client = ChatCompletionsClient::new(
+            api_key,
+            Some(config.deepseek_base_url.as_str()),
+            http_client,
+        );
 
         Ok(Self {
             client,
@@ -64,17 +58,17 @@ impl DeepSeekRigProvider {
 }
 
 #[async_trait]
-impl LlmProvider for DeepSeekRigProvider {
+impl LlmProvider for DeepSeekProvider {
     async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome, LlmError> {
         let effective_model = effective_deepseek_model(req.model.as_deref(), &self.model)?;
-        completion_with_stream_fallback(self.stream, self.name(), &effective_model, || {
-            let model = self.client.completion_model(effective_model.clone());
-            let (prompt, history) = to_rig_messages(&req.messages)?;
-            Ok(model
-                .completion_request(prompt)
-                .messages(history)
-                .max_tokens(self.max_output_tokens))
-        })
+        chat_completions_with_stream_fallback(
+            self.stream,
+            &self.client,
+            self.name(),
+            &effective_model,
+            self.max_output_tokens,
+            &req.messages,
+        )
         .await
     }
 
@@ -92,8 +86,6 @@ impl LlmProvider for DeepSeekRigProvider {
 }
 
 /// 验证并解析 DeepSeek 的配置模型名。
-///
-/// 只允许 `deepseek:` 前缀或无前缀；若为 `openai:` 前缀则返回配置错误。
 pub(crate) fn deepseek_config_model(value: &str) -> Result<String, LlmError> {
     let model = ModelId::parse_config(value, "DEEPSEEK_MODEL")?;
     match model.provider {
@@ -105,9 +97,6 @@ pub(crate) fn deepseek_config_model(value: &str) -> Result<String, LlmError> {
 }
 
 /// 决定本次请求实际使用的 DeepSeek 模型名称。
-///
-/// 如果请求中指定了模型，则去掉 `deepseek:` 前缀后返回；
-/// 若指定了 `openai:` 前缀则拒绝；无指定时返回默认模型。
 fn effective_deepseek_model(
     override_model: Option<&str>,
     default_model: &str,

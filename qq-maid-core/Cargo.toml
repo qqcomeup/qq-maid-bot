@@ -32,10 +32,8 @@ regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["gzip", "json", "rustls"] }
 # gateway 与 Core 共享的无业务状态基础工具。
 qq-maid-common = { path = "../qq-maid-common" }
-# LLM 调用框架（Rig）
-# 0.38.2 修复了 OpenAI Responses 流式返回中新字段/可选字段的兼容问题，
-# 避免合法 SSE 事件在本地被误判为反序列化失败后退化到空回复或额外 fallback。
-rig-core = "0.38.2"
+# LLM Provider、路由、SSE、usage、健康状态和 Web Search 协议由独立 crate 承载。
+qq-maid-llm = { path = "../qq-maid-llm" }
 # SQLite 存储，当前承载 Session、Todo、Memory、RSS 订阅和去重状态
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 # 序列化/反序列化

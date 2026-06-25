@@ -67,13 +67,13 @@ bash scripts/deploy-local.sh
 | 能力 | 当前实现 |
 | --- | --- |
 | QQ 接入 | 基于 QQ 官方 Gateway，处理 C2C 私聊和群聊 at 文本主链路；普通群消息默认关闭，可按模式启用 |
-| 普通聊天 | 未命中命令时进入 Rust LLM 聊天流程 |
+| 普通聊天 | 未命中命令时进入 Rust Core 业务 flow，并通过 `qq-maid-llm` 调用模型 |
 | 会话管理 | 支持新建、重命名、恢复、清空、状态查看、上下文压缩和自动标题 |
 | 长期记忆 | 通过明确 `/memory` 指令生成草稿，确认后写入，不从普通聊天自动写记忆 |
 | Todo | 支持新增、查询、完成、恢复、修改、删除和已完成任务清理；`/todo add` 可识别火车行程，自动查询 12306 校验车次、站点和时间后创建待办；支持按 Asia/Shanghai 每日定时向个人私聊推送当日待办提醒 |
 | RSS / Atom | 支持订阅管理、轮询、去重和通过 Gateway 主动推送；外语标题和摘要会在推送前尽力翻译为简体中文，失败时使用原文 |
 | 主动消息推送 | Gateway 提供本机 `/internal/push`，供 RSS 调度与 Todo 每日提醒推送到私聊或群聊目标 |
-| 联网查询 | `/查`、`/查询`、`/search` 通过 Core 模块内的查询流程执行 |
+| 联网查询 | `/查`、`/查询`、`/search` 由 Core 解析和排版，并通过 `qq-maid-llm` 的 OpenAI Web Search 协议执行 |
 | 列车时刻 | `/火车 G1`、`/火车 G1 明天`、`/火车 G1 2026-06-28` 查询指定日期列车经停时刻，未带日期时默认今天 |
 | 天气 | `/天气杭州`、`/杭州天气` 等命令调用天气执行器 |
 | 翻译 | `/翻译` 默认翻译为简体中文，`/翻译日语`、`/翻译成英语` 等显式目标语言命令复用模型 provider |
@@ -97,7 +97,8 @@ bash scripts/deploy-local.sh
 项目运行时只启动一个 `qq-maid-bot` 程序，但内部仍保持 Gateway 与 Core 的清晰边界，并通过根目录 Cargo Workspace 统一管理：
 
 - `qq-maid-gateway-rs/` 专注 QQ 事件接收、消息转换、回复发送、`/ping` 诊断和本机主动推送入口。
-- `qq-maid-core/` 负责 `/v1/respond`、普通聊天、查询、天气、翻译、会话、长期记忆、Todo、RSS 和模型 provider 调用。
+- `qq-maid-core/` 负责 `/v1/respond`、普通聊天、查询命令、天气、翻译、会话、长期记忆、Todo、RSS 和业务 prompt 组装。
+- `qq-maid-llm/` 负责模型协议、Provider 路由、fallback、SSE、usage、健康观测和 OpenAI Web Search。
 - `qq-maid-common/` 只放两个服务共享的基础工具，例如时间、日期和时区处理，不承载业务 flow。
 
 统一进程只合并启动和运维入口；Gateway 仍通过本机 HTTP 调用 Core 的 `/v1/respond`，因此现有业务边界和协议保持不变。
@@ -138,7 +139,7 @@ graph TD
     A[QQ 官方机器人平台] --> B[qq-maid-bot]
     B --> C[Gateway 模块]
     C -->|POST http://127.0.0.1:8787/v1/respond| D[Core HTTP 模块]
-    D --> E[模型 Provider]
+    D --> E[qq-maid-llm 模型 Provider]
     D --> F[(SQLite APP_DB_FILE)]
     D --> G[查询与天气服务]
     D --> H[RSS / Todo / Memory / Session]
@@ -215,6 +216,7 @@ make run
 
 - 开发维护文档：[DEVELOPMENT.md](./DEVELOPMENT.md)
 - Core 模块文档：[qq-maid-core/README.md](./qq-maid-core/README.md)
+- LLM 基础设施文档：[qq-maid-llm/README.md](./qq-maid-llm/README.md)
 - Gateway 文档：[qq-maid-gateway-rs/README.md](./qq-maid-gateway-rs/README.md)
 - 运行目录说明：[runtime/README.md](./runtime/README.md)
 - 配置模板：[runtime/.env.example](./runtime/.env.example)

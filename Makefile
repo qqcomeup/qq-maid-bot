@@ -1,13 +1,14 @@
 CORE_DIR := qq-maid-core
 GATEWAY_DIR := qq-maid-gateway-rs
 COMMON_DIR := qq-maid-common
+LLM_DIR := qq-maid-llm
 BOT_BIN := qq-maid-bot
 
 # status 只统计 Git 已跟踪的 Rust 源码。
 # 不统计 target/、脚本、配置、README、Makefile。
-STATUS_RUST_PATHS := ':(glob)$(COMMON_DIR)/**/*.rs' ':(glob)$(CORE_DIR)/**/*.rs' ':(glob)$(GATEWAY_DIR)/**/*.rs'
+STATUS_RUST_PATHS := ':(glob)$(COMMON_DIR)/**/*.rs' ':(glob)$(LLM_DIR)/**/*.rs' ':(glob)$(CORE_DIR)/**/*.rs' ':(glob)$(GATEWAY_DIR)/**/*.rs'
 
-.PHONY: help status build install deploy deploy-local deploy-remote run test test-common test-core test-gateway common-fmt common-test common-check core-fmt core-test core-check gateway-fmt gateway-test gateway-check clean doctor diagnose
+.PHONY: help status build install deploy deploy-local deploy-remote run test test-common test-llm test-core test-gateway common-fmt common-test common-check llm-fmt llm-test llm-check core-fmt core-test core-check gateway-fmt gateway-test gateway-check clean doctor diagnose
 
 help:
 	@echo "make status        查看项目状态和 Rust 源码行数"
@@ -18,6 +19,7 @@ help:
 	@echo "make run           启动统一 qq-maid-bot 程序"
 	@echo "make test          运行根目录 Cargo workspace 的 fmt、test 和 check"
 	@echo "make test-common   运行 Rust common fmt check、测试和 check"
+	@echo "make test-llm      运行 Rust LLM fmt check、测试和 check"
 	@echo "make test-core     运行 Rust common 和 Core fmt check、测试和 check"
 	@echo "make test-gateway  运行 Rust common 和 QQ C2C gateway fmt、测试和 check"
 	@echo "make diagnose      运行网络和环境诊断脚本"
@@ -71,7 +73,9 @@ test:
 
 test-common: common-fmt common-test common-check
 
-test-core: common-fmt core-fmt common-test core-test common-check core-check
+test-llm: common-fmt llm-fmt common-test llm-test common-check llm-check
+
+test-core: common-fmt llm-fmt core-fmt common-test llm-test core-test common-check llm-check core-check
 
 test-gateway: common-fmt gateway-fmt common-test gateway-test common-check gateway-check
 
@@ -83,6 +87,15 @@ common-test:
 
 common-check:
 	cargo check -p qq-maid-common
+
+llm-fmt:
+	cargo fmt -p qq-maid-llm -- --check
+
+llm-test:
+	cargo test -p qq-maid-llm
+
+llm-check:
+	cargo check -p qq-maid-llm
 
 core-fmt:
 	cargo fmt -p qq-maid-core -- --check

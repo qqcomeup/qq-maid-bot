@@ -328,6 +328,40 @@ impl AppConfig {
         }
         Ok(routes)
     }
+
+    /// 提取 LLM crate 所需的 Provider 基础配置。
+    ///
+    /// Todo、标题、记忆、压缩和翻译模型仍由 Core 解析和管理，这里只把对应
+    /// `ModelRoute` 作为可用候选链传给 LLM 层做启动期 provider 校验。
+    pub fn llm_config(&self) -> qq_maid_llm::config::LlmConfig {
+        qq_maid_llm::config::LlmConfig {
+            provider: match self.provider {
+                ProviderMode::OpenAi => qq_maid_llm::config::ProviderMode::OpenAi,
+                ProviderMode::DeepSeek => qq_maid_llm::config::ProviderMode::DeepSeek,
+                ProviderMode::Auto => qq_maid_llm::config::ProviderMode::Auto,
+            },
+            model_route: self.model_route.clone(),
+            configured_model_routes: self
+                .configured_model_routes()
+                .expect("model routes are validated when AppConfig is created")
+                .into_iter()
+                .map(|(name, route)| (name.to_owned(), route))
+                .collect(),
+            openai_api_key: self.openai_api_key.clone(),
+            openai_base_url: self.openai_base_url.clone(),
+            openai_api_mode: match self.openai_api_mode {
+                OpenAiApiMode::Auto => qq_maid_llm::config::OpenAiApiMode::Auto,
+                OpenAiApiMode::ChatOnly => qq_maid_llm::config::OpenAiApiMode::ChatOnly,
+            },
+            deepseek_api_key: self.deepseek_api_key.clone(),
+            deepseek_base_url: self.deepseek_base_url.clone(),
+            deepseek_model: self.deepseek_model.clone(),
+            stream: self.stream,
+            request_timeout_seconds: self.request_timeout_seconds,
+            max_output_tokens: self.max_output_tokens,
+            openai_search_model: self.openai_search_model.clone(),
+        }
+    }
 }
 
 /// 默认项目通用 SQLite 文件路径。

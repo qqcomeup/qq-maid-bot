@@ -16,10 +16,25 @@
 当前主线只保留：
 
 * `qq-maid-gateway-rs/`：Rust QQ 官方 gateway 接入层，负责 QQ 事件、消息转换、白名单、本地 `/ping` 和回复发送。
-* `qq-maid-core/`：Rust Core 模块，负责 `/v1/respond`、查询、记忆、session、todo、命令、prompt 和 provider 调用。
-* `qq-maid-common/`：Rust 共享基础工具，只放 gateway 和 Core 都需要、且不依赖业务状态的通用逻辑。
+* `qq-maid-core/`：Rust Core 模块，负责 `/v1/respond`、查询、记忆、session、todo、命令、prompt 和业务模型路由；通过 `qq-maid-llm` 调用模型。
+* `qq-maid-llm/`：Rust LLM 基础设施 crate，负责模型调用协议、Provider 路由、fallback、SSE、usage、健康观测和 OpenAI Web Search 协议；不依赖 `qq-maid-core`。
+* `qq-maid-common/`：Rust 共享基础工具，仅承载两个及以上 crate 共用的通用逻辑，且不得依赖业务状态。
 * `runtime/`：服务器部署运行目录，只放 release 二进制、运行配置和运行产物。
 * `scripts/`：部署、进程控制和诊断脚本源码。
+
+依赖方向固定为：
+
+```text
+qq-maid-gateway-rs
+        ↓
+qq-maid-core
+        ↓
+qq-maid-llm
+        ↓
+qq-maid-common / reqwest / serde / tokio
+```
+
+禁止 `qq-maid-llm` 反向依赖 `qq-maid-core`，也不要让 `qq-maid-core` 绕过 `qq-maid-llm` 直接维护 Provider 协议实现。
 
 当前 Rust 构建由仓库根目录 Cargo Workspace 统一管理：
 
@@ -77,14 +92,15 @@ Rust HTTP 层只公开：
 重点保持这些边界：
 
 * gateway 负责 QQ 接入、事件解析、`/ping` 本地诊断和回复发送。
-* LLM、查询、记忆、session、todo、命令和 prompt 等业务能力放在 Rust / rig-core。
+* LLM 协议、Provider、路由、fallback、SSE、usage、健康观测和 Web Search 协议放在 `qq-maid-llm`。
+* 业务 prompt、查询、记忆、session、todo、命令和业务模型路由放在 `qq-maid-core`，通过 `qq-maid-llm` 的统一入口调用模型。
 * 新功能优先通过 Rust `/v1/respond` 或 Rust 内部模块承载。
 * `runtime/respond.rs` 保留 `/v1/respond` facade。
 * 具体 session/search/todo/memory/chat flow 在 `runtime/respond/` 下维护。
 * pending operation 类型与确认分类优先复用 `runtime/pending/`。
 * respond pending 分发逻辑保留在 `runtime/respond/pending.rs`。
-* provider-facing chat primitives 保留在 `provider/types.rs`。
-* 查询模块保留在 `runtime/query/`。
+* provider-facing chat primitives 保留在 `qq-maid-llm/src/provider/types.rs`；core 侧 `provider/` 仅作为兼容 re-export 入口。
+* 查询模块保留在 `runtime/query/`；`/查` 的模型协议实现保留在 `qq-maid-llm/src/web_search.rs`。
 * 文件持久化实现放在 `storage/session.rs`、`storage/memory.rs`、`storage/todo.rs`。
 
 不要随意改变：
@@ -97,6 +113,8 @@ Rust HTTP 层只公开：
 * OpenAI / DeepSeek fallback；
 * Rust `/v1/respond` 调用路径；
 * 已确认持久化数据格式。
+
+不要在 `qq-maid-core` 中重新实现已迁入 `qq-maid-llm` 的 Provider 协议、SSE frame 解析、模型候选链或健康观测逻辑；需要这些能力时直接复用 `qq-maid-llm` 的公开入口（`LlmService::chat` / `web_search` / `web_search_stream` / `upstream_status`）。
 
 通用逻辑优先复用，不要在具体命令里重复实现。
 
@@ -188,6 +206,7 @@ cargo build --workspace --release --all-features
 * 修改 `scripts/*.sh`：至少执行 `bash -n` 对应脚本。
 * 涉及诊断入口时执行 `make diagnose`。
 * 修改启动、配置、依赖、QQ 事件或 OpenAI / DeepSeek 调用：需要本地启动验证。
+* 修改 `qq-maid-llm` 的 Provider 协议、SSE 解析或模型候选链：需要跑 `qq-maid-llm` 的单测，并确认 core 侧调用链无回归。
 * 修改代码后按项目已有命令格式化，不要为了格式化引入新依赖。
 
 如果某项检查无法执行，需要在最终说明里写明原因。
@@ -249,7 +268,7 @@ commit message 使用简洁中文：
 发版本时按顺序执行：
 
 1. 改版本号：根 `Cargo.toml` 的 `version` 字段（如 `0.4.1` → `0.4.2`）。
-   * 子 crate（`qq-maid-core`、`qq-maid-gateway-rs`、`qq-maid-common`）的版本号独立维护，不跟随根包，除非该 crate 本身有变更需要发布。
+   * 子 crate（`qq-maid-core`、`qq-maid-gateway-rs`、`qq-maid-llm`、`qq-maid-common`）的版本号独立维护，不跟随根包，除非该 crate 本身有变更需要发布。
    * 改完 `cargo build` 让 `Cargo.lock` 同步更新，一并提交。
 2. 更新 `CHANGELOG.md`：在顶部新增 `## [vX.Y.Z] - YYYY-MM-DD` 条目，按 keep a changelog 格式写变更。
 3. 提交：`git commit -m "chore: 发布 vX.Y.Z"` 或与版本内容合并的 commit。

@@ -54,7 +54,10 @@ impl LlmRuntime {
     pub fn from_config(config: AppConfig) -> anyhow::Result<Self> {
         let addr: SocketAddr = format!("{}:{}", config.server_host, config.server_port).parse()?;
         let upstream_status = UpstreamStatus::default();
-        let provider = observe_provider(build_provider(&config)?, upstream_status.clone());
+        let provider = observe_provider(
+            build_provider(&config.llm_config())?,
+            upstream_status.clone(),
+        );
         let translation_service =
             TranslationService::new(provider.clone(), config.translation_model.clone());
         let query_executor = build_query_executor(&config)?;

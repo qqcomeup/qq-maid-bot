@@ -6,13 +6,13 @@
 use crate::error::LlmError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SseFrame {
-    pub(crate) event: Option<String>,
-    pub(crate) data: String,
+pub struct SseFrame {
+    pub event: Option<String>,
+    pub data: String,
 }
 
 /// 从 SSE 字节缓冲区中取出一个完整 frame。
-pub(crate) fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+pub fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let (index, delimiter_len) = find_sse_delimiter(buffer)?;
     let frame = buffer[..index].to_vec();
     buffer.drain(..index + delimiter_len);
@@ -31,7 +31,7 @@ fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-pub(crate) fn parse_sse_frame(frame: &[u8]) -> Result<Option<SseFrame>, LlmError> {
+pub fn parse_sse_frame(frame: &[u8]) -> Result<Option<SseFrame>, LlmError> {
     let text = std::str::from_utf8(frame)
         .map_err(|err| LlmError::provider(format!("invalid SSE stream UTF-8: {err}"), "sse"))?;
     let mut event = None;

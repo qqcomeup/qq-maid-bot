@@ -2,6 +2,36 @@
 
 本文档基于 [keep a changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，记录每个已发布版本的变更。
 
+## [v0.5.0] - 2026-06-25
+
+### Added
+
+- 新增独立 `qq-maid-llm` library crate，承载模型调用协议、Provider 路由、fallback、SSE、usage、健康观测和 OpenAI Web Search 协议；不依赖 `qq-maid-core`
+- 新增 `qq-maid-llm/README.md`，说明 crate 职责边界、统一入口、模块结构、配置边界和调用链
+- 依赖方向固定为 `qq-maid-gateway-rs → qq-maid-core → qq-maid-llm → qq-maid-common`，禁止反向依赖
+
+### Changed
+
+- 将 OpenAI Responses、Chat Completions、DeepSeek、模型候选链、SSE 解析、LLM metrics、健康观测和 `/查` Web Search 协议从 `qq-maid-core` 迁入 `qq-maid-llm`
+- OpenAI Chat Completions 改为基于 `reqwest` 的自研实现，支持流式与非流式、`[DONE]`、usage 与 cached token 提取、空流补非流、401/403/429/timeout/5xx 与非标准错误正文分类
+- DeepSeek 复用 OpenAI 兼容 Chat Completions adapter，不再维护独立 SDK 封装，只保留 base URL、认证和模型规则差异
+- 聊天 Responses 与 `/查` Web Search 共用同一套 SSE frame 解析（`qq-maid-llm/src/sse.rs`），消除重复实现
+- `qq-maid-core` 改为通过 `LlmService::chat` / `web_search` / `web_search_stream` / `upstream_status` 公开入口调用模型；core 侧 `provider/` 仅作为兼容 re-export 入口
+- `LlmError` 收敛为仅模型调用相关错误（Provider 配置、网络/超时、HTTP 上游、SSE/协议、空回复、候选全部失败）；core 在 LLM 调用边界完成错误转换，保持用户侧错误格式和文案兼容
+- 普通聊天、标题、Todo、记忆、Compact、翻译和 `/查` 全部切换到新的 `qq-maid-llm` 调用链，Prompt 组装位置、模型选择、fallback 顺序、用户侧回复内容和格式、健康检查数据保持不变
+- README 文档导航补充 `qq-maid-llm/README.md` 链接
+- AGENTS.md 同步更新项目定位、依赖方向、代码修改边界和常用验证规则
+
+### Removed
+
+- 从 `Cargo.toml`、`Cargo.lock` 和源码中完全移除 `rig-core` 依赖
+- 删除 `qq-maid-core` 中已迁移的 Provider 实现（`provider/deepseek.rs`、`provider/openai/`、`provider/status.rs`、`util/sse.rs` 等）
+- 删除 `/查` 中已迁移的模型协议代码
+
+### Fixed
+
+- 修复聊天 Responses 与 `/查` 各自维护一套 SSE frame 解析导致的重复实现问题
+
 ## [v0.4.5] - 2026-06-25
 
 ### Changed
@@ -247,6 +277,7 @@ bash scripts/deploy-local.sh
 - 移除已废弃的 Python 接入层和旧 Provider
 - rig-core 升级至 0.38.2
 
+[v0.5.0]: https://github.com/kuliantnt/qq-maid-bot/compare/v0.4.5...v0.5.0
 [v0.3.4]: https://github.com/kuliantnt/qq-maid-bot/compare/v0.3.3...v0.3.4
 [v0.3.3]: https://github.com/kuliantnt/qq-maid-bot/compare/v0.3.2...v0.3.3
 [v0.3.2]: https://github.com/kuliantnt/qq-maid-bot/compare/v0.3.0...v0.3.2

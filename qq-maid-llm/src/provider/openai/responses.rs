@@ -1,14 +1,15 @@
 //! OpenAI Responses 主链路。
 //!
 //! 这里仅负责 Responses API 的流式/非流式聊天执行，以及在需要时回退到同 provider
-//! 的非流式请求；不直接接触 rig-core，以保证 Responses 与 fallback provider 彻底解耦。
+//! 的非流式请求；不直接接触 Chat Completions，以保证 Responses 与 fallback provider 解耦。
 
 use serde_json::Value;
 
 use crate::{
     error::LlmError,
+    metrics::MetricsRecorder,
     provider::{ChatOutcome, types::ChatMessage},
-    util::metrics::MetricsRecorder,
+    sse::{parse_sse_frame, take_sse_frame},
 };
 
 use super::{
@@ -17,7 +18,7 @@ use super::{
         should_retry_non_stream_after_empty_stream, should_retry_non_stream_after_stream_error,
     },
     payload::openai_responses_payload,
-    stream::{handle_openai_chat_stream_event, parse_sse_frame, take_sse_frame},
+    stream::handle_openai_chat_stream_event,
     transport::send_openai_responses_request,
 };
 

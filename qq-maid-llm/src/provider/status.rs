@@ -247,7 +247,7 @@ fn http_status_from_message(message: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::metrics::LlmMetrics;
+    use crate::metrics::LlmMetrics;
     use std::collections::HashMap;
 
     #[test]

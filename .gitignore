@@ -52,7 +52,6 @@ llm/llmctl.sh
 llm/gatewayctl.sh
 llm/diagnose-network.sh
 llm/data/
-qq-maid-llm/
 qq-maid-core/data/
 qq-maid-core/.env
 qq-maid-core/config/.env
