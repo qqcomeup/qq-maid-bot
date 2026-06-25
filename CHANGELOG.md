@@ -2,6 +2,20 @@
 
 本文档基于 [keep a changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，记录每个已发布版本的变更。
 
+## [v0.4.5] - 2026-06-25
+
+### Changed
+
+- 调整普通聊天消息排列：稳定 system prompt 前置，请求时间上下文移到稳定前缀之后、记忆与会话上下文之前，避免每轮请求时间变化破坏 Prompt Cache 前缀命中
+- `TokenUsage` 新增 `cached_input_tokens` 字段，采集上游 `input_tokens_details.cached_tokens` / `prompt_tokens_details.cached_tokens`，字段缺失时记 `None`，不伪造 0
+- `provider/openai/chat.rs` 在流式与非流式补全中从原始响应提取缓存命中 token 数，rig-core `Usage` 已提供该字段时优先复用
+- `provider/openai/extract.rs::extract_response_usage` 解析 `input_tokens_details.cached_tokens`
+- `LlmChatService` 在每次请求完成后输出脱敏结构化日志 `llm request completed`，记录 provider、model、purpose、input/output/cached tokens、fallback_used
+
+### Fixed
+
+- 修复请求时间上下文注入头部导致稳定 prompt 前缀每轮被顶位、Prompt Cache 无法命中稳定前缀的问题
+
 ## [v0.4.4] - 2026-06-25
 
 ### Added
