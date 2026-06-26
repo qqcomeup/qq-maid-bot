@@ -565,12 +565,41 @@ mod tests {
         ));
         let knowledge_dir = base.join("knowledge");
         fs::create_dir_all(&knowledge_dir).unwrap();
-        fs::write(knowledge_dir.join("version.md"), "# 版本\n\nRAG-VERSION").unwrap();
+        let content = "# 版本\n\nRAG-VERSION";
+        let file_hash = hash_text(content);
+        fs::write(knowledge_dir.join("version.md"), content).unwrap();
         let index = test_index(&knowledge_dir);
+        index
+            .store
+            .replace_document(
+                "version.md",
+                &file_hash,
+                Some("2026-06-26T00:00:00Z"),
+                &[KnowledgeChunkDraft {
+                    chunk_id: "version-md-old:0000:old".to_owned(),
+                    relative_path: "version.md".to_owned(),
+                    document_title: Some("旧索引".to_owned()),
+                    heading_path: Some("旧索引".to_owned()),
+                    chunk_index: 0,
+                    chunk_type: "text".to_owned(),
+                    body: "旧版本切片内容".to_owned(),
+                    content_hash: "old-chunk-hash".to_owned(),
+                    file_hash: file_hash.clone(),
+                    modified_at: Some("2026-06-26T00:00:00Z".to_owned()),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    code_language: None,
+                    // 文件内容不变时，只能靠 chunking_version 差异触发派生索引重建。
+                    chunking_version: CHUNKING_VERSION - 1,
+                    search_text: build_index_text("旧版本切片内容"),
+                }],
+            )
+            .unwrap();
 
-        assert_eq!(index.sync().unwrap().added_files, 1);
+        let rebuild = index.sync().unwrap();
         let second = index.sync().unwrap();
 
+        assert_eq!(rebuild.updated_files, 1);
         assert_eq!(second.unchanged_files, 1);
     }
 
