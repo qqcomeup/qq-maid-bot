@@ -13,6 +13,10 @@ runtime/config/prompts/mode_rules.md
 runtime/config/prompts/session_context.md
 runtime/config/context/*.md
 !runtime/config/context/*.example.md
+runtime/config/knowledge/**/*.md
+runtime/config/knowledge/**/*.markdown
+!runtime/config/knowledge/**/*.example.md
+!runtime/config/knowledge/**/*.example.markdown
 runtime/run/
 runtime/logs/
 runtime/qq-maid-bot
@@ -33,6 +37,10 @@ config/prompts/mode_rules.md
 config/prompts/session_context.md
 config/context/*.md
 !config/context/*.example.md
+config/knowledge/**/*.md
+config/knowledge/**/*.markdown
+!config/knowledge/**/*.example.md
+!config/knowledge/**/*.example.markdown
 llm/.env
 llm/config/.env
 llm/config/member_id_mapping.json
@@ -44,6 +52,10 @@ llm/config/prompts/mode_rules.md
 llm/config/prompts/session_context.md
 llm/config/context/*.md
 !llm/config/context/*.example.md
+llm/config/knowledge/**/*.md
+llm/config/knowledge/**/*.markdown
+!llm/config/knowledge/**/*.example.md
+!llm/config/knowledge/**/*.example.markdown
 llm/run/
 llm/logs/
 llm/qq-maid-llm
@@ -64,5 +76,9 @@ qq-maid-core/config/prompts/mode_rules.md
 qq-maid-core/config/prompts/session_context.md
 qq-maid-core/config/context/*.md
 !qq-maid-core/config/context/*.example.md
+qq-maid-core/config/knowledge/**/*.md
+qq-maid-core/config/knowledge/**/*.markdown
+!qq-maid-core/config/knowledge/**/*.example.md
+!qq-maid-core/config/knowledge/**/*.example.markdown
 .env
 qq-maid-gateway-rs/config/.env
