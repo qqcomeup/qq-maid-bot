@@ -623,6 +623,9 @@ fn respond_error_info_to_qq_text(info: &RespondErrorInfo) -> String {
     match info.code.as_str() {
         "timeout" => "LLM 服务处理超时，请稍后再试".to_owned(),
         "config" => "LLM 服务配置未完成，请联系维护者处理".to_owned(),
+        "safety_blocked" => {
+            "这条消息触发了上游安全拦截，我没法按原样继续。可以换个说法再试。".to_owned()
+        }
         "invalid_request" | "bad_request" => safe_message
             .map(|message| format!("请求格式有误：{message}"))
             .unwrap_or_else(|| "请求格式有误，请调整后再试".to_owned()),
@@ -1134,6 +1137,30 @@ Connection: close
             respond_error_to_qq_text(&error),
             "上游服务暂时不可用，请稍后再试"
         );
+    }
+
+    #[test]
+    fn status_error_safety_blocked_uses_fixed_user_message() {
+        let error = RespondError::Status {
+            status: StatusCode::OK,
+            body: serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "safety_blocked",
+                    "message": "Chat Completions returned HTTP 400: {\"error\":{\"message\":\"request blocked by moderation policy\",\"type\":\"prompt_blocked\"}}",
+                    "stage": "http",
+                }
+            })
+            .to_string(),
+        };
+
+        let qq_text = respond_error_to_qq_text(&error);
+        assert_eq!(
+            qq_text,
+            "这条消息触发了上游安全拦截，我没法按原样继续。可以换个说法再试。"
+        );
+        assert!(!qq_text.contains("请求格式有误"));
+        assert!(!qq_text.contains("prompt_blocked"));
     }
 
     #[test]
