@@ -194,6 +194,11 @@ async fn chat_status_error(status: StatusCode, response: reqwest::Response) -> L
             status.as_u16()
         )
     };
+    // OpenAI 兼容网关可能把安全拦截放在 HTTP 400 返回体中；这不是本地请求格式错误，
+    // 需要保留独立错误码，避免 Gateway 向用户展示“请求格式有误”的误导文案。
+    if is_prompt_blocked_error(&detail) {
+        return LlmError::new("safety_blocked", message, "http");
+    }
     match status.as_u16() {
         401 | 403 => LlmError::config(message),
         400 | 404 | 422 => LlmError::new("bad_request", message, "http"),
@@ -210,6 +215,14 @@ fn truncate_error_detail(value: &str, limit: usize) -> String {
     let mut truncated = value.chars().take(limit).collect::<String>();
     truncated.push_str("...");
     truncated
+}
+
+fn is_prompt_blocked_error(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("prompt_blocked")
+        || lower.contains("moderation policy")
+        || lower.contains("content policy")
+        || lower.contains("safety policy")
 }
 
 pub(crate) async fn non_stream_completion(
@@ -573,6 +586,39 @@ mod tests {
 
         assert_eq!(outcome.reply, "retry ok");
         assert_eq!(state.lock().await.requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn prompt_blocked_error_keeps_safety_code() {
+        let (base_url, _state) = spawn_mock_chat(
+            vec![
+                json!({
+                    "error": {
+                        "message": "request blocked by moderation policy",
+                        "type": "prompt_blocked"
+                    }
+                })
+                .to_string(),
+            ],
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        let client =
+            ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
+
+        let err = non_stream_completion(
+            &client,
+            "openai",
+            "gpt-test",
+            1200,
+            &[ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, "safety_blocked");
+        assert_eq!(err.stage, "http");
+        assert!(err.message.contains("prompt_blocked"));
     }
 
     #[tokio::test]
