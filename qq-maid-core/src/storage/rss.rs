@@ -5,7 +5,6 @@
 //! 本模块只保留 RSS 表结构和查询语义，数据库打开、目录创建和通用 PRAGMA
 //! 由 `storage::database` 统一负责。
 
-use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -293,7 +292,7 @@ impl RssStore {
             ],
         )
         .map_err(RssStoreError::from_sql)?;
-        insert_items_unlocked(&tx, &id, baseline_items, Some(&now), None)?;
+        insert_items_unlocked(&tx, &id, baseline_items, Some(&now))?;
         trim_seen_unlocked(&tx, &id, retain_seen)?;
         tx.commit().map_err(RssStoreError::from_sql)?;
         self.get_unlocked(&conn, &id)?
@@ -357,30 +356,19 @@ impl RssStore {
         subscription_id: &str,
         title: Option<&str>,
     ) -> Result<(), RssStoreError> {
-        let success_watermark = now_iso_cn();
-        self.record_check_success_with_watermark(subscription_id, title, &success_watermark)
-    }
-
-    pub fn record_check_success_with_watermark(
-        &self,
-        subscription_id: &str,
-        title: Option<&str>,
-        success_watermark: &str,
-    ) -> Result<(), RssStoreError> {
         let conn = self.connection()?;
-        let checked_at = now_iso_cn();
+        let now = now_iso_cn();
         let clean_title = title.and_then(clean_optional);
-        let success_watermark = clean_required(success_watermark, "rss success watermark")?;
         conn.execute(
             "UPDATE rss_subscriptions
              SET title = COALESCE(?2, title),
                  last_checked_at = ?3,
-                 last_success_at = ?4,
+                 last_success_at = ?3,
                  last_error = NULL,
                  consecutive_failures = 0,
                  initialized = 1
              WHERE id = ?1",
-            params![subscription_id, clean_title, checked_at, success_watermark],
+            params![subscription_id, clean_title, now],
         )
         .map_err(RssStoreError::from_sql)?;
         Ok(())
@@ -412,24 +400,9 @@ impl RssStore {
         items: &[RssFeedItem],
         retain_seen: usize,
     ) -> Result<usize, RssStoreError> {
-        self.enqueue_items_after_success(subscription_id, items, retain_seen, None)
-    }
-
-    /// 将本轮发现的新条目或内容更新写成待推送状态，并用上次成功检查时间保护历史条目。
-    ///
-    /// 部分聚合源会回写旧文章摘要或元数据；这些条目已经推送过时，只要条目自身时间
-    /// 不晚于本轮之前的成功检查点，就视为历史修订并重新基线，避免一次性补推多条旧消息。
-    pub fn enqueue_items_after_success(
-        &self,
-        subscription_id: &str,
-        items: &[RssFeedItem],
-        retain_seen: usize,
-        previous_success_at: Option<&str>,
-    ) -> Result<usize, RssStoreError> {
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(RssStoreError::from_sql)?;
-        let inserted =
-            insert_items_unlocked(&tx, subscription_id, items, None, previous_success_at)?;
+        let inserted = insert_items_unlocked(&tx, subscription_id, items, None)?;
         trim_seen_unlocked(&tx, subscription_id, retain_seen)?;
         tx.commit().map_err(RssStoreError::from_sql)?;
         Ok(inserted)
@@ -632,19 +605,11 @@ fn insert_items_unlocked(
     subscription_id: &str,
     items: &[RssFeedItem],
     pushed_at: Option<&str>,
-    previous_success_at: Option<&str>,
 ) -> Result<usize, RssStoreError> {
     let now = now_iso_cn();
     let mut changed = 0;
     for item in items {
-        let change = upsert_item_state_unlocked(
-            conn,
-            subscription_id,
-            item,
-            &now,
-            pushed_at,
-            previous_success_at,
-        )?;
+        let change = upsert_item_state_unlocked(conn, subscription_id, item, &now, pushed_at)?;
         if matches!(change, FeedItemChange::New | FeedItemChange::Updated) {
             changed += 1;
         }
@@ -658,7 +623,6 @@ fn upsert_item_state_unlocked(
     item: &RssFeedItem,
     now: &str,
     pushed_at: Option<&str>,
-    previous_success_at: Option<&str>,
 ) -> Result<FeedItemChange, RssStoreError> {
     let existing = conn
         .query_row(
@@ -727,23 +691,10 @@ fn upsert_item_state_unlocked(
         return Ok(FeedItemChange::Unchanged);
     }
 
-    if is_pushed_historical_revision(&existing, item, previous_success_at) {
-        // 已推送条目的时间不晚于上次成功检查点时，revision 变化多半是源站回写历史内容。
-        // 这里刷新基线但保留 pushed_at，避免日报类 feed 一次性补推多条旧文章。
-        update_item_seen_unlocked(
-            conn,
-            subscription_id,
-            item,
-            now,
-            existing.pushed_at.as_deref(),
-        )?;
-        return Ok(FeedItemChange::Unchanged);
-    }
-
     if is_same_entry_time(&existing, item) {
         // 部分状态页 feed 的组件列表顺序会抖动，或 revision 归一化算法升级后 hash 会变化。
-        // 同一 item_key 只有 published/updated 时间也变化时才重新入队；若旧版本已把
-        // 这类抖动写成 pending，这里会把它重新基线，避免历史 incident 反复推送。
+        // 只按上次成功检查时间判断会吞掉延迟公开的真实更新；这里必须看到条目自身
+        // published/updated 时间没有变化，才把 revision 差异当作已观测条目的重新基线。
         let pushed_at = existing.pushed_at.as_deref().or(Some(now));
         update_item_seen_unlocked(conn, subscription_id, item, now, pushed_at)?;
         return Ok(FeedItemChange::Unchanged);
@@ -868,34 +819,6 @@ fn is_pushed_legacy_state(existing: &ExistingItemState) -> bool {
 
 fn is_same_entry_time(existing: &ExistingItemState, item: &RssFeedItem) -> bool {
     existing.published_at == item.published_at && existing.updated_at == item.updated_at
-}
-
-fn is_pushed_historical_revision(
-    existing: &ExistingItemState,
-    item: &RssFeedItem,
-    previous_success_at: Option<&str>,
-) -> bool {
-    if existing.pushed_at.is_none() {
-        return false;
-    }
-    let Some(previous_success_at) = previous_success_at.and_then(parse_rfc3339_utc) else {
-        return false;
-    };
-    let Some(item_time) = item
-        .updated_at
-        .as_deref()
-        .or(item.published_at.as_deref())
-        .and_then(parse_rfc3339_utc)
-    else {
-        return false;
-    };
-    item_time <= previous_success_at
-}
-
-fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value.trim())
-        .ok()
-        .map(|datetime| datetime.with_timezone(&Utc))
 }
 
 fn subscription_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RssSubscription> {
@@ -1153,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn pushed_historical_revision_after_previous_success_is_rebaselined() {
+    fn pushed_same_time_historical_revision_is_rebaselined() {
         let store = test_store();
         let sub = store
             .create_subscription(
@@ -1178,17 +1101,7 @@ mod tests {
             "2026-06-19T00:00:00+00:00",
             "2026-06-19T00:00:00+00:00",
         );
-        assert_eq!(
-            store
-                .enqueue_items_after_success(
-                    &sub.id,
-                    &[rewritten],
-                    50,
-                    Some("2026-06-26T09:00:00+08:00")
-                )
-                .unwrap(),
-            0
-        );
+        assert_eq!(store.enqueue_items(&sub.id, &[rewritten], 50).unwrap(), 0);
 
         assert!(store.pending_items(&sub.id, 10, 3).unwrap().is_empty());
         let seen = store
@@ -1200,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn pushed_newer_revision_after_previous_success_requeues() {
+    fn pushed_revision_with_new_entry_time_requeues() {
         let store = test_store();
         let sub = store
             .create_subscription(
@@ -1225,17 +1138,7 @@ mod tests {
             "2026-06-25T00:00:00+00:00",
             "2026-06-26T02:00:00+00:00",
         );
-        assert_eq!(
-            store
-                .enqueue_items_after_success(
-                    &sub.id,
-                    &[updated],
-                    50,
-                    Some("2026-06-26T09:00:00+08:00")
-                )
-                .unwrap(),
-            1
-        );
+        assert_eq!(store.enqueue_items(&sub.id, &[updated], 50).unwrap(), 1);
 
         let pending = store.pending_items(&sub.id, 10, 3).unwrap();
         assert_eq!(pending.len(), 1);
@@ -1244,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn success_watermark_uses_fetch_start_to_keep_racing_updates() {
+    fn delayed_revision_with_backdated_entry_time_requeues() {
         let store = test_store();
         let sub = store
             .create_subscription(
@@ -1255,42 +1158,24 @@ mod tests {
                     "incident-1",
                     "rev-a",
                     "Investigating",
-                    "2026-06-26T00:00:00+00:00",
-                    "2026-06-26T00:00:00+00:00",
+                    "2020-01-01T00:00:00+00:00",
+                    "2020-01-01T00:00:00+00:00",
                 )],
                 50,
             )
             .unwrap();
 
-        store
-            .record_check_success_with_watermark(
-                &sub.id,
-                Some("测试 Feed"),
-                "2026-06-26T10:00:00+08:00",
-            )
-            .unwrap();
-        let sub = store.get(&sub.id).unwrap().unwrap();
-        assert_eq!(
-            sub.last_success_at.as_deref(),
-            Some("2026-06-26T10:00:00+08:00")
-        );
-
-        let updated_after_snapshot = item_with_revision_and_time(
+        // 源站或 CDN 可能延迟公开已经带有旧 updated_at 的新 revision；
+        // 不能因为条目时间早于当前检查时间就把它当作历史回写吞掉。
+        let delayed_update = item_with_revision_and_time(
             "incident-1",
             "rev-b",
             "Resolved",
-            "2026-06-26T00:00:00+00:00",
-            "2026-06-26T02:01:00+00:00",
+            "2020-01-01T00:00:00+00:00",
+            "2020-01-01T00:01:00+00:00",
         );
         assert_eq!(
-            store
-                .enqueue_items_after_success(
-                    &sub.id,
-                    &[updated_after_snapshot],
-                    50,
-                    sub.last_success_at.as_deref()
-                )
-                .unwrap(),
+            store.enqueue_items(&sub.id, &[delayed_update], 50).unwrap(),
             1
         );
 
