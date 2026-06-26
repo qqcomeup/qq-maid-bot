@@ -4,7 +4,6 @@
 [![Release](https://img.shields.io/github/v/release/kuliantnt/qq-maid-bot)](https://github.com/kuliantnt/qq-maid-bot/releases)
 [![License](https://img.shields.io/github/license/kuliantnt/qq-maid-bot)](LICENSE)
 [![Dependencies](https://deps.rs/repo/github/kuliantnt/qq-maid-bot/status.svg)](https://deps.rs/repo/github/kuliantnt/qq-maid-bot)
-![OneBot 11](https://img.shields.io/badge/OneBot-11-blueviolet)
 ![Memory](https://img.shields.io/badge/memory-24%20MiB-success)
 ![Maid Status](https://img.shields.io/badge/maid-online-ff69b4)
 ![Maid Purity](https://img.shields.io/badge/女仆浓度-100%25-ff69b4)
@@ -56,7 +55,6 @@ QQ Maid Bot 使用 Rust 构建，通过 QQ 官方机器人接口运行。它不�
 - SQLite
 - RAG
 - 记忆系统
-- OneBot
 - Markdown 渲染
 - 独立 LLM 抽象层
 
