@@ -188,6 +188,12 @@ fn safe_error_summary(error: &LlmError) -> String {
     if error.code == "timeout" || lower.contains("timed out") || lower.contains("timeout") {
         return "上游请求超时".to_owned();
     }
+    if error.code == "safety_blocked"
+        || lower.contains("prompt_blocked")
+        || lower.contains("moderation policy")
+    {
+        return format!("上游安全策略拦截{status}");
+    }
     if lower.contains("unauthorized")
         || lower.contains("authentication")
         || lower.contains("api key")
@@ -272,6 +278,21 @@ mod tests {
         );
 
         assert_eq!(safe_error_summary(&error), "上游网络请求失败");
+    }
+
+    #[test]
+    fn safety_blocked_summary_does_not_expose_provider_detail() {
+        let error = LlmError::new(
+            "safety_blocked",
+            "Chat Completions returned HTTP 400: prompt_blocked moderation policy detail",
+            "http",
+        );
+
+        let summary = safe_error_summary(&error);
+
+        assert_eq!(summary, "上游安全策略拦截（HTTP 400）");
+        assert!(!summary.contains("prompt_blocked"));
+        assert!(!summary.contains("moderation"));
     }
 
     #[test]
