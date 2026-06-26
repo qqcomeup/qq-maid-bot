@@ -583,7 +583,10 @@ fn lexical_tokens(text: &str) -> Vec<String> {
 fn cjk_ngrams(text: &str) -> Vec<String> {
     let chars = text.chars().filter(|ch| is_cjk(*ch)).collect::<Vec<_>>();
     let mut tokens = Vec::new();
-    for n in 1..=3 {
+    // 只生成 2-gram 和 3-gram，跳过单字 1-gram。
+    // 单字在中文里匹配范围太广（如"庄""园""区"），会把大量无关 chunk
+    // 推到 BM25 前排，挤掉真正相关的长片段。
+    for n in 2..=3 {
         if chars.len() < n {
             continue;
         }
