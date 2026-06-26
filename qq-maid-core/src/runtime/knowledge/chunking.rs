@@ -1,6 +1,7 @@
 use super::text::{build_index_text, hash_text};
 
-pub(super) const CHUNKING_VERSION: i64 = 2;
+// 修改分块正文语义时必须提升版本，确保 file_hash 未变的已索引知识文件也会重建。
+pub(super) const CHUNKING_VERSION: i64 = 3;
 
 const TARGET_CHUNK_CHARS: usize = 900;
 const SOFT_CHUNK_CHARS: usize = 1200;
