@@ -111,7 +111,7 @@ runtime/.env
 - `PROMPT_DIR`、`MEMBER_ID_MAPPING_FILE`：固定 prompt 和成员映射。
 - `KNOWLEDGE_DIR`：Markdown 知识目录；留空时使用 `config/knowledge`，启动时自动同步到 SQLite FTS5，普通聊天按需检索片段。
 - `RSS_*`：RSS / Atom 轮询、去重、推送和 SSRF 防护相关配置。
-- `OPENAI_SEARCH_MODEL`：联网查询模型配置。`SEARCH_CONTEXT_SIZE`、`SEARCH_MAX_RESULTS` 目前只保留在模板中，当前 `/查` flow 仍使用查询模块默认值。
+- `OPENAI_SEARCH_MODEL`：联网查询模型配置。`SEARCH_CONTEXT_SIZE`、`SEARCH_MAX_RESULTS` 当前没有环境变量入口，`/查` flow 使用查询模块默认值。
 - `QWEATHER_API_KEY`、`QWEATHER_API_HOST`、`QWEATHER_GEO_HOST`：天气配置；当前 `QWEATHER_API_KEY` 为必需项。
 
 模型配置支持单模型和候选链两种写法：
