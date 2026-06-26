@@ -256,7 +256,8 @@ fn scan_dir(root: &Path, dir: &Path, files: &mut Vec<ScannedMarkdown>) -> Result
             scan_dir(root, &path, files)?;
             continue;
         }
-        if !metadata.is_file() || !is_markdown_file(&path) {
+        // 公开 release 包会带 *.example.md 模板；模板用于说明配置格式，不能进入真实知识索引。
+        if !metadata.is_file() || !is_markdown_file(&path) || is_markdown_example_file(&path) {
             continue;
         }
         let Some(relative_path) = relative_slash_path(root, &path) else {
@@ -288,6 +289,16 @@ fn is_markdown_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
+        .unwrap_or(false)
+}
+
+fn is_markdown_example_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let name = name.to_ascii_lowercase();
+            name.ends_with(".example.md") || name.ends_with(".example.markdown")
+        })
         .unwrap_or(false)
 }
 
@@ -408,9 +419,15 @@ impl<'a> ChunkBuilder<'a> {
         let heading_path = self.heading_path();
         let index = self.chunks.len();
         let short_hash = content_hash.chars().take(12).collect::<String>();
+        let path_hash = hash_text(self.relative_path)
+            .chars()
+            .take(12)
+            .collect::<String>();
+        // chunk_id 在 storage 层有唯一约束，slug 只用于可读性；原始相对路径哈希用于避免
+        // a-b.md / a/b.md 或中文文件名归一化后发生碰撞。
         let chunk_id = format!(
-            "{}:{index:04}:{short_hash}",
-            stable_path_id(self.relative_path)
+            "{}-{path_hash}:{index:04}:{short_hash}",
+            stable_path_id(self.relative_path),
         );
         let mut searchable = String::new();
         searchable.push_str(self.relative_path);
@@ -476,7 +493,8 @@ fn split_long_text(text: &str, max_chars: usize) -> Vec<String> {
 }
 
 fn stable_path_id(path: &str) -> String {
-    path.chars()
+    let slug = path
+        .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() {
                 ch.to_ascii_lowercase()
@@ -486,7 +504,12 @@ fn stable_path_id(path: &str) -> String {
         })
         .collect::<String>()
         .trim_matches('-')
-        .to_owned()
+        .to_owned();
+    if slug.is_empty() {
+        "doc".to_owned()
+    } else {
+        slug
+    }
 }
 
 fn hash_text(text: &str) -> String {
@@ -497,6 +520,7 @@ fn hash_text(text: &str) -> String {
 fn build_index_text(text: &str) -> String {
     let mut tokens = lexical_tokens(text);
     tokens.extend(cjk_ngrams(text));
+    tokens.extend(ascii_ngrams(text));
     tokens.sort();
     tokens.dedup();
     tokens.join(" ")
@@ -505,6 +529,7 @@ fn build_index_text(text: &str) -> String {
 fn build_search_query(text: &str) -> String {
     let mut tokens = lexical_tokens(text);
     tokens.extend(cjk_ngrams(text));
+    tokens.extend(ascii_ngrams(text));
     tokens.sort();
     tokens.dedup();
     tokens
@@ -532,11 +557,7 @@ fn lexical_tokens(text: &str) -> Vec<String> {
 }
 
 fn cjk_ngrams(text: &str) -> Vec<String> {
-    let chars = text
-        .chars()
-        .filter(|ch| is_cjk(*ch) || ch.is_ascii_alphanumeric())
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect::<Vec<_>>();
+    let chars = text.chars().filter(|ch| is_cjk(*ch)).collect::<Vec<_>>();
     let mut tokens = Vec::new();
     for n in 1..=3 {
         if chars.len() < n {
@@ -547,6 +568,34 @@ fn cjk_ngrams(text: &str) -> Vec<String> {
         }
     }
     tokens
+}
+
+fn ascii_ngrams(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut run = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            run.push(ch.to_ascii_lowercase());
+        } else {
+            push_ascii_ngrams(&mut tokens, &run);
+            run.clear();
+        }
+    }
+    push_ascii_ngrams(&mut tokens, &run);
+    tokens
+}
+
+fn push_ascii_ngrams(tokens: &mut Vec<String>, run: &str) {
+    // ASCII 只生成 3-gram：保留 RAG407 这类编号的模糊匹配，同时避免 hi/ok
+    // 被拆成单字母后命中任意英文资料。
+    const ASCII_NGRAM_SIZE: usize = 3;
+    let chars = run.chars().collect::<Vec<_>>();
+    if chars.len() < ASCII_NGRAM_SIZE {
+        return;
+    }
+    for window in chars.windows(ASCII_NGRAM_SIZE) {
+        tokens.push(window.iter().collect::<String>());
+    }
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -682,9 +731,44 @@ mod tests {
             chunks[0].heading_path.as_deref(),
             Some("示例知识 / 中文检索")
         );
-        assert!(chunks[0].chunk_id.starts_with("guide-example-md:0000:"));
+        assert!(chunks[0].chunk_id.starts_with("guide-example-md-"));
+        assert!(chunks[0].chunk_id.contains(":0000:"));
         assert!(chunks[0].search_text.contains("rag"));
         assert!(chunks[0].search_text.contains("女仆"));
+    }
+
+    #[test]
+    fn scan_skips_committed_example_markdown_templates() {
+        let base = std::env::temp_dir().join(format!(
+            "qq-maid-knowledge-example-skip-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let nested = base.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(base.join("real.md"), "真实知识").unwrap();
+        fs::write(base.join("template.example.md"), "公开模板").unwrap();
+        fs::write(nested.join("template.example.markdown"), "公开模板").unwrap();
+
+        let files = scan_markdown_files(&base).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, "real.md");
+    }
+
+    #[test]
+    fn chunk_id_keeps_slug_readable_but_uses_path_hash_for_uniqueness() {
+        let left = chunk_markdown("a-b.md", "相同正文用于验证 chunk id 不碰撞。", "file-hash");
+        let right = chunk_markdown("a/b.md", "相同正文用于验证 chunk id 不碰撞。", "file-hash");
+        let chinese_left = chunk_markdown("甲.md", "相同正文用于验证中文路径不碰撞。", "file-hash");
+        let chinese_right =
+            chunk_markdown("乙.md", "相同正文用于验证中文路径不碰撞。", "file-hash");
+
+        assert!(left[0].chunk_id.starts_with("a-b-md-"));
+        assert!(right[0].chunk_id.starts_with("a-b-md-"));
+        assert_ne!(left[0].chunk_id, right[0].chunk_id);
+        assert!(chinese_left[0].chunk_id.starts_with("md-"));
+        assert!(chinese_right[0].chunk_id.starts_with("md-"));
+        assert_ne!(chinese_left[0].chunk_id, chinese_right[0].chunk_id);
     }
 
     #[test]
@@ -696,6 +780,62 @@ mod tests {
         assert!(index_text.contains("知识"));
         assert!(query.contains("\"总部\""));
         assert!(query.contains("\"知识\""));
+    }
+
+    #[test]
+    fn ascii_ngrams_skip_single_character_noise() {
+        let index_text = build_index_text("OpenAI Web Search 与编号 RAG-407。");
+        let short_query = build_search_query("hi ok");
+        let code_query = build_search_query("RAG407");
+
+        assert!(!index_text.contains(" o "));
+        assert!(!index_text.contains(" p "));
+        assert_eq!(short_query, "\"hi\" OR \"ok\"");
+        assert!(code_query.contains("\"rag\""));
+        assert!(code_query.contains("\"407\""));
+    }
+
+    #[test]
+    fn short_ascii_chat_does_not_match_unrelated_english_knowledge() {
+        let base = std::env::temp_dir().join(format!(
+            "qq-maid-knowledge-short-ascii-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let knowledge_dir = base.join("knowledge");
+        fs::create_dir_all(&knowledge_dir).unwrap();
+        fs::write(
+            knowledge_dir.join("guide.md"),
+            "# Mixed Terms\n\nThis document mentions OpenAI, Markdown chunks, and SQLite FTS5.",
+        )
+        .unwrap();
+        let index = test_index(&knowledge_dir);
+        index.sync().unwrap();
+
+        assert_eq!(index.search_context("hi ok").unwrap().hit_count, 0);
+        assert_eq!(index.search_context("OpenAI").unwrap().hit_count, 1);
+    }
+
+    #[test]
+    fn sync_accepts_paths_that_share_the_same_slug() {
+        let base = std::env::temp_dir().join(format!(
+            "qq-maid-knowledge-slug-collision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let knowledge_dir = base.join("knowledge");
+        fs::create_dir_all(knowledge_dir.join("a")).unwrap();
+        fs::write(knowledge_dir.join("a-b.md"), "相同正文用于验证同步不碰撞。").unwrap();
+        fs::write(
+            knowledge_dir.join("a").join("b.md"),
+            "相同正文用于验证同步不碰撞。",
+        )
+        .unwrap();
+        let index = test_index(&knowledge_dir);
+
+        let summary = index.sync().unwrap();
+
+        assert_eq!(summary.scanned_files, 2);
+        assert_eq!(summary.added_files, 2);
+        assert_eq!(summary.chunk_count, 2);
     }
 
     #[test]
