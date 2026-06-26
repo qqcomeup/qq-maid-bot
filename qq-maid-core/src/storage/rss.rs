@@ -357,19 +357,30 @@ impl RssStore {
         subscription_id: &str,
         title: Option<&str>,
     ) -> Result<(), RssStoreError> {
+        let success_watermark = now_iso_cn();
+        self.record_check_success_with_watermark(subscription_id, title, &success_watermark)
+    }
+
+    pub fn record_check_success_with_watermark(
+        &self,
+        subscription_id: &str,
+        title: Option<&str>,
+        success_watermark: &str,
+    ) -> Result<(), RssStoreError> {
         let conn = self.connection()?;
-        let now = now_iso_cn();
+        let checked_at = now_iso_cn();
         let clean_title = title.and_then(clean_optional);
+        let success_watermark = clean_required(success_watermark, "rss success watermark")?;
         conn.execute(
             "UPDATE rss_subscriptions
              SET title = COALESCE(?2, title),
                  last_checked_at = ?3,
-                 last_success_at = ?3,
+                 last_success_at = ?4,
                  last_error = NULL,
                  consecutive_failures = 0,
                  initialized = 1
              WHERE id = ?1",
-            params![subscription_id, clean_title, now],
+            params![subscription_id, clean_title, checked_at, success_watermark],
         )
         .map_err(RssStoreError::from_sql)?;
         Ok(())
@@ -1229,6 +1240,62 @@ mod tests {
         let pending = store.pending_items(&sub.id, 10, 3).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].item_key, "incident-1");
+        assert_eq!(pending[0].revision_hash, "rev-b");
+    }
+
+    #[test]
+    fn success_watermark_uses_fetch_start_to_keep_racing_updates() {
+        let store = test_store();
+        let sub = store
+            .create_subscription(
+                &target("group:g1"),
+                "https://example.test/feed.xml",
+                "测试 Feed",
+                &[item_with_revision_and_time(
+                    "incident-1",
+                    "rev-a",
+                    "Investigating",
+                    "2026-06-26T00:00:00+00:00",
+                    "2026-06-26T00:00:00+00:00",
+                )],
+                50,
+            )
+            .unwrap();
+
+        store
+            .record_check_success_with_watermark(
+                &sub.id,
+                Some("测试 Feed"),
+                "2026-06-26T10:00:00+08:00",
+            )
+            .unwrap();
+        let sub = store.get(&sub.id).unwrap().unwrap();
+        assert_eq!(
+            sub.last_success_at.as_deref(),
+            Some("2026-06-26T10:00:00+08:00")
+        );
+
+        let updated_after_snapshot = item_with_revision_and_time(
+            "incident-1",
+            "rev-b",
+            "Resolved",
+            "2026-06-26T00:00:00+00:00",
+            "2026-06-26T02:01:00+00:00",
+        );
+        assert_eq!(
+            store
+                .enqueue_items_after_success(
+                    &sub.id,
+                    &[updated_after_snapshot],
+                    50,
+                    sub.last_success_at.as_deref()
+                )
+                .unwrap(),
+            1
+        );
+
+        let pending = store.pending_items(&sub.id, 10, 3).unwrap();
+        assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].revision_hash, "rev-b");
     }
 

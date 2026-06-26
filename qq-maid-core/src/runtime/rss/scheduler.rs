@@ -18,7 +18,7 @@ use crate::{
         looks_like_chinese_text,
     },
     storage::rss::{RssPendingItem, RssStore, RssSubscription},
-    util::time_context::format_rss_time_for_display,
+    util::time_context::{format_rss_time_for_display, now_iso_cn},
 };
 
 use super::feed::{RssFeedError, RssFetcher};
@@ -106,6 +106,9 @@ impl RssScheduler {
             scope_key = %subscription.scope_key,
             "checking RSS subscription"
         );
+        // 历史回写过滤必须使用抓取开始前的水位；若使用抓取完成后的时间，
+        // 可能吞掉源站在本轮快照之后、成功落库之前发布的真实 incident 更新。
+        let success_watermark = now_iso_cn();
         let parsed = match self
             .fetcher
             .fetch(&subscription.url, self.config.summary_max_chars)
@@ -149,10 +152,11 @@ impl RssScheduler {
                 return;
             }
         };
-        if let Err(err) = self
-            .store
-            .record_check_success(&subscription.id, Some(&parsed.title))
-        {
+        if let Err(err) = self.store.record_check_success_with_watermark(
+            &subscription.id,
+            Some(&parsed.title),
+            &success_watermark,
+        ) {
             warn!(
                 subscription_id = %short_id(&subscription.id),
                 error = %err,
