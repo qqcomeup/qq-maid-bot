@@ -124,17 +124,26 @@ impl KnowledgeIndex {
             }
         }
 
-        for indexed_path in self
-            .store
-            .list_document_paths()
-            .map_err(knowledge_db_error)?
-        {
-            if !scanned_paths.contains(&indexed_path) {
-                self.store
-                    .delete_document(&indexed_path)
-                    .map_err(knowledge_db_error)?;
-                summary.deleted_files += 1;
+        // 知识目录没有可扫描的 .md 文件时，保留 DB 中已有索引不删除。
+        // 这支持从生产环境拷贝 app.db 到新部署环境、或源 .md 文件暂不可用的场景。
+        if summary.scanned_files > 0 {
+            for indexed_path in self
+                .store
+                .list_document_paths()
+                .map_err(knowledge_db_error)?
+            {
+                if !scanned_paths.contains(&indexed_path) {
+                    self.store
+                        .delete_document(&indexed_path)
+                        .map_err(knowledge_db_error)?;
+                    summary.deleted_files += 1;
+                }
             }
+        } else {
+            tracing::info!(
+                dir = %self.knowledge_dir.display(),
+                "knowledge dir has no scannable markdown files, keeping existing db index"
+            );
         }
         summary.chunk_count = self.store.chunk_count().map_err(knowledge_db_error)?;
         summary.enabled = summary.chunk_count > 0;
@@ -1004,7 +1013,16 @@ mod tests {
 
         fs::remove_file(knowledge_dir.join("example.md")).unwrap();
         let deleted = index.sync().unwrap();
-        assert_eq!(deleted.deleted_files, 1);
-        assert_eq!(deleted.chunk_count, 0);
+        // 源文件全部移除后保留 DB 已有数据，支持从生产环境拷贝 app.db
+        // 到新部署环境、或源 .md 文件暂不可用的场景。
+        assert_eq!(deleted.deleted_files, 0);
+        assert_eq!(deleted.chunk_count, 1);
+        assert!(
+            index
+                .search_context("RAG-408")
+                .unwrap()
+                .text
+                .contains("RAG-408")
+        );
     }
 }
