@@ -153,13 +153,22 @@ OPENCODE_GO_ALLOWED_GROUP_IDS=
 opencode-go:glm-5.2
 ```
 
-示例：
+本任务需要新增并接线普通聊天专用候选链配置：
 
 ```env
 CHAT_MODEL_ROUTE=opencode-go:glm-5.2,openai:<现有默认模型>
 ```
 
-或按照仓库现有变量名配置。
+当前仓库主候选链由 `LLM_MODEL` 解析，且 Todo、记忆、压缩、翻译等内部模型在未配置专项变量时会沿用 `LLM_MODEL`。为了让 OpenCode Go 只进入普通聊天链路，不要只在文档中新增未接线变量，也不要简单要求部署者把 `LLM_MODEL` 改成 OpenCode Go。
+
+实现要求：
+
+* 扩展 `ModelProvider` / `ModelId` 前缀解析，使 `opencode-go:<model>` 成为合法候选；
+* 在 Core 配置中新增 `CHAT_MODEL_ROUTE`，语法与 `LLM_MODEL` 候选链一致；
+* 未设置 `CHAT_MODEL_ROUTE` 时，普通聊天继续使用现有 `LLM_MODEL`，保持向后兼容；
+* 设置 `CHAT_MODEL_ROUTE` 时，只有普通聊天请求使用该候选链；
+* `CHAT_MODEL_ROUTE` 需要加入启动期 provider route 校验，避免首次聊天时才发现配置错误；
+* `.env.example` 和 Provider 配置文档需要说明 `CHAT_MODEL_ROUTE` 与 `LLM_MODEL` 的差异。
 
 要求：
 
@@ -223,7 +232,7 @@ OpenCode Go 默认只进入普通聊天链路。
 * `/rss`
 * `/weather`
 * `/ping`
-* 标题生成；
+* 标题生成（继续使用现有 `TITLE_MODEL` 语义，未配置时按现有行为跳过自动标题生成）；
 * 记忆提取；
 * 会话压缩；
 * 翻译；
@@ -231,7 +240,7 @@ OpenCode Go 默认只进入普通聊天链路。
 * 状态检查；
 * 其他命令类调用。
 
-不要因为设置普通聊天主模型而连带改变辅助任务模型。
+不要因为设置普通聊天主模型而连带改变辅助任务模型。`CHAT_MODEL_ROUTE` 只作为普通聊天覆盖；`TODO_MODEL`、`MEMORY_MODEL`、`COMPACT_MODEL`、`TRANSLATION_MODEL` 未显式配置时继续沿用现有 `LLM_MODEL` 语义，不应改为沿用 `CHAT_MODEL_ROUTE`。
 
 ---
 
@@ -389,6 +398,12 @@ OpenCode Go 默认只进入普通聊天链路。
 * 如何配置群白名单；
 * 图片等附件仍按现有“附件转文本备注”行为处理；
 * 如何关闭并恢复原配置。
+
+至少同步更新：
+
+* `runtime/.env.example`：增加 OpenCode Go 和 `CHAT_MODEL_ROUTE` 示例；
+* `qq-maid-core/README.md`：说明 `CHAT_MODEL_ROUTE`、`LLM_MODEL` 和内部任务模型的关系；
+* `qq-maid-llm/README.md`：说明新增 provider 前缀和启动期 route 校验。
 
 无需在 README 首页大篇幅宣传，可以加入 Provider 配置表和示例。
 
