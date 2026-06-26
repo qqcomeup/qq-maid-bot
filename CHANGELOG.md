@@ -2,6 +2,22 @@
 
 本文档基于 [keep a changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，记录每个已发布版本的变更。
 
+## [v0.6.2] - 2026-06-27
+
+### Fixed
+
+- 修复未闭合 fenced code block 到 EOF 时最后一行代码被误当 closer 复制进每个切片，污染检索索引
+
+### Internal
+
+- `qq-maid-gateway-rs` 0.1.1 → 0.1.2（v0.6.1 群聊 active 关键词配置、安全拦截文案遗漏提升）
+- `qq-maid-llm` 0.1.0 → 0.1.1（v0.6.1 safety_blocked 错误码与健康摘要脱敏遗漏提升）
+- `qq-maid-core` 0.1.7 → 0.1.8（未闭合代码围栏分块修复）
+
+### Documentation
+
+- RAG V2 任务文档从 tasks/ 移入 done/
+
 ## [v0.6.1] - 2026-06-27
 
 ### Added
@@ -31,22 +47,6 @@
 ### CI
 
 - 恢复 CI 全量触发：本轮尝试了 CI paths 过滤（仅生产代码变更触发）后因 pull_request 事件匹配不稳定而撤销，恢复为所有 PR 和 push 均触发
-
-## [v0.6.2] - 2026-06-27
-
-### Fixed
-
-- 修复未闭合 fenced code block 到 EOF 时最后一行代码被误当 closer 复制进每个切片，污染检索索引
-
-### Internal
-
-- `qq-maid-gateway-rs` 0.1.1 → 0.1.2（v0.6.1 群聊 active 关键词配置、安全拦截文案遗漏提升）
-- `qq-maid-llm` 0.1.0 → 0.1.1（v0.6.1 safety_blocked 错误码与健康摘要脱敏遗漏提升）
-- `qq-maid-core` 0.1.7 → 0.1.8（未闭合代码围栏分块修复）
-
-### Documentation
-
-- RAG V2 任务文档从 tasks/ 移入 done/
 
 ## [v0.6.0] - 2026-06-26
 
