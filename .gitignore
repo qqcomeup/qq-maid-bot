@@ -3,6 +3,51 @@ dist/
 # 根级历史残留，防止误建。
 data/
 
+# 历史目录和误运行路径兜底：这些位置不再是主线配置入口，
+# 但一旦残留真实 .env、prompt、知识库或成员映射，仍不能进入 Git。
+.env
+# 真实环境变量文件可能残留在旧模块或误运行子目录，显式兜底避免迁移期误提交。
+**/.env
+config/.env
+config/member_id_mapping.json
+config/world.md
+config/context_modules.toml
+config/prompts/*.md
+!config/prompts/*.example.md
+config/context/*.md
+!config/context/*.example.md
+config/knowledge/**/*.md
+config/knowledge/**/*.markdown
+!config/knowledge/**/*.example.md
+!config/knowledge/**/*.example.markdown
+llm/.env
+llm/config/.env
+llm/config/member_id_mapping.json
+llm/config/world.md
+llm/config/context_modules.toml
+llm/config/prompts/*.md
+!llm/config/prompts/*.example.md
+llm/config/context/*.md
+!llm/config/context/*.example.md
+llm/config/knowledge/**/*.md
+llm/config/knowledge/**/*.markdown
+!llm/config/knowledge/**/*.example.md
+!llm/config/knowledge/**/*.example.markdown
+qq-maid-core/.env
+qq-maid-core/config/.env
+qq-maid-core/config/member_id_mapping.json
+qq-maid-core/config/world.md
+qq-maid-core/config/context_modules.toml
+qq-maid-core/config/prompts/*.md
+!qq-maid-core/config/prompts/*.example.md
+qq-maid-core/config/context/*.md
+!qq-maid-core/config/context/*.example.md
+qq-maid-core/config/knowledge/**/*.md
+qq-maid-core/config/knowledge/**/*.markdown
+!qq-maid-core/config/knowledge/**/*.example.md
+!qq-maid-core/config/knowledge/**/*.example.markdown
+qq-maid-gateway-rs/config/.env
+
 # ========== runtime 运行目录 ==========
 # 只提交 README、.example 模板和 static/index.html；
 # 不提交真实配置、运行产物、二进制和部署脚本副本。
@@ -11,10 +56,8 @@ runtime/config/.env
 runtime/config/member_id_mapping.json
 runtime/config/world.md
 runtime/config/context_modules.toml
-runtime/config/prompts/innerworld_lore.md
-runtime/config/prompts/maid_system.md
-runtime/config/prompts/mode_rules.md
-runtime/config/prompts/session_context.md
+runtime/config/prompts/*.md
+!runtime/config/prompts/*.example.md
 runtime/config/context/*.md
 !runtime/config/context/*.example.md
 runtime/config/knowledge/**/*.md
