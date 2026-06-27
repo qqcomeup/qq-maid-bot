@@ -204,8 +204,8 @@ make diagnose
 
 ```text
 runtime/config/.env 或 runtime/.env
-  └→ Rust Core HTTP (127.0.0.1:8787)
-       └→ /v1/respond
+  └→ qq-maid-bot 统一进程
+       └→ CoreService::respond
             └→ 普通聊天组装:
                  固定核心 prompt
                  + 请求时间上下文

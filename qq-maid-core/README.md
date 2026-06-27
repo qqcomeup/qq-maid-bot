@@ -1,16 +1,16 @@
 # qq-maid-core — Rust Core 模块
 
-`qq-maid-core/` 是 QQ Maid Bot 的核心业务模块，负责 `/v1/respond`、普通聊天、联网查询命令、列车时刻查询、天气、翻译、会话、长期记忆、Todo、RSS / Atom 订阅和业务 prompt 组装。模型协议、Provider 路由、fallback、SSE、usage、健康观测和 OpenAI Web Search 传输由 `qq-maid-llm/` 承载。
+`qq-maid-core/` 是 QQ Maid Bot 的核心业务模块，负责 `CoreService`、普通聊天、联网查询命令、列车时刻查询、天气、翻译、会话、长期记忆、Todo、RSS / Atom 订阅和业务 prompt 组装。模型协议、Provider 路由、fallback、SSE、usage、健康观测和 OpenAI Web Search 传输由 `qq-maid-llm/` 承载。
 
 QQ 平台事件解析、白名单、`/ping` 本地诊断和消息回发不在本模块处理，相关实现见 [qq-maid-gateway-rs/README.md](../qq-maid-gateway-rs/README.md)。运行目录、私有配置、部署产物和数据文件说明见 [runtime/README.md](../runtime/README.md)。
 
 ## 当前范围
 
-- HTTP 层默认只公开 `GET /healthz` 和 `POST /v1/respond`；本地 Web 控制台默认关闭，启用后才注册 `/console/` 和 `/api/v1/markdown/render`。
-- 普通聊天、查询、列车时刻、天气、翻译、会话命令、长期记忆、Todo 和 RSS 指令都通过 `/v1/respond` 内部分发。
+- HTTP 层默认只公开进程级 `GET /healthz`；本地 Web 控制台默认关闭，启用后才注册 `/console/` 和 `/api/v1/markdown/render`。
+- 普通聊天、查询、列车时刻、天气、翻译、会话命令、长期记忆、Todo 和 RSS 指令都通过 `CoreService::respond` 进程内分发。
 - Session、Todo、长期记忆、RSS / Atom 订阅、RSS 去重状态和知识检索索引统一写入 `APP_DB_FILE` 指向的 SQLite。
 - 长期记忆只能通过明确 `/memory`、`/记忆`、`/记` 指令生成草稿，用户确认后写入；普通聊天不会自动写长期记忆。
-- RSS 后台轮询由本模块调度，主动推送通过 gateway 的本机 `/internal/push` 出口发送。
+- RSS 后台轮询由本模块调度，主动推送通过进程内 `PushSink` 交给 gateway 发送。
 - OpenAI / DeepSeek、模型候选链 fallback、Web Search 传输和上游健康观测由 `qq-maid-llm` 提供，Core 只保留业务调用边界和兼容 re-export。
 
 旧 HTTP `/query`、HTTP `/memory`、`/v1/chat` 等入口不再公开，也不要重新引入 Python LLM、Python 查询、Python 记忆或 Python fallback 入口。
@@ -21,13 +21,14 @@ QQ 平台事件解析、白名单、`/ping` 本地诊断和消息回发不在本
 qq-maid-core/src/
 ├── app/                 # 启动、dotenv 加载、日志、组件装配
 ├── config.rs            # 环境变量解析和默认值
-├── http/                # /healthz 与 /v1/respond facade
+├── http/                # /healthz、控制台和 Markdown render
+├── service.rs           # CoreService / CoreHandle 进程内契约
 ├── provider/            # qq-maid-llm provider-facing 类型的兼容 re-export
 ├── runtime/
-│   ├── respond/         # /v1/respond 分发和 chat/search/weather/todo/memory/session flow
+│   ├── respond/         # CoreService 后的 chat/search/weather/todo/memory/session flow
 │   ├── pending/         # 待确认操作类型和确认分类
 │   ├── query/           # qq-maid-llm Web Search 执行器的兼容 facade
-│   ├── rss/             # RSS / Atom 拉取、存储封装、调度和 push client
+│   ├── rss/             # RSS / Atom 拉取、存储封装、调度和 PushSink
 │   ├── prompt/          # 固定 prompt 和成员映射加载
 │   ├── knowledge/       # Markdown 知识目录扫描、分段和检索上下文
 │   ├── session.rs       # 会话领域逻辑
@@ -36,39 +37,20 @@ qq-maid-core/src/
 │   ├── train/           # 列车时刻查询执行器
 │   └── weather/         # 天气执行器
 ├── storage/             # SQLite、migration、session/memory/todo/rss/knowledge 持久化
-└── util/                # SSE、指标，以及 time_context 兼容 re-export
+└── util/                # 指标，以及 time_context 兼容 re-export
 ```
 
-`runtime/respond.rs` 是 `/v1/respond` facade 后的统一业务入口；具体 flow 在 `runtime/respond/` 下维护。通用日期、时间和时区语义优先复用 `qq-maid-common/src/time_context.rs`；Core 内部可继续通过 `util/time_context.rs` 兼容入口引用，不要在具体命令里重复实现。
+`runtime/respond.rs` 是 `CoreService::respond` 后的统一业务入口；具体 flow 在 `runtime/respond/` 下维护。通用日期、时间和时区语义优先复用 `qq-maid-common/src/time_context.rs`；Core 内部可继续通过 `util/time_context.rs` 兼容入口引用，不要在具体命令里重复实现。
 
 ## HTTP 接口
 
 ### `GET /healthz`
 
-返回核心模块健康状态、当前 provider、模型、流式配置和当前进程内最近一次真实上游调用的脱敏快照，供 gateway `/ping`、控制脚本和诊断脚本探测。进程启动后尚无调用时，上游状态为 `unverified`；进程重启后不会沿用旧配置下的状态。
+返回进程级健康状态、当前 provider、模型、流式配置和当前进程内最近一次真实上游调用的脱敏快照，供控制脚本和诊断脚本探测。Gateway `/ping` 直接读取 `CoreService::health_snapshot()`，不通过 HTTP。进程启动后尚无调用时，上游状态为 `unverified`；进程重启后不会沿用旧配置下的状态。
 
-### `POST /v1/respond`
+### CoreService
 
-gateway 调用的唯一业务入口。请求体只接受当前 schema，未知字段会被拒绝：
-
-```json
-{
-  "scope_key": "qq:c2c:xxx",
-  "content": "/todo add 明天下午检查日志",
-  "platform": "qq_official",
-  "event_type": "C2C_MESSAGE_CREATE",
-  "user_id": "optional",
-  "group_id": "optional",
-  "guild_id": "optional",
-  "channel_id": "optional",
-  "message_id": "optional",
-  "timestamp": "optional"
-}
-```
-
-Gateway 的 `/ping check` 会在该入口发送内部诊断动作，直接执行一次最小 provider 请求；该分支不进入 respond 业务 flow，不创建 session，也不触发标题、记忆、Todo 或查询。
-
-默认返回 JSON `RespondResponse`。当 `LLM_SEND_MODE=streaming` 且调用方接受 SSE 时，目前只有 `/查` 联网查询路径会返回流式事件；普通聊天仍按现有 flow 处理。
+Gateway 调用 Core 的唯一业务入口是 `CoreService::respond(CoreRequest)`。Gateway 只传入最终拼接后的文本、平台、成员身份和私聊 / 群聊目标；`scope_key` 由 Core 根据目标派生。`/ping check` 调用 `CoreService::upstream_check()`，该分支不进入 respond 业务 flow，不创建 session，也不触发标题、记忆、Todo 或查询。
 
 ### `GET /console/` 与 `POST /api/v1/markdown/render`
 
@@ -105,7 +87,7 @@ runtime/.env
 - `LLM_PROVIDER`：`openai` / `deepseek` / `bigmodel` / `auto`；`auto` 会按模型候选链中的 provider 前缀路由。
 - `LLM_MODEL`、`TITLE_MODEL`、`TODO_MODEL`、`MEMORY_MODEL`、`COMPACT_MODEL`、`TRANSLATION_MODEL`：主模型和内部任务模型；`TRANSLATION_MODEL` 供 `/翻译` 和 RSS 推送前翻译共用，留空时沿用主模型。
 - `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_BASE_URLS`、`OPENAI_API_MODE`、`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`BIGMODEL_API_KEY`、`BIGMODEL_BASE_URL`、`BIGMODEL_MODEL`：provider 配置；Core 解析后传给 `qq-maid-llm`。`OPENAI_BASE_URLS` 为逗号分隔时取第一个非空地址，优先于 `OPENAI_BASE_URL`。`OPENAI_API_MODE=auto` 优先 Responses API 并在可恢复错误时降级 Chat Completions；`chat_only` 仅用于普通聊天兼容只实现 Chat Completions 的网关，不会请求 `/v1/responses`。
-- `LLM_SERVER_HOST`、`LLM_SERVER_PORT`、`LLM_REQUEST_TIMEOUT_SECONDS`、`LLM_SEND_MODE`：HTTP 服务和请求行为。
+- `LLM_SERVER_HOST`、`LLM_SERVER_PORT`、`LLM_REQUEST_TIMEOUT_SECONDS`：外部健康 / 控制台 HTTP 服务和请求超时行为。
 - `WEB_CONSOLE_ENABLED`、`WEB_CONSOLE_ALLOWED_ORIGINS`：本地控制台和跨域 allowlist；默认关闭且不允许任意来源。
 - `APP_DB_FILE`：统一 SQLite 文件，承载业务数据和知识检索索引。
 - `PROMPT_DIR`、`MEMBER_ID_MAPPING_FILE`：固定 prompt 和成员映射。

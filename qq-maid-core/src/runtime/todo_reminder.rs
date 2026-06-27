@@ -15,9 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::DailyReminderTime,
-    runtime::push::{
-        GatewayPushClient, GatewayPushError, GatewayPushTarget, GatewayPushTargetType,
-    },
+    runtime::push::{PushError, PushIntent, PushSink, PushTarget, PushTargetType},
     storage::todo::{
         TodoItem, TodoReminderOwnerQueryResult, TodoReminderOwnerSkipReason, TodoStore,
     },
@@ -51,9 +49,10 @@ pub struct TodoReminderRunStats {
     pub duplicate_owner_count: usize,
 }
 
+#[derive(Clone)]
 pub struct TodoReminderScheduler {
     store: TodoStore,
-    push_client: GatewayPushClient,
+    push_sink: Arc<dyn PushSink>,
     config: TodoReminderSchedulerConfig,
     sent_markers: Arc<Mutex<HashSet<String>>>,
     retry_delay: Duration,
@@ -88,12 +87,12 @@ enum ReminderClassification {
 impl TodoReminderScheduler {
     pub fn new(
         store: TodoStore,
-        push_client: GatewayPushClient,
+        push_sink: Arc<dyn PushSink>,
         config: TodoReminderSchedulerConfig,
     ) -> Self {
         Self {
             store,
-            push_client,
+            push_sink,
             config,
             sent_markers: Arc::new(Mutex::new(HashSet::new())),
             retry_delay: FAILED_RUN_RETRY_DELAY,
@@ -241,16 +240,21 @@ impl TodoReminderScheduler {
                 continue;
             };
 
-            let target = GatewayPushTarget {
-                target_type: GatewayPushTargetType::Private,
+            let target = PushTarget {
+                target_type: PushTargetType::Private,
                 target_id: owner.private_target_id.clone(),
             };
             match self
-                .push_client
-                .send(&target, "markdown", &message.markdown, Some(&message.text))
+                .push_sink
+                .push(PushIntent {
+                    target,
+                    message_type: "markdown".to_owned(),
+                    text: message.markdown.clone(),
+                    fallback_text: Some(message.text.clone()),
+                })
                 .await
             {
-                Ok(()) => {
+                Ok(_) => {
                     mark_sent_today(&self.sent_markers, &owner.owner_key, today);
                     stats.sent_owner_count += 1;
                     info!(
@@ -505,10 +509,9 @@ fn short_hash(value: &str) -> String {
     output
 }
 
-fn safe_push_error(err: &GatewayPushError) -> String {
+fn safe_push_error(err: &PushError) -> String {
     match err {
-        GatewayPushError::Status { status, .. } => format!("push endpoint returned {status}"),
-        _ => err.to_string(),
+        PushError::Failed { summary } => summary.clone(),
     }
 }
 
@@ -517,10 +520,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
-    use serde::Deserialize;
+    use async_trait::async_trait;
 
     use crate::{
+        runtime::push::PushResult,
         storage::todo::{TodoItemDraft, TodoTimePrecision},
         storage::{APP_MIGRATIONS, database::SqliteDatabase},
     };
@@ -533,30 +536,48 @@ mod tests {
         fallback_text: Option<String>,
     }
 
-    #[derive(Clone)]
-    struct PushServerState {
+    #[derive(Default)]
+    struct TestPushSink {
         requests: Arc<Mutex<Vec<CapturedPushRequest>>>,
         failing_targets: HashSet<String>,
         transient_failures: Arc<Mutex<HashMap<String, usize>>>,
     }
 
-    #[derive(Debug, Deserialize)]
-    struct PushPayload {
-        target_id: String,
-        message_type: String,
-        text: String,
-        #[serde(default)]
-        fallback_text: Option<String>,
+    #[async_trait]
+    impl PushSink for TestPushSink {
+        async fn push(&self, intent: PushIntent) -> Result<PushResult, PushError> {
+            self.requests.lock().unwrap().push(CapturedPushRequest {
+                target_id: intent.target.target_id.clone(),
+                message_type: intent.message_type.clone(),
+                text: intent.text.clone(),
+                fallback_text: intent.fallback_text.clone(),
+            });
+            if self.failing_targets.contains(&intent.target.target_id) {
+                return Err(PushError::Failed {
+                    summary: "push failed".to_owned(),
+                });
+            }
+            let mut transient_failures = self.transient_failures.lock().unwrap();
+            if let Some(remaining) = transient_failures.get_mut(&intent.target.target_id)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return Err(PushError::Failed {
+                    summary: "push failed".to_owned(),
+                });
+            }
+            Ok(PushResult { message_id: None })
+        }
     }
 
     fn test_store() -> TodoStore {
         TodoStore::new(SqliteDatabase::open_temp("qq-maid-todo-reminder", APP_MIGRATIONS).unwrap())
     }
 
-    fn reminder_scheduler(store: TodoStore, endpoint: String) -> TodoReminderScheduler {
+    fn reminder_scheduler(store: TodoStore, push_sink: Arc<TestPushSink>) -> TodoReminderScheduler {
         TodoReminderScheduler::new(
             store,
-            GatewayPushClient::new(endpoint, None, 5).unwrap(),
+            push_sink,
             TodoReminderSchedulerConfig {
                 enabled: true,
                 reminder_time: DailyReminderTime { hour: 9, minute: 0 },
@@ -564,90 +585,21 @@ mod tests {
         )
     }
 
-    fn push_status_for_target(state: &PushServerState, target_id: &str) -> StatusCode {
-        if state.failing_targets.contains(target_id) {
-            return StatusCode::BAD_GATEWAY;
-        }
-        let mut transient_failures = state.transient_failures.lock().unwrap();
-        match transient_failures.get_mut(target_id) {
-            Some(remaining) if *remaining > 0 => {
-                *remaining -= 1;
-                StatusCode::BAD_GATEWAY
-            }
-            _ => StatusCode::OK,
-        }
-    }
-
-    async fn spawn_push_server(
-        failing_targets: &[&str],
-    ) -> (
-        String,
-        Arc<Mutex<Vec<CapturedPushRequest>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        async fn receive_push(
-            State(state): State<PushServerState>,
-            Json(payload): Json<PushPayload>,
-        ) -> (StatusCode, Json<serde_json::Value>) {
-            state.requests.lock().unwrap().push(CapturedPushRequest {
-                target_id: payload.target_id.clone(),
-                message_type: payload.message_type.clone(),
-                text: payload.text.clone(),
-                fallback_text: payload.fallback_text.clone(),
-            });
-            let status = push_status_for_target(&state, &payload.target_id);
-            (
-                status,
-                Json(serde_json::json!({ "ok": status.is_success() })),
-            )
-        }
-
+    fn push_sink(failing_targets: &[&str]) -> Arc<TestPushSink> {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let state = PushServerState {
+        Arc::new(TestPushSink {
             requests: requests.clone(),
             failing_targets: failing_targets
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
             transient_failures: Arc::new(Mutex::new(HashMap::new())),
-        };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let router = Router::new()
-            .route("/internal/push", post(receive_push))
-            .with_state(state);
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        (format!("http://{addr}/internal/push"), requests, handle)
+        })
     }
 
-    async fn spawn_push_server_with_transient_failures(
-        failing_targets: &[(&str, usize)],
-    ) -> (
-        String,
-        Arc<Mutex<Vec<CapturedPushRequest>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        async fn receive_push(
-            State(state): State<PushServerState>,
-            Json(payload): Json<PushPayload>,
-        ) -> (StatusCode, Json<serde_json::Value>) {
-            state.requests.lock().unwrap().push(CapturedPushRequest {
-                target_id: payload.target_id.clone(),
-                message_type: payload.message_type.clone(),
-                text: payload.text.clone(),
-                fallback_text: payload.fallback_text.clone(),
-            });
-            let status = push_status_for_target(&state, &payload.target_id);
-            (
-                status,
-                Json(serde_json::json!({ "ok": status.is_success() })),
-            )
-        }
-
+    fn push_sink_with_transient_failures(failing_targets: &[(&str, usize)]) -> Arc<TestPushSink> {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let state = PushServerState {
+        Arc::new(TestPushSink {
             requests: requests.clone(),
             failing_targets: HashSet::new(),
             transient_failures: Arc::new(Mutex::new(
@@ -656,16 +608,7 @@ mod tests {
                     .map(|(target, count)| ((*target).to_owned(), *count))
                     .collect(),
             )),
-        };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let router = Router::new()
-            .route("/internal/push", post(receive_push))
-            .with_state(state);
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        (format!("http://{addr}/internal/push"), requests, handle)
+        })
     }
 
     fn create_todo(
@@ -698,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_once_sends_one_private_reminder_per_owner_per_day() {
-        let (endpoint, requests, handle) = spawn_push_server(&[]).await;
+        let sink = push_sink(&[]);
         let store = test_store();
         let owner_same_scope = TodoStore::owner(Some("u1"), "private:u1");
         let owner_dirty_scope = TodoStore::owner(Some("u1"), "private: u1");
@@ -719,13 +662,13 @@ mod tests {
         );
         create_todo(&store, &future_owner, "明天再做", Some("2026-06-25"), None);
 
-        let scheduler = reminder_scheduler(store, endpoint);
+        let scheduler = reminder_scheduler(store, sink.clone());
         let today = NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
 
         let first = scheduler.run_once_for_date(today).await.unwrap();
         assert_eq!(first.sent_owner_count, 1);
         assert_eq!(first.empty_owner_count, 1);
-        let captured = requests.lock().unwrap().clone();
+        let captured = sink.requests.lock().unwrap().clone();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].target_id, "u1");
         assert_eq!(captured[0].message_type, "markdown");
@@ -745,38 +688,34 @@ mod tests {
 
         let second = scheduler.run_once_for_date(today).await.unwrap();
         assert_eq!(second.already_sent_owner_count, 1);
-        assert_eq!(requests.lock().unwrap().len(), 1);
-
-        handle.abort();
+        assert_eq!(sink.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn run_once_future_only_is_silent_and_does_not_mark_sent() {
-        let (endpoint, requests, handle) = spawn_push_server(&[]).await;
+        let sink = push_sink(&[]);
         let store = test_store();
         let owner = TodoStore::owner(Some("u1"), "private:u1");
         create_todo(&store, &owner, "未来任务", Some("2026-06-25"), None);
 
-        let scheduler = reminder_scheduler(store.clone(), endpoint);
+        let scheduler = reminder_scheduler(store.clone(), sink.clone());
         let today = NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
 
         let first = scheduler.run_once_for_date(today).await.unwrap();
         assert_eq!(first.sent_owner_count, 0);
         assert_eq!(first.empty_owner_count, 1);
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(sink.requests.lock().unwrap().is_empty());
 
         create_todo(&store, &owner, "今天补记", Some("2026-06-24"), None);
         let second = scheduler.run_once_for_date(today).await.unwrap();
         assert_eq!(second.sent_owner_count, 1);
-        assert_eq!(requests.lock().unwrap().len(), 1);
-
-        handle.abort();
+        assert_eq!(sink.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn run_once_failure_does_not_block_other_owners_and_explicit_rerun_retries_failed_owner()
     {
-        let (endpoint, requests, handle) = spawn_push_server(&["u1"]).await;
+        let sink = push_sink(&["u1"]);
         let store = test_store();
         let failing_owner = TodoStore::owner(Some("u1"), "private:u1");
         let success_owner = TodoStore::owner(Some("u2"), "private:u2");
@@ -795,19 +734,19 @@ mod tests {
             None,
         );
 
-        let scheduler = reminder_scheduler(store, endpoint);
+        let scheduler = reminder_scheduler(store, sink.clone());
         let today = NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
 
         let first = scheduler.run_once_for_date(today).await.unwrap();
         assert_eq!(first.sent_owner_count, 1);
         assert_eq!(first.failed_owner_count, 1);
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(sink.requests.lock().unwrap().len(), 2);
 
         let second = scheduler.run_once_for_date(today).await.unwrap();
         assert_eq!(second.sent_owner_count, 0);
         assert_eq!(second.failed_owner_count, 1);
         assert_eq!(second.already_sent_owner_count, 1);
-        let captured = requests.lock().unwrap().clone();
+        let captured = sink.requests.lock().unwrap().clone();
         assert_eq!(captured.len(), 3);
         assert_eq!(
             captured
@@ -823,14 +762,11 @@ mod tests {
                 .count(),
             1
         );
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn scheduled_cycle_retries_failed_owner_on_same_day() {
-        let (endpoint, requests, handle) =
-            spawn_push_server_with_transient_failures(&[("u1", 1)]).await;
+        let sink = push_sink_with_transient_failures(&[("u1", 1)]);
         let store = test_store();
         let owner = TodoStore::owner(Some("u1"), "private:u1");
         // 调度器内部 next_retry_after 使用上海时区（shanghai_offset）取当前日期，
@@ -841,11 +777,11 @@ mod tests {
         create_todo(&store, &owner, "当天自动补跑", Some(&today_str), None);
 
         let scheduler =
-            reminder_scheduler(store, endpoint).with_retry_delay_for_test(Duration::ZERO);
+            reminder_scheduler(store, sink.clone()).with_retry_delay_for_test(Duration::ZERO);
 
         scheduler.run_scheduled_cycle_for_date(today).await;
 
-        let captured = requests.lock().unwrap().clone();
+        let captured = sink.requests.lock().unwrap().clone();
         assert_eq!(captured.len(), 2);
         assert_eq!(
             captured
@@ -854,8 +790,6 @@ mod tests {
                 .count(),
             2
         );
-
-        handle.abort();
     }
 
     #[test]

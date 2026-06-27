@@ -5,48 +5,48 @@
 ```text
 QQ Gateway C2C_MESSAGE_CREATE
   -> qq-maid-gateway-rs
-  -> qq-maid-core POST /v1/respond
+  -> qq-maid-core CoreService::respond
   -> QQ OpenAPI /v2/users/{openid}/messages
 
 QQ Gateway GROUP_AT_MESSAGE_CREATE
   -> qq-maid-gateway-rs
-  -> qq-maid-core POST /v1/respond
+  -> qq-maid-core CoreService::respond
   -> QQ OpenAPI /v2/groups/{group_openid}/messages
 
 qq-maid-core RSS scheduler
-  -> qq-maid-gateway-rs POST /internal/push
+  -> qq-maid-gateway-rs PushSink
   -> QQ OpenAPI /v2/users 或 /v2/groups 消息发送
 ```
 
 ## 当前范围
 
 - 处理 `C2C_MESSAGE_CREATE`、`GROUP_AT_MESSAGE_CREATE` 和普通 `GROUP_MESSAGE_CREATE` 文本消息；普通群消息默认采用 `mention` 模式，仅响应命令、@ 和回复机器人消息，可按配置关闭或改为提示词触发模式。
-- `/ping` 会在 gateway 本地返回诊断信息，只做短超时 `/healthz` 探测，不产生模型请求；`/ping check` 会通过 `/v1/respond` 执行一次不写会话的最小上游检查。
+- `/ping` 会在 gateway 本地返回诊断信息，直接读取 Core 进程内健康快照；`/ping check` 会调用 `CoreService::upstream_check()` 执行一次不写会话的最小上游检查。
 - 文本回复使用 QQ C2C `msg_type: 0`、原消息 `msg_id` 和递增 `msg_seq`。
-- 入站附件不会改 `/v1/respond` schema；图片等附件信息会追加到 `content` 末尾，例如 `[附件 image/jpeg: a.jpg https://example.test/a.jpg]`。
+- 入站附件不会改 Core 稳定请求模型；图片等附件信息会追加到文本末尾，例如 `[附件 image/jpeg: a.jpg https://example.test/a.jpg]`。
 - Markdown 和图片保留独立 outbound 类型、payload 构造和发送入口；发送失败会 warn 并 fallback 到文本。第一版真机验收不以富媒体成功发送为前置条件。
-- 本机内部 `/internal/push` 供 Core RSS 调度主动推送，默认只监听 `127.0.0.1`，可通过共享 token 限制调用方。
+- Core RSS 调度和 Todo 每日提醒通过进程内 `PushSink` 主动推送，不再暴露本机 HTTP push 入口。
 - 不做频道、频道私信、Ark、Embed、Keyboard、多租户或旧接入层兼容。
 
 ## 开发边界
 
 - QQ 平台字段解析、intent、白名单、消息去重和发送分支优先放在本目录维护。
 - 普通聊天、查询、天气、翻译、session、todo、memory、RSS 指令和 prompt 组装放在 `qq-maid-core/`。
-- gateway 调用 Core 时只走 `QQ_MAID_RESPOND_URL` 指向的 `/v1/respond`，不要重新引入旧 `/query`、HTTP `/memory` 或 `/v1/chat` 调用路径。
-- `/internal/push` 是给 Core RSS 调度使用的本机内部出口，生产环境应保持本机监听，并按需配置 `QQ_MAID_PUSH_TOKEN` / `RSS_PUSH_TOKEN` 共享 token。
+- gateway 调用 Core 时只走 `CoreService` 进程内接口，不要重新引入旧 `/query`、HTTP `/memory`、`/v1/chat` 或 localhost `/v1/respond` 调用路径。
+- 主动推送只通过 `PushSink` 进程内边界进入 Gateway，不要恢复本机 push HTTP、push token 或 push 端口。
 
 ## 源码边界
 
 当前 Gateway 主链路按以下边界维护：
 
-- `src/gateway/mod.rs`：运行域装配和顶层编排，只负责初始化共享状态、启动 `/internal/push`、维护重连循环，并把 WebSocket 协议处理委托给下层模块。
+- `src/gateway/mod.rs`：运行域装配和顶层编排，只负责初始化共享状态、绑定进程内 push sink、维护重连循环，并把 WebSocket 协议处理委托给下层模块。
 - `src/gateway/protocol.rs`：QQ Gateway WebSocket 协议层，负责 gateway 地址获取、HELLO/IDENTIFY/RESUME、心跳、READY/RESUMED、`INVALID_SESSION` 和 envelope 分发。
 - `src/gateway/event.rs`：QQ 平台 payload 到 `C2cMessage` / `GroupMessage` 的解析与兼容字段处理。
 - `src/gateway/outbound.rs`：QQ 出站发送包装和 runtime 发送状态记录，保持“真实发送结果再记录状态”的约束。
-- `src/respond.rs`：gateway 到 Core `/v1/respond` 的桥接层，负责请求体构造、JSON/SSE 响应解析、错误脱敏，以及 reply block / 附件备注拼接。
-- `src/gateway/push.rs`：本机 `/internal/push` 主动推送入口。
+- `src/respond.rs`：gateway 到 CoreService 的进程内桥接层，负责 CoreRequest 映射、错误脱敏，以及 reply block / 附件备注拼接。
+- `src/gateway/push.rs`：进程内主动推送实现。
 
-维护时应尽量保持这些边界，不要把 WebSocket 协议细节、`/v1/respond` 传输细节和 QQ 发送状态记录重新堆回同一个超长文件。
+维护时应尽量保持这些边界，不要把 WebSocket 协议细节、Core 业务调用和 QQ 发送状态记录重新堆回同一个超长文件。
 
 ## 配置
 
@@ -66,16 +66,11 @@ QQ_BOT_APP_SECRET=你的QQ机器人AppSecret
 QQ_BOT_SANDBOX=false
 QQ_BOT_API_BASE=https://api.sgroup.qq.com
 QQ_BOT_TOKEN_REFRESH_MARGIN_SECONDS=60
-QQ_MAID_RESPOND_URL=http://127.0.0.1:8787/v1/respond
 QQ_MAID_ENABLE_MARKDOWN=true
 QQ_MAID_ENABLE_IMAGE=false
 QQ_MAID_GATEWAY_VERBOSE_LOG=false
 QQ_MAID_GROUP_MESSAGE_MODE=mention
 QQ_MAID_GROUP_ACTIVE_KEYWORDS=小女仆
-QQ_MAID_PUSH_ENABLED=true
-QQ_MAID_PUSH_HOST=127.0.0.1
-QQ_MAID_PUSH_PORT=8788
-QQ_MAID_PUSH_TOKEN=
 RUST_LOG=info,qq_maid_gateway_rs=debug
 ```
 
@@ -106,7 +101,7 @@ RUST_LOG=info,qq_maid_gateway_rs=debug
 RUST_LOG=debug make run
 ```
 
-默认日志会记录 gateway 连接、READY/RESUMED、重连、收到 C2C 事件、调用 `/v1/respond`、回发 QQ 消息和失败状态。日志中的 openid/user_id 会脱敏，不记录 QQ raw event envelope、Authorization header、AppSecret 或 token，也不默认打印消息正文。
+默认日志会记录 gateway 连接、READY/RESUMED、重连、收到 C2C 事件、调用进程内 CoreService、回发 QQ 消息和失败状态。日志中的 openid/user_id 会脱敏，不记录 QQ raw event envelope、Authorization header、AppSecret 或 token，也不默认打印消息正文。
 
 确需查看解析后的消息正文时，可以临时开启：
 
@@ -153,7 +148,7 @@ cargo check -p qq-maid-gateway-rs
 - 能获取 QQ Access Token。
 - 能连接 QQ Gateway。
 - 能收到 C2C 文本事件。
-- 能调用 `qq-maid-core` 的 `/v1/respond`。
+- 能通过进程内 `CoreService` 调用 `qq-maid-core`。
 - 能回发 C2C 文本。
 - `/ping` 能直接返回 gateway 诊断信息。
 - `/ping check` 能主动验证 LLM 鉴权、模型、参数和响应解析，且不写入聊天历史。

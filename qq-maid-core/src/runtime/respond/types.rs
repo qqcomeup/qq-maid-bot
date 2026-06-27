@@ -6,14 +6,12 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-
 use crate::{
     error::ErrorInfo,
     provider::types::{ChatMessage, TokenUsage},
     util::metrics::LlmMetrics,
 };
+use serde::{Deserialize, Serialize};
 
 /// 请求用途标记，用于区分当前请求的业务语义。
 ///
@@ -201,33 +199,6 @@ pub struct RespondResponse {
     pub usage: Option<TokenUsage>,
     /// 错误信息
     pub error: Option<ErrorInfo>,
-}
-
-/// `/v1/respond` 的传输结果。
-///
-/// 默认仍然返回完整 JSON；当命中流式查询路径时，HTTP 层会改为 SSE。
-#[derive(Debug)]
-pub enum RespondTransport {
-    /// 一次性 JSON 响应。
-    Json(Box<RespondResponse>),
-    /// SSE 流式响应。
-    Stream(RespondStream),
-}
-
-/// SSE 流式响应的事件。
-#[derive(Debug, Clone)]
-pub enum RespondStreamEvent {
-    /// 流式增量文本。
-    Delta { text: String },
-    /// 结束事件，携带完整响应。
-    Final { response: Box<RespondResponse> },
-}
-
-/// SSE 流式响应载体。
-#[derive(Debug)]
-pub struct RespondStream {
-    /// 从后台任务接收流式事件。
-    pub receiver: mpsc::Receiver<RespondStreamEvent>,
 }
 
 impl ChatResponse {

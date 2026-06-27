@@ -28,7 +28,6 @@ pub const DEFAULT_APP_DB_FILE: &str = "data/storage/app.db"; // 项目通用 SQL
 pub const DEFAULT_PROMPT_DIR: &str = "config/prompts"; // 提示词模板目录
 pub const DEFAULT_KNOWLEDGE_DIR: &str = "config/knowledge"; // Markdown 知识目录
 pub const DEFAULT_MEMBER_ID_MAPPING_FILE: &str = "config/member_id_mapping.json"; // 成员 ID 映射文件
-pub const DEFAULT_RSS_PUSH_URL: &str = "http://127.0.0.1:8788/internal/push"; // gateway 内部推送入口
 pub const DEFAULT_RSS_POLL_INTERVAL_SECONDS: u64 = 300; // RSS 轮询间隔
 pub const DEFAULT_RSS_HTTP_TIMEOUT_SECONDS: u64 = 15; // RSS HTTP 请求超时
 pub const DEFAULT_RSS_MAX_BODY_BYTES: u64 = 2 * 1024 * 1024; // RSS 响应体大小上限
@@ -156,8 +155,6 @@ pub struct AppConfig {
     pub bigmodel_model: String,
     /// 是否启用流式输出
     pub stream: bool,
-    /// 发送模式（final / streaming 等）
-    pub send_mode: String,
     /// LLM 请求超时秒数
     pub request_timeout_seconds: u64,
     /// 首 token 到达告警阈值（秒）
@@ -186,10 +183,6 @@ pub struct AppConfig {
     pub rss_seen_retention: u64,
     /// 单条目推送失败次数上限
     pub rss_push_max_failures: u64,
-    /// gateway 内部主动推送入口
-    pub rss_push_url: String,
-    /// gateway 内部主动推送共享 token；空值表示不发送 token
-    pub rss_push_token: Option<String>,
     /// RSS 主动推送消息类型：markdown / text
     pub rss_push_message_type: String,
     /// 是否启用 Todo 每日提醒调度。
@@ -271,7 +264,6 @@ impl AppConfig {
             bigmodel_base_url: env_string("BIGMODEL_BASE_URL", DEFAULT_BIGMODEL_BASE_URL),
             bigmodel_model,
             stream: env_bool("LLM_STREAM", true)?,
-            send_mode: env_string("LLM_SEND_MODE", "final"),
             request_timeout_seconds: env_u64(
                 "LLM_REQUEST_TIMEOUT_SECONDS",
                 DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -295,8 +287,6 @@ impl AppConfig {
             rss_summary_max_chars: env_u64("RSS_SUMMARY_MAX_CHARS", DEFAULT_RSS_SUMMARY_MAX_CHARS)?,
             rss_seen_retention: env_u64("RSS_SEEN_RETENTION", DEFAULT_RSS_SEEN_RETENTION)?,
             rss_push_max_failures: env_u64("RSS_PUSH_MAX_FAILURES", DEFAULT_RSS_PUSH_MAX_FAILURES)?,
-            rss_push_url: env_string("RSS_PUSH_URL", DEFAULT_RSS_PUSH_URL),
-            rss_push_token: env_optional("RSS_PUSH_TOKEN"),
             rss_push_message_type: env_string(
                 "RSS_PUSH_MESSAGE_TYPE",
                 DEFAULT_RSS_PUSH_MESSAGE_TYPE,

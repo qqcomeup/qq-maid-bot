@@ -4,12 +4,9 @@ use std::{collections::HashMap, time::Duration};
 
 use thiserror::Error;
 
-pub const DEFAULT_RESPOND_URL: &str = "http://127.0.0.1:8787/v1/respond";
 pub const DEFAULT_PROD_API_BASE: &str = "https://api.sgroup.qq.com";
 pub const DEFAULT_SANDBOX_API_BASE: &str = "https://sandbox.api.sgroup.qq.com";
 pub const DEFAULT_TOKEN_REFRESH_MARGIN_SECONDS: u64 = 60;
-pub const DEFAULT_PUSH_HOST: &str = "127.0.0.1";
-pub const DEFAULT_PUSH_PORT: u16 = 8788;
 pub const DEFAULT_GROUP_ACTIVE_KEYWORDS: &[&str] = &["小女仆"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,17 +24,12 @@ pub struct AppConfig {
     pub sandbox: bool,
     pub api_base: String,
     pub token_refresh_margin: Duration,
-    pub respond_url: String,
     pub enable_markdown: bool,
     pub enable_image: bool,
     pub enable_group_messages: bool,
     pub verbose_log: bool,
     pub group_message_mode: GroupMessageMode,
     pub group_active_keywords: Vec<String>,
-    pub push_enabled: bool,
-    pub push_host: String,
-    pub push_port: u16,
-    pub push_token: Option<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -77,8 +69,6 @@ impl AppConfig {
             .to_owned();
         let margin_seconds = parse_u64(env, "QQ_BOT_TOKEN_REFRESH_MARGIN_SECONDS")?
             .unwrap_or(DEFAULT_TOKEN_REFRESH_MARGIN_SECONDS);
-        let respond_url =
-            optional(env, "QQ_MAID_RESPOND_URL").unwrap_or_else(|| DEFAULT_RESPOND_URL.to_owned());
         let enable_markdown = parse_bool(env, "QQ_MAID_ENABLE_MARKDOWN")?.unwrap_or(true);
         let enable_image = parse_bool(env, "QQ_MAID_ENABLE_IMAGE")?.unwrap_or(false);
         let enable_group_messages =
@@ -90,29 +80,18 @@ impl AppConfig {
             "QQ_MAID_GROUP_ACTIVE_KEYWORDS",
             DEFAULT_GROUP_ACTIVE_KEYWORDS,
         );
-        let push_enabled = parse_bool(env, "QQ_MAID_PUSH_ENABLED")?.unwrap_or(true);
-        let push_host =
-            optional(env, "QQ_MAID_PUSH_HOST").unwrap_or_else(|| DEFAULT_PUSH_HOST.to_owned());
-        let push_port = parse_u16(env, "QQ_MAID_PUSH_PORT")?.unwrap_or(DEFAULT_PUSH_PORT);
-        let push_token = optional(env, "QQ_MAID_PUSH_TOKEN");
-
         Ok(Self {
             app_id,
             app_secret,
             sandbox,
             api_base,
             token_refresh_margin: Duration::from_secs(margin_seconds),
-            respond_url,
             enable_markdown,
             enable_image,
             enable_group_messages,
             verbose_log,
             group_message_mode,
             group_active_keywords,
-            push_enabled,
-            push_host,
-            push_port,
-            push_token,
         })
     }
 }
@@ -204,25 +183,6 @@ fn parse_u64(
         .map_err(|_| ConfigError::InvalidInteger { name, value: raw })
 }
 
-fn parse_u16(
-    env: &HashMap<String, String>,
-    name: &'static str,
-) -> Result<Option<u16>, ConfigError> {
-    let Some(raw) = optional(env, name) else {
-        return Ok(None);
-    };
-    let parsed = raw
-        .parse::<u16>()
-        .map_err(|_| ConfigError::InvalidInteger {
-            name,
-            value: raw.clone(),
-        })?;
-    if parsed == 0 {
-        return Err(ConfigError::InvalidInteger { name, value: raw });
-    }
-    Ok(Some(parsed))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,7 +215,6 @@ mod tests {
         assert_eq!(config.app_secret, "secret");
         assert!(!config.sandbox);
         assert_eq!(config.api_base, DEFAULT_PROD_API_BASE);
-        assert_eq!(config.respond_url, DEFAULT_RESPOND_URL);
         assert_eq!(
             config.token_refresh_margin,
             Duration::from_secs(DEFAULT_TOKEN_REFRESH_MARGIN_SECONDS)
@@ -363,7 +322,6 @@ mod tests {
             ("QQ_BOT_SANDBOX", "yes"),
             ("QQ_BOT_API_BASE", "https://example.test/"),
             ("QQ_BOT_TOKEN_REFRESH_MARGIN_SECONDS", "120"),
-            ("QQ_MAID_RESPOND_URL", "http://llm.test/v1/respond"),
             ("QQ_MAID_ENABLE_MARKDOWN", "true"),
             ("QQ_MAID_ENABLE_IMAGE", "1"),
             ("QQ_MAID_ENABLE_GROUP_MESSAGES", "yes"),
@@ -374,7 +332,6 @@ mod tests {
         assert!(config.sandbox);
         assert_eq!(config.api_base, "https://example.test");
         assert_eq!(config.token_refresh_margin, Duration::from_secs(120));
-        assert_eq!(config.respond_url, "http://llm.test/v1/respond");
         assert!(config.enable_markdown);
         assert!(config.enable_image);
         assert!(config.enable_group_messages);

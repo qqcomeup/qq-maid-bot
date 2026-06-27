@@ -1,49 +1,36 @@
 //! HTTP 路由和请求处理器。
 //!
-//! 定义 `/healthz` 健康检查和 `/v1/respond` 聊天响应接口。
-//! 路由层负责参数校验、超时控制、错误处理和指标记录。
-
-use std::{collections::HashMap, time::Duration};
+//! 定义进程级 `/healthz`、控制台和 Markdown 预览接口。
+//!
+//! Gateway 与 Core 之间的业务调用已经改为进程内 `CoreService`，这里不再公开
+//! 内部 `/v1/respond` 或 SSE 传输入口，避免同进程组件保留长期双轨。
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{State, rejection::JsonRejection},
+    extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use futures::stream;
 use pulldown_cmark::{Options, Parser, html};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::time::timeout;
-use tracing::{error, info, warn};
 
 use crate::{
     config::AppConfig,
-    error::LlmError,
-    provider::{
-        DynLlmProvider,
-        status::UpstreamStatus,
-        types::{ChatMessage, ChatRequest, ChatRole},
-    },
+    provider::{DynLlmProvider, status::UpstreamStatus},
     runtime::{
         knowledge::KnowledgeIndex,
         memory::MemoryStore,
         prompt::PromptConfig,
         query::DynQueryExecutor,
-        respond::{
-            RespondExecutors, RespondRequest, RespondResponse, RespondServiceOptions,
-            RespondStores, RespondStreamEvent, RespondTransport, RustRespondService,
-        },
         rss::{RssFetcher, RssStore},
         session::SessionStore,
         todo::TodoStore,
         train::DynTrainExecutor,
         weather::DynWeatherExecutor,
     },
-    util::metrics::MetricsRecorder,
 };
 
 /// 应用全局状态，通过 Axum 的 State 注入到各处理器中。
@@ -77,73 +64,10 @@ pub struct AppState {
     pub prompt_config: PromptConfig,
 }
 
-/// HTTP /v1/respond 接口的请求体。
-///
-/// 使用 `#[serde(deny_unknown_fields)]` 拒绝旧版遗留字段。
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct HttpRespondRequest {
-    /// 会话作用域键，用于隔离不同会话的上下文。
-    scope_key: String,
-    /// 用户发送的文本内容。
-    content: String,
-    /// 消息来源平台（如 `qq_official`）。
-    platform: String,
-    /// 事件类型（如 `FakeEvent`）。
-    event_type: String,
-    /// 发送者用户 ID。
-    #[serde(default)]
-    user_id: Option<String>,
-    /// 群聊 ID。
-    #[serde(default)]
-    group_id: Option<String>,
-    /// 频道/子区 ID（用于 guild 场景）。
-    #[serde(default)]
-    guild_id: Option<String>,
-    /// 子频道 ID。
-    #[serde(default)]
-    channel_id: Option<String>,
-    /// 消息 ID。
-    #[serde(default)]
-    message_id: Option<String>,
-    /// 消息时间戳。
-    #[serde(default)]
-    timestamp: Option<String>,
-    /// gateway `/ping check` 专用诊断动作；不进入任何业务 flow。
-    #[serde(default)]
-    diagnostic: Option<HttpDiagnosticAction>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum HttpDiagnosticAction {
-    UpstreamCheck,
-}
-
-impl From<HttpRespondRequest> for RespondRequest {
-    fn from(value: HttpRespondRequest) -> Self {
-        Self {
-            content: value.content,
-            scope_key: value.scope_key,
-            user_id: value.user_id,
-            group_id: value.group_id,
-            guild_id: value.guild_id,
-            channel_id: value.channel_id,
-            message_id: value.message_id,
-            timestamp: value.timestamp,
-            platform: value.platform,
-            event_type: value.event_type,
-            ..Default::default()
-        }
-    }
-}
-
 /// 构建 Axum 路由树，注册所有 HTTP 端点。
 pub fn build_router(state: AppState) -> Router {
     let console_enabled = state.config.web_console_enabled;
-    let router = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/respond", post(respond));
+    let router = Router::new().route("/healthz", get(healthz));
     let router = if console_enabled {
         router.route("/console/", get(console_index)).route(
             "/api/v1/markdown/render",
@@ -313,269 +237,22 @@ fn allowed_console_origin<'a>(state: &'a AppState, headers: &'a HeaderMap) -> Op
         .find(|allowed| *allowed == origin)
 }
 
-/// /v1/respond 处理器：解析请求、调用 LLM 服务并返回结果。
-///
-/// 负责：
-/// - 请求体 JSON 反序列化与校验
-/// - 创建 [`RustRespondService`] 实例
-/// - 超时控制（由 `request_timeout_seconds` 配置）
-/// - 成功 / 业务错误 / 超时三种响应的指标记录与错误日志
-async fn respond(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    payload: Result<Json<HttpRespondRequest>, JsonRejection>,
-) -> Response {
-    let Json(req) = match payload {
-        Ok(req) => req,
-        Err(err) => {
-            warn!(error = %err, "respond request payload rejected");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "ok": false,
-                    "error": {
-                        "code": "invalid_request",
-                        "message": "invalid /v1/respond payload",
-                        "stage": "http",
-                    }
-                })),
-            )
-                .into_response();
-        }
-    };
-    if matches!(req.diagnostic, Some(HttpDiagnosticAction::UpstreamCheck)) {
-        return run_upstream_check(&state).await;
-    }
-    let req: RespondRequest = req.into();
-    let service = RustRespondService::new(
-        state.provider.clone(),
-        RespondExecutors {
-            query_executor: state.query_executor.clone(),
-            weather_executor: state.weather_executor.clone(),
-            train_executor: state.train_executor.clone(),
-        },
-        RespondStores {
-            memory_store: state.memory_store.clone(),
-            session_store: state.session_store.clone(),
-            todo_store: state.todo_store.clone(),
-            rss_store: state.rss_store.clone(),
-        },
-        state.rss_fetcher.clone(),
-        state.knowledge_index.clone(),
-        state.prompt_config.clone(),
-        RespondServiceOptions {
-            title_model: state.config.title_model.clone(),
-            todo_model: state.config.todo_model.clone(),
-            memory_model: state.config.memory_model.clone(),
-            compact_model: state.config.compact_model.clone(),
-            translation_model: state.config.translation_model.clone(),
-            send_mode: state.config.send_mode.clone(),
-            rss_summary_max_chars: state.config.rss_summary_max_chars as usize,
-            rss_seen_retention: state.config.rss_seen_retention as usize,
-        },
-    );
-    let recorder = MetricsRecorder::start();
-    let scope_key = req.scope_key.clone();
-    let allow_streaming =
-        state.config.send_mode.eq_ignore_ascii_case("streaming") && accepts_streaming(&headers);
-    let result = timeout(
-        Duration::from_secs(state.config.request_timeout_seconds),
-        service.respond_transport(req, allow_streaming),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(RespondTransport::Json(response))) => {
-            if let Some(text) = response.text.as_deref() {
-                info!(
-                    scope_key = response.session_id.as_deref().unwrap_or(&scope_key),
-                    reply_len = text.chars().count(),
-                    command = response.command.as_deref().unwrap_or("chat"),
-                    "respond request succeeded"
-                );
-            }
-            Json(*response).into_response()
-        }
-        Ok(Ok(RespondTransport::Stream(stream))) => {
-            // 目前只有 `/查` 联网搜索会返回 SSE，这里显式记录 command，
-            // 便于和普通 chat 请求区分，避免排障时误判成聊天链路。
-            info!(scope_key = %scope_key, command = "web_search", "respond request streaming");
-            stream_response(stream)
-        }
-        Ok(Err(err)) => {
-            warn_respond_error(&scope_key, &err);
-            let metrics = recorder.fail(
-                state.provider.name(),
-                state.provider.model(),
-                state.provider.stream_enabled(),
-            );
-            Json(RespondResponse {
-                ok: false,
-                text: None,
-                markdown: None,
-                handled: Some(false),
-                session_id: None,
-                command: None,
-                diagnostics: None,
-                metrics,
-                usage: None,
-                error: Some(err.as_info()),
-            })
-            .into_response()
-        }
-        Err(_) => {
-            let err = LlmError::timeout("request");
-            error_respond_error(&scope_key, &err);
-            let metrics = recorder.fail(
-                state.provider.name(),
-                state.provider.model(),
-                state.provider.stream_enabled(),
-            );
-            Json(RespondResponse {
-                ok: false,
-                text: None,
-                markdown: None,
-                handled: Some(false),
-                session_id: None,
-                command: None,
-                diagnostics: None,
-                metrics,
-                usage: None,
-                error: Some(err.as_info()),
-            })
-            .into_response()
-        }
-    }
-}
-
-/// 主动执行最小 provider 请求，只验证鉴权、模型、参数与响应解析。
-///
-/// 该路径不构造 `RustRespondService`，因此不会创建 session，也不会触发标题、
-/// Memory、Todo、查询或任何持久化副作用。
-async fn run_upstream_check(state: &AppState) -> Response {
-    let request = ChatRequest {
-        session_id: "diagnostic:upstream_check".to_owned(),
-        model: None,
-        messages: vec![ChatMessage {
-            role: ChatRole::User,
-            content: "这是连通性检查。请只回复 OK。".to_owned(),
-        }],
-        metadata: HashMap::from([("purpose".to_owned(), "upstream_check".to_owned())]),
-    };
-
-    match timeout(
-        Duration::from_secs(state.config.request_timeout_seconds),
-        state.provider.chat(request),
-    )
-    .await
-    {
-        Ok(Ok(outcome)) if !outcome.reply.trim().is_empty() => Json(json!({
-            "ok": true,
-            "diagnostics": { "upstream_check": true }
-        }))
-        .into_response(),
-        Ok(Ok(_)) => {
-            let error = LlmError::provider("upstream returned empty response", "diagnostic");
-            // provider 已完成但空正文不能证明响应解析可用，显式覆盖为失败。
-            state.upstream_status.record_failure(&error);
-            Json(json!({
-                "ok": false,
-                "error": {
-                    "code": error.code,
-                    "stage": error.stage,
-                    "message": "上游返回空响应",
-                }
-            }))
-            .into_response()
-        }
-        Ok(Err(error)) => Json(json!({
-            "ok": false,
-            "error": {
-                "code": error.code,
-                "stage": error.stage,
-                "message": state.upstream_status.snapshot().error_summary
-                    .unwrap_or_else(|| "上游检查失败".to_owned()),
-            }
-        }))
-        .into_response(),
-        Err(_) => {
-            let error = LlmError::timeout("upstream_check");
-            // timeout 会取消被观测 provider 的 future，因此在入口补记失败状态。
-            state.upstream_status.record_failure(&error);
-            Json(json!({
-                "ok": false,
-                "error": {
-                    "code": error.code,
-                    "stage": error.stage,
-                    "message": "上游请求超时",
-                }
-            }))
-            .into_response()
-        }
-    }
-}
-
-fn accepts_streaming(headers: &HeaderMap) -> bool {
-    headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
-        .unwrap_or(false)
-}
-
-fn stream_response(stream: crate::runtime::respond::RespondStream) -> Response {
-    let sse_stream = stream::unfold(stream.receiver, |mut receiver| async move {
-        let event = receiver.recv().await?;
-        let event = match event {
-            RespondStreamEvent::Delta { text } => axum::response::sse::Event::default()
-                .event("delta")
-                .data(text),
-            RespondStreamEvent::Final { response } => axum::response::sse::Event::default()
-                .event("final")
-                .data(serde_json::to_string(&response).unwrap_or_else(|_| {
-                    "{\"ok\":false,\"error\":{\"code\":\"http_error\",\"message\":\"stream response serialization failed\",\"stage\":\"http\"}}".to_owned()
-                })),
-        };
-        Some((Ok::<_, std::convert::Infallible>(event), receiver))
-    });
-    axum::response::sse::Sse::new(sse_stream).into_response()
-}
-
-/// 记录业务错误的警告日志。
-fn warn_respond_error(scope_key: &str, err: &LlmError) {
-    warn!(
-        scope_key,
-        error_code = err.code,
-        error_stage = err.stage,
-        "respond request failed"
-    );
-}
-
-/// 记录请求超时的错误日志。
-fn error_respond_error(scope_key: &str, err: &LlmError) {
-    error!(
-        scope_key,
-        error_code = err.code,
-        error_stage = err.stage,
-        "respond request timed out"
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         config::{DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_RSS_SUMMARY_MAX_CHARS, ProviderMode},
+        error::LlmError,
         provider::{
             ChatOutcome, LlmProvider,
-            status::{UpstreamState, UpstreamStatus, observe_provider},
+            status::{UpstreamStatus, observe_provider},
             types::{ChatRequest, TokenUsage},
         },
         runtime::{
             prompt::PromptConfig,
             query::{QueryExecutor, QueryOutcome, QueryRequest, QuerySource},
             rss::RssFetchConfig,
-            session::{SessionMeta, SessionStore},
+            session::SessionStore,
             train::{TrainExecutor, TrainSchedule, TrainScheduleRequest, TrainStop},
             weather::{
                 CurrentWeather, DailyWeather, WeatherExecutor, WeatherLocation, WeatherOutcome,
@@ -832,7 +509,6 @@ mod tests {
                 bigmodel_base_url: crate::config::DEFAULT_BIGMODEL_BASE_URL.to_owned(),
                 bigmodel_model: "glm-5.2".to_owned(),
                 stream: true,
-                send_mode: "final".to_owned(),
                 request_timeout_seconds: 5,
                 ttft_warn_seconds: 30,
                 max_output_tokens: 1200,
@@ -847,8 +523,6 @@ mod tests {
                 rss_summary_max_chars: DEFAULT_RSS_SUMMARY_MAX_CHARS,
                 rss_seen_retention: 500,
                 rss_push_max_failures: 3,
-                rss_push_url: "http://127.0.0.1:8788/internal/push".to_owned(),
-                rss_push_token: None,
                 rss_push_message_type: "markdown".to_owned(),
                 todo_daily_reminder_enabled: false,
                 todo_daily_reminder_time: crate::config::DailyReminderTime { hour: 9, minute: 0 },
@@ -949,21 +623,6 @@ mod tests {
             request_raw_response(state, method, path, value, accept).await;
         let text = String::from_utf8_lossy(&body).into_owned();
         (status, headers, text)
-    }
-
-    async fn request_json(
-        state: AppState,
-        method: &str,
-        path: &str,
-        value: Option<serde_json::Value>,
-    ) -> serde_json::Value {
-        let (status, json) = request_response(state, method, path, value).await;
-        assert!(status.is_success(), "unexpected status {status}: {json}");
-        json
-    }
-
-    async fn post_json(path: &str, value: serde_json::Value) -> serde_json::Value {
-        request_json(test_state(), "POST", path, Some(value)).await
     }
 
     fn standard_qq_payload(content: &str) -> serde_json::Value {
@@ -1072,7 +731,7 @@ mod tests {
             "POST",
             "/api/v1/markdown/render",
             Some(json!({"markdown":"# hi"})),
-            Some("text/event-stream, application/json"),
+            Some("application/json"),
             None,
         )
         .await;
@@ -1223,109 +882,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_check_calls_provider_without_creating_session() -> Result<(), Infallible> {
-        let mut state = test_state();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let upstream_status = UpstreamStatus::default();
-        state.provider = observe_provider(
-            Arc::new(CountingProvider {
-                calls: calls.clone(),
-            }),
-            upstream_status.clone(),
-        );
-        state.upstream_status = upstream_status.clone();
-        let session_store = state.session_store.clone();
-        let mut payload = standard_qq_payload("should not enter chat flow");
-        payload
-            .as_object_mut()
-            .unwrap()
-            .insert("diagnostic".to_owned(), json!("upstream_check"));
-
-        let (_status, json) = request_response(state, "POST", "/v1/respond", Some(payload)).await;
-
-        assert_eq!(json["ok"], true);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(upstream_status.snapshot().state, UpstreamState::Available);
-        let meta = SessionMeta::new(
-            "group:g1",
-            Some("u1".to_owned()),
-            Some("g1".to_owned()),
-            None,
-            None,
-            "qq_official",
-        );
-        assert!(session_store.get_active(&meta).unwrap().is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn respond_accepts_standard_qq_payload() -> Result<(), Infallible> {
-        let json = post_json("/v1/respond", standard_qq_payload("普通聊天")).await;
-
-        assert_eq!(json["ok"], true);
-        assert_eq!(json["text"], "标题\n· hello");
-        assert_eq!(json["markdown"], "# 标题\n- hello");
-        assert!(json.get("reply").is_none());
-        assert!(json.get("raw_reply").is_none());
-        assert!(json.get("deltas").is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn respond_keeps_chat_markdown_and_plaintext_fallback() -> Result<(), Infallible> {
-        let json = post_json("/v1/respond", standard_qq_payload("给 codex")).await;
-
-        assert_eq!(json["text"], "标题\n· hello");
-        assert_eq!(json["markdown"], "# 标题\n- hello");
-        assert!(json.get("reply").is_none());
-        assert!(json.get("raw_reply").is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn respond_streams_when_accepts_event_stream_and_enabled() -> Result<(), Infallible> {
-        let mut state = test_state();
-        state.config.send_mode = "streaming".to_owned();
-        let (status, headers, body) = request_text_response(
-            state,
+    async fn respond_route_is_not_registered() -> Result<(), Infallible> {
+        let (status, _json) = request_response(
+            test_state(),
             "POST",
             "/v1/respond",
-            Some(standard_qq_payload("/查 Cloudflare D1")),
-            Some("text/event-stream"),
+            Some(standard_qq_payload("普通聊天")),
         )
         .await;
 
-        assert_eq!(status, axum::http::StatusCode::OK);
-        let content_type = headers
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        assert!(content_type.contains("text/event-stream"));
-        assert!(body.contains("event: delta"));
-        assert!(body.contains("event: final"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn respond_rejects_legacy_payload_fields() -> Result<(), Infallible> {
-        for (field, value) in [
-            ("session_id", json!("group:g1")),
-            ("user_text", json!("旧文本")),
-            ("system_prompts", json!([])),
-            ("history_messages", json!([])),
-            ("purpose", json!("chat")),
-        ] {
-            let mut payload = standard_qq_payload("普通聊天");
-            payload
-                .as_object_mut()
-                .unwrap()
-                .insert(field.to_owned(), value);
-
-            let (status, _json) =
-                request_response(test_state(), "POST", "/v1/respond", Some(payload)).await;
-
-            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{field}");
-        }
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
         Ok(())
     }
 

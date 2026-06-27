@@ -145,21 +145,21 @@ Gateway、Core 和 LLM 模块由同一个 `qq-maid-bot` 进程统一启动和管
 graph TD
     A[QQ 官方机器人平台] --> B[qq-maid-bot]
     B --> C[Gateway 模块]
-    C -->|POST http://127.0.0.1:8787/v1/respond| D[Core HTTP 模块]
+    C -->|进程内 CoreService::respond| D[Core 模块]
     D --> E[qq-maid-llm 模型 Provider]
     D --> F[(SQLite APP_DB_FILE)]
     D --> G[查询与天气服务]
     D --> H[RSS / Todo / Memory / Session]
-    H -->|RSS / Todo 提醒 push| C
+    H -->|进程内 PushSink| C
     C --> A
 ```
 
-Core HTTP 层仅提供 `GET /healthz` 和 `POST /v1/respond` 两个服务端点。Gateway 负责 QQ 平台侧的消息收发，并为 RSS 调度与 Todo 每日提醒提供仅监听本机的 `/internal/push`。
+Gateway 与 Core 由同一进程装配，聊天、命令、`/ping check`、RSS 和 Todo 主动推送都走进程内强类型接口；外部 HTTP 仅保留进程级 `GET /healthz`、控制台和 Markdown 渲染接口。
 
 项目内部通过根目录 Cargo Workspace 统一管理，保持明确的模块边界：
 
 * `qq-maid-gateway-rs/` — QQ 事件接收、消息转换、回复发送、`/ping` 诊断
-* `qq-maid-core/` — `/v1/respond`、业务 prompt、会话、记忆、Todo、RSS 和命令
+* `qq-maid-core/` — CoreService、业务 prompt、会话、记忆、Todo、RSS 和命令
 * `qq-maid-llm/` — 模型协议、Provider 路由、fallback、SSE 和健康观测
 * `qq-maid-common/` — 时间、日期和时区等共享基础工具
 

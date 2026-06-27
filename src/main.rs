@@ -1,21 +1,21 @@
 //! 统一程序入口。
 //!
-//! 该入口只负责一次性完成 dotenv / tracing 初始化，并按“先 Core HTTP、后 Gateway”的顺序
-//! 启动现有两个 Rust 模块。Gateway 仍通过本机 HTTP 调用 `/v1/respond`，本次不改业务边界。
+//! 该入口一次性完成 dotenv / tracing 初始化，组装 CoreHandle、Gateway 和主动推送
+//! sink。Core 与 Gateway 之间只走进程内强类型调用，不再通过 localhost HTTP 探活或通信。
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 use qq_maid_core::{app::LlmRuntime as CoreRuntime, config::AppConfig as CoreConfig};
-use qq_maid_gateway_rs::config::AppConfig as GatewayConfig;
+use qq_maid_gateway_rs::{
+    config::AppConfig as GatewayConfig, gateway::push::GatewayPushSink, respond::RespondClient,
+};
 use time::{UtcOffset, macros::format_description};
-use tokio::{sync::oneshot, task::JoinHandle};
-use tracing::{info, warn};
+use tokio::sync::oneshot;
+use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-const CORE_READY_TIMEOUT: Duration = Duration::from_secs(15);
-const CORE_READY_RETRY_DELAY: Duration = Duration::from_millis(250);
-const CORE_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+const OPS_HTTP_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,108 +26,43 @@ async fn main() -> anyhow::Result<()> {
     let gateway_env = std::env::vars().collect::<HashMap<_, _>>();
     let gateway_config = GatewayConfig::from_map(&gateway_env)?;
 
-    let core_runtime = CoreRuntime::from_config(core_config)?;
-    let core_healthz_url = core_runtime.healthz_url();
+    let push_sink = GatewayPushSink::unbound();
+    let core_runtime =
+        CoreRuntime::from_config_with_push_sink(core_config, Some(Arc::new(push_sink.clone())))?;
+    let core_handle = core_runtime.core_handle();
     let (core_shutdown_tx, core_shutdown_rx) = oneshot::channel::<()>();
-    let mut core_handle = tokio::spawn(async move {
+    let mut core_http_handle = tokio::spawn(async move {
         core_runtime
             .serve_with_shutdown(async move {
                 let _ = core_shutdown_rx.await;
             })
             .await
     });
-
-    if let Err(err) = wait_for_core_ready(&core_healthz_url, &mut core_handle).await {
-        let final_err = if core_handle.is_finished() {
-            task_exit_error("qq-maid-core", core_handle.await).context(err.to_string())
-        } else {
-            let _ = core_shutdown_tx.send(());
-            let _ = tokio::time::timeout(CORE_SHUTDOWN_WAIT, &mut core_handle).await;
-            err
-        };
-        return Err(final_err);
-    }
-
-    info!(healthz = %core_healthz_url, "Core HTTP 已就绪，开始启动 Gateway");
-    let mut gateway_handle =
-        tokio::spawn(async move { qq_maid_gateway_rs::app::run_with_config(gateway_config).await });
+    let respond = RespondClient::new(Arc::new(core_handle));
+    info!("Core 已完成进程内初始化，开始启动 Gateway");
+    let mut gateway_handle = tokio::spawn(async move {
+        qq_maid_gateway_rs::app::run_with_config(gateway_config, respond, push_sink).await
+    });
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("收到 Ctrl+C，准备停止统一进程");
-            shutdown_on_signal(core_shutdown_tx, &mut core_handle, &mut gateway_handle).await;
-            Ok(())
-        }
-        result = &mut core_handle => {
+            let _ = core_shutdown_tx.send(());
             gateway_handle.abort();
             let _ = gateway_handle.await;
-            Err(task_exit_error("qq-maid-core", result))
+            let _ = tokio::time::timeout(OPS_HTTP_SHUTDOWN_WAIT, &mut core_http_handle).await;
+            Ok(())
+        }
+        result = &mut core_http_handle => {
+            gateway_handle.abort();
+            let _ = gateway_handle.await;
+            Err(task_exit_error("qq-maid-core-ops-http", result))
         }
         result = &mut gateway_handle => {
             let _ = core_shutdown_tx.send(());
-            let _ = tokio::time::timeout(CORE_SHUTDOWN_WAIT, &mut core_handle).await;
+            let _ = tokio::time::timeout(OPS_HTTP_SHUTDOWN_WAIT, &mut core_http_handle).await;
             Err(task_exit_error("qq-maid-gateway-rs", result))
         }
-    }
-}
-
-async fn wait_for_core_ready(
-    healthz_url: &str,
-    core_handle: &mut JoinHandle<anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .context("build Core readiness client")?;
-    let started_at = tokio::time::Instant::now();
-
-    loop {
-        if core_handle.is_finished() {
-            return Err(anyhow!("qq-maid-core 在 /healthz 就绪前已经退出"));
-        }
-
-        match client.get(healthz_url).send().await {
-            Ok(response) if response.status().is_success() => {
-                info!(healthz = %healthz_url, "Core /healthz 就绪");
-                return Ok(());
-            }
-            Ok(response) => {
-                warn!(
-                    healthz = %healthz_url,
-                    status = %response.status(),
-                    "Core /healthz 尚未就绪"
-                );
-            }
-            Err(err) => {
-                warn!(healthz = %healthz_url, error = %err, "等待 Core /healthz 就绪");
-            }
-        }
-
-        if started_at.elapsed() >= CORE_READY_TIMEOUT {
-            return Err(anyhow!(
-                "等待 Core /healthz 超时（{} 秒）：{}",
-                CORE_READY_TIMEOUT.as_secs(),
-                healthz_url
-            ));
-        }
-
-        tokio::time::sleep(CORE_READY_RETRY_DELAY).await;
-    }
-}
-
-async fn shutdown_on_signal(
-    core_shutdown_tx: oneshot::Sender<()>,
-    core_handle: &mut JoinHandle<anyhow::Result<()>>,
-    gateway_handle: &mut JoinHandle<anyhow::Result<()>>,
-) {
-    let _ = core_shutdown_tx.send(());
-    gateway_handle.abort();
-
-    if !gateway_handle.is_finished() {
-        let _ = gateway_handle.await;
-    }
-    if !core_handle.is_finished() {
-        let _ = tokio::time::timeout(CORE_SHUTDOWN_WAIT, core_handle).await;
     }
 }
 

@@ -14,9 +14,10 @@ mod tests;
 
 use crate::{auth::AccessTokenManager, config::AppConfig, gateway::event::C2cMessage};
 use qq_maid_common::time_context::now_unix_seconds_marker;
+use qq_maid_core::service::CoreHealthSnapshot;
 
 use self::{
-    healthz::{LlmUpstreamSnapshot, probe_llm_healthz},
+    healthz::{LlmUpstreamSnapshot, core_health_snapshot},
     render::render_c2c_ping_reply,
 };
 
@@ -57,7 +58,14 @@ pub async fn build_c2c_ping_reply(
     runtime: &GatewayRuntimeStatus,
     auth: &AccessTokenManager,
 ) -> String {
-    build_c2c_ping_reply_with_check_failure(message, config, runtime, auth, None).await
+    let snapshot = qq_maid_core::service::CoreHealthSnapshot {
+        ok: false,
+        provider: String::new(),
+        model: String::new(),
+        stream: false,
+        upstream: Default::default(),
+    };
+    build_c2c_ping_reply_with_check_failure(message, config, runtime, auth, &snapshot, None).await
 }
 
 pub async fn build_c2c_ping_reply_with_check_failure(
@@ -65,10 +73,11 @@ pub async fn build_c2c_ping_reply_with_check_failure(
     config: &AppConfig,
     runtime: &GatewayRuntimeStatus,
     auth: &AccessTokenManager,
+    core_health: &CoreHealthSnapshot,
     check_failure: Option<&str>,
 ) -> String {
     let token_snapshot = auth.snapshot().await;
-    let mut llm_health = probe_llm_healthz(&config.respond_url).await;
+    let mut llm_health = core_health_snapshot(core_health);
     if let Some(summary) = check_failure {
         // 主动检查的直接失败必须覆盖旧 healthz 快照，避免 `/ping check` 误报绿色。
         llm_health.upstream = LlmUpstreamSnapshot::Error {

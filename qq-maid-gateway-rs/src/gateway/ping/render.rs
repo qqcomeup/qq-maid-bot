@@ -7,7 +7,7 @@ use crate::{
     config::AppConfig,
     gateway::{
         event::C2cMessage,
-        logging::{mask_identifier, mask_scope_key, mask_url, mask_url_query},
+        logging::{mask_identifier, mask_scope_key},
     },
 };
 
@@ -250,15 +250,14 @@ fn render_debug_send(snapshot: &GatewayRuntimeSnapshot) -> Vec<String> {
 }
 
 fn render_debug_llm(
-    config: &AppConfig,
+    _config: &AppConfig,
     llm_health: &LlmHealthSnapshot,
     snapshot: &GatewayRuntimeSnapshot,
 ) -> Vec<String> {
     vec![
         "### LLM".to_owned(),
-        format!("- respond：{}", mask_url(&config.respond_url)),
-        format!("- healthz URL：{}", llm_health.healthz_url),
-        format!("- healthz：{}", llm_health.status),
+        format!("- core：{}", llm_health.healthz_url),
+        format!("- health：{}", llm_health.status),
         format!("- 上游状态：{}", upstream_debug_text(&llm_health.upstream)),
         format!(
             "- 最近 respond 成功：{}",
@@ -306,8 +305,6 @@ fn render_debug_config(config: &AppConfig, token_snapshot: &AccessTokenSnapshot)
         "### 配置".to_owned(),
         format!("- sandbox：{}", bool_text(config.sandbox)),
         format!("- api_base：{}", url_host_path(&config.api_base)),
-        format!("- respond_url：{}", url_host_path(&config.respond_url)),
-        format!("- respond query：{}", mask_url_query(&config.respond_url)),
         format!("- Markdown：{}", bool_text(config.enable_markdown)),
         format!("- Image：{}", bool_text(config.enable_image)),
         format!("- verbose_log：{}", bool_text(config.verbose_log)),

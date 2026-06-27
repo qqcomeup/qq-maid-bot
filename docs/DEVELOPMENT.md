@@ -7,7 +7,7 @@
 ## 架构边界
 
 - `qq-maid-gateway-rs/`：QQ 官方 C2C / 群 at gateway 接入层，负责 QQ 事件接收、消息转换、`/ping` 诊断、回复发送和本机内部主动推送出口。
-- `qq-maid-core/`：Rust Core / 查询 / 记忆 / session / prompt 模块，公开 `GET /healthz` 和 `POST /v1/respond`。
+- `qq-maid-core/`：Rust Core / 查询 / 记忆 / session / prompt 模块，通过 `CoreService` 提供进程内业务入口，并公开 `GET /healthz`。
 - `qq-maid-llm/`：模型协议、Provider 路由、fallback、SSE、usage、健康观测和 OpenAI Web Search 基础设施。
 - `src/main.rs`：统一 `qq-maid-bot` 程序入口，负责一次性初始化 dotenv / tracing，并按顺序拉起 Core HTTP 与 Gateway。
 - `qq-maid-common/`：gateway 和 Core 共享的无业务状态基础工具，目前承载时间、日期和时区处理。
@@ -88,7 +88,7 @@ make run
 
 - [README.md](../README.md)：项目定位、核心能力、快速开始和用户可见指令示例。
 - [qq-maid-core/README.md](../qq-maid-core/README.md)：Rust Core 模块边界、HTTP facade、指令 flow、配置项和检查方式。
-- [qq-maid-gateway-rs/README.md](../qq-maid-gateway-rs/README.md)：QQ 官方 gateway、事件范围、消息发送、日志、`/ping` 和 `/internal/push`。
+- [qq-maid-gateway-rs/README.md](../qq-maid-gateway-rs/README.md)：QQ 官方 gateway、事件范围、消息发送、日志、`/ping` 和进程内主动推送。
 - [runtime/README.md](../runtime/README.md)：运行目录、部署产物、真实配置、路径解析、运行数据、控制脚本和诊断。
 - [runtime/.env.example](../runtime/.env.example)：环境变量模板和字段说明。
 
@@ -130,12 +130,11 @@ make clean
 
 ## HTTP 与命令入口
 
-Rust Core HTTP 层只公开：
+Rust HTTP 层只公开外部运维 / 管理能力：
 
 - `GET /healthz`
-- `POST /v1/respond`
 
-旧 HTTP 路由 `/query`、HTTP `/memory`、`/v1/chat` 不再公开。查询、记忆、待办、会话和 RSS 都通过 `/v1/respond` 内部命令流程承载。
+旧 HTTP 路由 `/query`、HTTP `/memory`、`/v1/chat`、`/v1/respond` 不再公开。查询、记忆、待办、会话和 RSS 都通过 `CoreService::respond` 进程内命令流程承载。
 
 当前常用 slash 指令：
 
@@ -152,9 +151,9 @@ Rust Core HTTP 层只公开：
 - 默认做小改动，保持用户可见行为稳定。
 - 新增或调整 QQ 接入、事件处理和发送逻辑时，优先修改 `qq-maid-gateway-rs/`。
 - 修改模型协议、Provider 路由、fallback、SSE、usage、健康观测或 OpenAI Web Search 传输时，优先修改 `qq-maid-llm/`。
-- Gateway 内部继续保持分层边界：`gateway/mod.rs` 负责顶层编排，`gateway/protocol.rs` 负责 WebSocket 协议与事件分发，`gateway/outbound.rs` 负责 QQ 出站状态记录，`respond.rs` 负责 `/v1/respond` 桥接；不要把这些职责重新混回单个超长文件。
+- Gateway 内部继续保持分层边界：`gateway/mod.rs` 负责顶层编排，`gateway/protocol.rs` 负责 WebSocket 协议与事件分发，`gateway/outbound.rs` 负责 QQ 出站状态记录，`respond.rs` 负责 CoreService 进程内桥接；不要把这些职责重新混回单个超长文件。
 - 修改普通聊天、查询命令、记忆、session、待办、会话命令或 prompt 时，优先修改 `qq-maid-core/`。
-- Rust HTTP 层只公开 `GET /healthz` 和 `POST /v1/respond`；不要重新公开 `/query`、HTTP `/memory` 或 `/v1/chat`。
+- Rust HTTP 层只公开 `GET /healthz`，以及启用控制台时的 `/console/` 和 `/api/v1/markdown/render`；不要重新公开 `/query`、HTTP `/memory`、`/v1/chat` 或内部 `/v1/respond`。
 - 通用日期、时间和时区语义优先复用 `qq-maid-common/src/time_context.rs`；Core 内部的 `qq-maid-core/src/util/time_context.rs` 保留为兼容 re-export。
 - 未来目标是通用 QQ 机器人；不要把具体人设、群聊内容、真实用户信息或业务材料写死进代码。
 

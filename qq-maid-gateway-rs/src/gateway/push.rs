@@ -1,20 +1,16 @@
-//! gateway 内部主动推送入口。
+//! Gateway 进程内主动推送实现。
 //!
-//! 该 HTTP 服务默认只监听 127.0.0.1，供本机 LLM RSS 调度调用。
-//! QQ token 和平台 payload 仍由 gateway 统一处理，避免业务服务绕过网关直连 QQ OpenAPI。
+//! Core 只通过 `PushSink` 交付推送意图；本模块负责 QQ 平台发送、Markdown
+//! 失败后的文本 fallback、发送状态记录，以及群推送成功后的 BotOutboundCache 回填。
 
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-
-use axum::{
-    Json, Router,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    routing::post,
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
 };
-use serde::Deserialize;
-use serde_json::json;
+
+use async_trait::async_trait;
+use qq_maid_core::runtime::push::{PushError, PushIntent, PushResult, PushSink, PushTargetType};
+use tokio::{sync::Notify, time::timeout};
 use tracing::{info, warn};
 
 use crate::{
@@ -26,131 +22,129 @@ use crate::{
     markdown::MarkdownPayload,
 };
 
-#[derive(Debug, Clone)]
-pub struct PushServerConfig {
-    pub host: String,
-    pub port: u16,
-    pub token: Option<String>,
+#[derive(Clone)]
+pub struct GatewayPushSink {
+    inner: Arc<Mutex<Option<GatewayPushRuntime>>>,
+    ready: Arc<Notify>,
 }
 
-#[derive(Debug, Clone)]
-struct PushState {
-    api: QqApiClient,
-    runtime: GatewayRuntimeStatus,
-    token: Option<String>,
-    group_outbound_cache: Arc<Mutex<BotOutboundCache>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PushRequest {
-    target_type: String,
-    target_id: String,
-    #[serde(default)]
-    message_type: Option<String>,
-    text: String,
-    #[serde(default)]
-    fallback_text: Option<String>,
-}
-
-pub(crate) async fn run_push_server(
-    config: PushServerConfig,
+#[derive(Clone)]
+struct GatewayPushRuntime {
     api: QqApiClient,
     runtime: GatewayRuntimeStatus,
     group_outbound_cache: Arc<Mutex<BotOutboundCache>>,
-) -> anyhow::Result<()> {
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-    let state = PushState {
-        api,
-        runtime,
-        token: config
-            .token
-            .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_owned())),
-        group_outbound_cache,
-    };
-    let router = Router::new()
-        .route("/internal/push", post(push_message))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "gateway internal push server listening");
-    axum::serve(listener, router).await?;
-    Ok(())
 }
 
-async fn push_message(
-    State(state): State<PushState>,
-    headers: HeaderMap,
-    Json(req): Json<PushRequest>,
-) -> Response {
-    if !authorized(&headers, state.token.as_deref()) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"ok": false, "error": "unauthorized"})),
-        )
-            .into_response();
-    }
-    let target_id = req.target_id.trim();
-    let text = req.text.trim();
-    if target_id.is_empty() || text.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"ok": false, "error": "target_id and text are required"})),
-        )
-            .into_response();
+impl GatewayPushSink {
+    pub fn unbound() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            ready: Arc::new(Notify::new()),
+        }
     }
 
-    let fallback_text = req
-        .fallback_text
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(text);
-    let message_type = req.message_type.as_deref().unwrap_or("text").trim();
-    let result = match req.target_type.trim() {
-        "private" => {
-            send_private_push(&state.api, target_id, message_type, text, fallback_text).await
+    pub(crate) fn bind(
+        &self,
+        api: QqApiClient,
+        runtime: GatewayRuntimeStatus,
+        group_outbound_cache: Arc<Mutex<BotOutboundCache>>,
+    ) {
+        // Core scheduler 可能在 Gateway 首次连接 QQ 前启动，因此 sink 需要先存在；
+        // 真正发送前必须已绑定运行期上下文，否则返回可观测错误而不是静默丢消息。
+        *self.inner.lock().unwrap() = Some(GatewayPushRuntime {
+            api,
+            runtime,
+            group_outbound_cache,
+        });
+        self.ready.notify_waiters();
+    }
+
+    async fn runtime(&self) -> Result<GatewayPushRuntime, PushError> {
+        if let Some(runtime) = self.inner.lock().unwrap().clone() {
+            return Ok(runtime);
         }
-        "group" => send_group_push(&state.api, target_id, message_type, text, fallback_text).await,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"ok": false, "error": "unsupported target_type"})),
-            )
-                .into_response();
+
+        // 统一进程启动时 Core 的 RSS / Todo 定时器和 QQ Gateway 连接并行启动。
+        // 首次推送如果撞上 Gateway 尚未 bind，等待一小段时间可避免把正常启动竞态记成推送失败。
+        let notified = self.ready.notified();
+        if timeout(Duration::from_secs(30), notified).await.is_err() {
+            return Err(PushError::Failed {
+                summary: "gateway push sink is not ready".to_owned(),
+            });
         }
-    };
-    record_qq_send_result(&state.runtime, &result);
-    // 群推送成功后，把返回的 message_id 写入共享的 BotOutboundCache，
-    // 确保 mention 模式下用户回复该消息能被 is_reply_to_bot 识别。
-    if req.target_type.trim() == "group"
-        && let Ok(Some(message_id)) = result.as_ref()
-    {
-        state
-            .group_outbound_cache
+
+        self.inner
             .lock()
             .unwrap()
-            .insert(Some(message_id.clone()));
+            .clone()
+            .ok_or_else(|| PushError::Failed {
+                summary: "gateway push sink is not ready".to_owned(),
+            })
     }
-    match result {
-        Ok(_) => {
-            info!(
-                target_type = %req.target_type,
-                target = %mask_identifier(target_id),
-                "gateway internal push sent"
-            );
-            Json(json!({"ok": true})).into_response()
+}
+
+#[async_trait]
+impl PushSink for GatewayPushSink {
+    async fn push(&self, intent: PushIntent) -> Result<PushResult, PushError> {
+        let runtime = self.runtime().await?;
+        runtime.push(intent).await
+    }
+}
+
+impl GatewayPushRuntime {
+    async fn push(&self, intent: PushIntent) -> Result<PushResult, PushError> {
+        let target_id = intent.target.target_id.trim();
+        let text = intent.text.trim();
+        if target_id.is_empty() || text.is_empty() {
+            return Err(PushError::Failed {
+                summary: "target_id and text are required".to_owned(),
+            });
         }
-        Err(err) => {
-            warn!(
-                target_type = %req.target_type,
-                target = %mask_identifier(target_id),
-                error = %err.log_summary(),
-                "gateway internal push failed"
-            );
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"ok": false, "error": err.log_summary()})),
-            )
-                .into_response()
+
+        let fallback_text = intent
+            .fallback_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(text);
+        let message_type = intent.message_type.trim();
+        let result = match intent.target.target_type {
+            PushTargetType::Private => {
+                send_private_push(&self.api, target_id, message_type, text, fallback_text).await
+            }
+            PushTargetType::Group => {
+                send_group_push(&self.api, target_id, message_type, text, fallback_text).await
+            }
+        };
+        record_qq_send_result(&self.runtime, &result);
+        if intent.target.target_type == PushTargetType::Group
+            && let Ok(Some(message_id)) = result.as_ref()
+        {
+            self.group_outbound_cache
+                .lock()
+                .unwrap()
+                .insert(Some(message_id.clone()));
+        }
+        match result {
+            Ok(message_id) => {
+                info!(
+                    target_type = %intent.target.target_type.as_str(),
+                    target = %mask_identifier(target_id),
+                    "gateway push sent"
+                );
+                Ok(PushResult { message_id })
+            }
+            Err(err) => {
+                warn!(
+                    target_type = %intent.target.target_type.as_str(),
+                    target = %mask_identifier(target_id),
+                    error = %err.log_summary(),
+                    "gateway push failed"
+                );
+                Err(PushError::Failed {
+                    summary: err.log_summary(),
+                })
+            }
         }
     }
 }
@@ -171,7 +165,7 @@ async fn send_private_push(
                     warn!(
                         target = %mask_identifier(target_id),
                         error = %err.log_summary(),
-                        "internal markdown push failed; falling back to text"
+                        "markdown push failed; falling back to text"
                     );
                     api.send_c2c_text(target_id, None, fallback_text).await
                 }
@@ -202,7 +196,7 @@ async fn send_group_push(
                     warn!(
                         target = %mask_identifier(target_id),
                         error = %err.log_summary(),
-                        "internal group markdown push failed; falling back to text"
+                        "group markdown push failed; falling back to text"
                     );
                     api.send_group_text(target_id, None, fallback_text).await
                 }
@@ -214,27 +208,5 @@ async fn send_group_push(
             api.send_group_text(target_id, None, text).await
         }
         _ => Err(crate::api::ApiError::Unsupported("message_type")),
-    }
-}
-
-fn authorized(headers: &HeaderMap, expected: Option<&str>) -> bool {
-    let Some(expected) = expected else {
-        return true;
-    };
-    headers
-        .get("X-QQ-Maid-Push-Token")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == expected)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_auth_is_required_when_configured() {
-        let headers = HeaderMap::new();
-        assert!(!authorized(&headers, Some("secret")));
-        assert!(authorized(&headers, None));
     }
 }
