@@ -127,6 +127,11 @@ fn group_reply_cache_key(group_openid: &str, message_id: &str) -> String {
 }
 
 fn group_reply_mention_prefix(message: &GroupMessage) -> Option<String> {
+    // 只有用户显式 @ 机器人触发的官方群 at 事件，才在回复正文里 @ 回发起人；
+    // 普通群命令、关键词触发和回复机器人消息继续只挂原消息 msg_id，避免额外打扰。
+    if message.event_type != GroupEventType::GroupAtMessage {
+        return None;
+    }
     message
         .member_openid
         .as_deref()
@@ -941,8 +946,8 @@ mod tests {
     }
 
     #[test]
-    fn group_reply_text_mentions_sender_when_member_openid_exists() {
-        let message = group_message("hello", GroupEventType::GroupMessage);
+    fn group_at_reply_text_mentions_sender_when_member_openid_exists() {
+        let message = group_message("hello", GroupEventType::GroupAtMessage);
 
         assert_eq!(
             prefix_group_reply_text(&message, "回复正文"),
@@ -951,8 +956,16 @@ mod tests {
     }
 
     #[test]
-    fn group_reply_text_skips_mention_without_member_openid() {
+    fn group_reply_text_skips_mention_for_plain_group_message() {
+        let message = group_message("hello", GroupEventType::GroupMessage);
+
+        assert_eq!(prefix_group_reply_text(&message, "回复正文"), "回复正文");
+    }
+
+    #[test]
+    fn group_at_reply_text_skips_mention_without_member_openid() {
         let mut message = group_message("hello", GroupEventType::GroupMessage);
+        message.event_type = GroupEventType::GroupAtMessage;
         message.member_openid = None;
 
         assert_eq!(prefix_group_reply_text(&message, "回复正文"), "回复正文");
