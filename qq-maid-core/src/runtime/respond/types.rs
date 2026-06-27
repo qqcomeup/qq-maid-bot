@@ -57,6 +57,9 @@ pub struct RespondRequest {
     /// 引用消息正文（仅当平台可解析引用内容时填充，无引用或未命中缓存时为空）。
     #[serde(default)]
     pub reply_text: Option<String>,
+    /// 平台事件是否携带引用关系；为 true 但 reply_text 为空时，不允许模型猜测引用内容。
+    #[serde(default)]
+    pub reply_present: bool,
     /// 作用域键，用于隔离不同群 / 频道的会话
     #[serde(default)]
     pub scope_key: String,
@@ -134,6 +137,7 @@ impl Default for RespondRequest {
             user_text: String::new(),
             content: String::new(),
             reply_text: None,
+            reply_present: false,
             scope_key: String::new(),
             user_id: None,
             group_id: None,

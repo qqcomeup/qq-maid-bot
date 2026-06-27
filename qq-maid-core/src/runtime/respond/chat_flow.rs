@@ -47,6 +47,18 @@ impl RustRespondService {
             .reply_text
             .as_deref()
             .is_some_and(|text| !text.trim().is_empty());
+        if req.reply_present && !has_reply_text {
+            // 引用关系存在但正文不可用时必须在代码层截断，不能让模型根据历史或知识库猜测。
+            let reply = "这条消息没有获取到引用内容，不能确认你引用的是哪一段。请把要我看的内容直接发出来。";
+            self.session_store
+                .append_exchange(&mut session, &user_text, reply)
+                .map_err(session_error)?;
+            return Ok(command_response(
+                reply,
+                Some(session.session_id),
+                Some("reply_content_unavailable"),
+            ));
+        }
         // 引用正文通过 reply_text 独立传入；只引用、不输入正文时仍要进入聊天链路。
         if user_text.trim().is_empty() && !has_reply_text {
             let reply = "唔，小女仆在。可以直接说要我看哪一块。";

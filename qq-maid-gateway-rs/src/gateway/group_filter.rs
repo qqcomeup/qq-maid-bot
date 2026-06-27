@@ -71,6 +71,7 @@ pub(crate) fn should_ignore_group_message(
     message: &GroupMessage,
     respond_content: &str,
     reply_text: Option<&str>,
+    reply_present: bool,
     masked_group: &str,
 ) -> bool {
     if message.author_is_self {
@@ -89,8 +90,8 @@ pub(crate) fn should_ignore_group_message(
         );
         return true;
     }
-    // 引用正文通过 reply_text 独立透传；用户只发引用时 content 为空但仍是有效输入。
-    if respond_content.trim().is_empty() && reply_text.is_none() {
+    // 引用正文通过 reply_text 独立透传；若引用正文回填失败，也交给 Core 明确拒绝猜测。
+    if respond_content.trim().is_empty() && reply_text.is_none() && !reply_present {
         debug!(
             message_id = %message.message_id,
             group = %masked_group,

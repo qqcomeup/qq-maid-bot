@@ -23,6 +23,9 @@ pub struct RespondRequest {
     /// 引用消息的正文（仅当平台可解析引用内容时填充，无引用或平台未提供时为空）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_text: Option<String>,
+    /// 平台事件是否携带引用关系；即使正文回填失败，也要让 Core 知道用户确实发了引用。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reply_present: bool,
     pub platform: String,
     pub event_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,7 +199,8 @@ impl RespondClient {
         content: String,
         reply_text: Option<String>,
     ) -> Result<RespondTransport, RespondError> {
-        let request = RespondRequest::from_c2c_message(message, content, reply_text);
+        let reply_present = has_reply(message);
+        let request = RespondRequest::from_c2c_message(message, content, reply_text, reply_present);
         let masked_user = mask_openid(&message.user_openid);
         let response = self
             .client
@@ -270,7 +274,9 @@ impl RespondClient {
         content: String,
         reply_text: Option<String>,
     ) -> Result<RespondTransport, RespondError> {
-        let request = RespondRequest::from_group_message(message, content, reply_text);
+        let reply_present = has_group_reply(message);
+        let request =
+            RespondRequest::from_group_message(message, content, reply_text, reply_present);
         let masked_group = mask_openid(&message.group_openid);
         let response = self
             .client
@@ -520,11 +526,13 @@ impl RespondRequest {
         message: &C2cMessage,
         content: String,
         reply_text: Option<String>,
+        reply_present: bool,
     ) -> Self {
         Self {
             scope_key: format!("private:{}", message.user_openid),
             content,
             reply_text,
+            reply_present,
             platform: "qq_official".to_owned(),
             event_type: "c2c_message".to_owned(),
             user_id: Some(message.user_openid.clone()),
@@ -540,6 +548,7 @@ impl RespondRequest {
         message: &GroupMessage,
         content: String,
         reply_text: Option<String>,
+        reply_present: bool,
     ) -> Self {
         Self {
             // 群聊 scope_key 必须保持"当前 QQ 目标"语义，避免把 RSS、会话等群级能力
@@ -547,6 +556,7 @@ impl RespondRequest {
             scope_key: format!("group:{}", message.group_openid),
             content,
             reply_text,
+            reply_present,
             platform: "qq_official".to_owned(),
             event_type: message.event_type.as_respond_event_type().to_owned(),
             user_id: message.member_openid.clone(),
@@ -557,6 +567,26 @@ impl RespondRequest {
             timestamp: message.timestamp.clone(),
         }
     }
+}
+
+/// 平台只给引用关系、不给正文时，`reply_present` 仍用于 Core 侧拒绝猜测引用内容。
+pub(crate) fn has_reply(message: &C2cMessage) -> bool {
+    message
+        .reply
+        .as_ref()
+        .is_some_and(|reply| !reply.message_id.trim().is_empty())
+}
+
+/// 群聊引用关系与 C2C 使用同一语义，仅作用域不同。
+pub(crate) fn has_group_reply(message: &GroupMessage) -> bool {
+    message
+        .reply
+        .as_ref()
+        .is_some_and(|reply| !reply.message_id.trim().is_empty())
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// 提取引用消息的正文（用于 `reply_text`），优先从已解析的 reply.content 获取。
@@ -834,6 +864,7 @@ mod tests {
             &message,
             build_respond_content(&message),
             reply_text,
+            has_reply(&message),
         ))
         .unwrap();
         let object = value.as_object().unwrap();
@@ -881,12 +912,44 @@ mod tests {
         };
 
         let reply_text = extract_reply_text(&message);
-        let request =
-            RespondRequest::from_c2c_message(&message, build_respond_content(&message), reply_text);
+        let request = RespondRequest::from_c2c_message(
+            &message,
+            build_respond_content(&message),
+            reply_text,
+            has_reply(&message),
+        );
 
         // content 不应包含引用块，引用正文通过 reply_text 独立传递
         assert_eq!(request.content, "你好");
         assert_eq!(request.reply_text.as_deref(), Some("上一条"));
+        assert!(request.reply_present);
+    }
+
+    #[test]
+    fn respond_payload_marks_reply_present_when_text_unavailable() {
+        let message = C2cMessage {
+            message_id: "msg-1".to_owned(),
+            user_openid: "user-1".to_owned(),
+            content: "看看引用".to_owned(),
+            reply: Some(crate::event::MessageReply {
+                message_id: "quoted-1".to_owned(),
+                content: None,
+            }),
+            timestamp: Some("2026-06-10T12:00:00+08:00".to_owned()),
+            attachments: Vec::new(),
+        };
+
+        let reply_text = extract_reply_text(&message);
+        let value = serde_json::to_value(RespondRequest::from_c2c_message(
+            &message,
+            build_respond_content(&message),
+            reply_text,
+            has_reply(&message),
+        ))
+        .unwrap();
+
+        assert_eq!(value["reply_present"], true);
+        assert!(value.get("reply_text").is_none());
     }
 
     #[test]
@@ -909,6 +972,7 @@ mod tests {
             &message,
             build_group_respond_content(&message),
             reply_text,
+            has_group_reply(&message),
         );
 
         assert_eq!(request.scope_key, "group:group-1");
@@ -916,6 +980,7 @@ mod tests {
         assert_eq!(request.user_id.as_deref(), Some("user-1"));
         assert_eq!(request.group_id.as_deref(), Some("group-1"));
         assert_eq!(request.reply_text, None);
+        assert!(!request.reply_present);
     }
 
     #[test]
@@ -938,6 +1003,7 @@ mod tests {
             &message,
             build_group_respond_content(&message),
             reply_text,
+            has_group_reply(&message),
         );
 
         assert_eq!(request.scope_key, "group:group-1");

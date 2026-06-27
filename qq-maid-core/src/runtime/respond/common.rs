@@ -101,6 +101,7 @@ pub(super) fn empty_respond_request() -> RespondRequest {
         user_text: String::new(),
         content: String::new(),
         reply_text: None,
+        reply_present: false,
         scope_key: String::new(),
         user_id: None,
         group_id: None,

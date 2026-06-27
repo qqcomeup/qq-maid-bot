@@ -84,6 +84,32 @@ async fn chat_uses_reply_text_when_current_message_is_empty() {
 }
 
 #[tokio::test]
+async fn chat_refuses_to_guess_when_reply_text_unavailable() {
+    let inspector = MockProvider::new();
+    let service = test_service_with_provider(inspector.clone());
+    let mut req = private_message("你能看到我引用的是什么吗");
+    req.reply_present = true;
+
+    let response = service.respond(req).await.unwrap();
+
+    assert_eq!(
+        response.command.as_deref(),
+        Some("reply_content_unavailable")
+    );
+    assert!(
+        response
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("没有获取到引用内容")
+    );
+    assert!(
+        inspector.requests().is_empty(),
+        "引用正文不可用时不应调用 LLM 猜测"
+    );
+}
+
+#[tokio::test]
 async fn chat_injects_knowledge_context_as_system_prompt() {
     let inspector = MockProvider::new();
     let (service, base) = test_service_with_provider_and_base(inspector.clone());

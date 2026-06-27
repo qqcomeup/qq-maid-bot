@@ -112,6 +112,9 @@ struct HttpRespondRequest {
     /// 引用消息正文（仅当平台可解析引用内容时填充，无引用或未命中缓存时为空）。
     #[serde(default)]
     reply_text: Option<String>,
+    /// 平台事件是否携带引用关系；用于区分“无引用”和“引用正文解析失败”。
+    #[serde(default)]
+    reply_present: bool,
     /// gateway `/ping check` 专用诊断动作；不进入任何业务 flow。
     #[serde(default)]
     diagnostic: Option<HttpDiagnosticAction>,
@@ -128,6 +131,7 @@ impl From<HttpRespondRequest> for RespondRequest {
         Self {
             content: value.content,
             reply_text: value.reply_text,
+            reply_present: value.reply_present,
             scope_key: value.scope_key,
             user_id: value.user_id,
             group_id: value.group_id,

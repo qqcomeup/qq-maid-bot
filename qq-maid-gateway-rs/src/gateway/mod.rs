@@ -284,11 +284,16 @@ async fn handle_group_message(
     log_group_message_received(&message, config.verbose_log);
     let masked_group = mask_openid(&message.group_openid);
     let respond_content = build_group_respond_content(&message);
+    let reply_present = message
+        .reply
+        .as_ref()
+        .is_some_and(|reply| !reply.message_id.trim().is_empty());
     let reply_text = extract_group_reply_text(&message);
     if should_ignore_group_message(
         &message,
         &respond_content,
         reply_text.as_deref(),
+        reply_present,
         &masked_group,
     ) {
         return Ok(());
@@ -501,9 +506,13 @@ async fn handle_c2c_message(
 
     let masked_user = mask_openid(&message.user_openid);
     let respond_content = build_respond_content(&message);
+    let reply_present = message
+        .reply
+        .as_ref()
+        .is_some_and(|reply| !reply.message_id.trim().is_empty());
     let reply_text = extract_reply_text(&message);
-    // 引用正文独立走 reply_text；只引用、不输入正文的消息不能在 gateway 被当空消息丢弃。
-    if respond_content.trim().is_empty() && reply_text.is_none() {
+    // 引用正文独立走 reply_text；只引用但正文回填失败的消息也要交给 Core 明确拒绝猜测。
+    if respond_content.trim().is_empty() && reply_text.is_none() && !reply_present {
         debug!(
             message_id = %message.message_id,
             user = %masked_user,
