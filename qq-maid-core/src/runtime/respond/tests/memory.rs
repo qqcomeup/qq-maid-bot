@@ -143,7 +143,7 @@ async fn personal_memory_list_is_isolated_in_same_group() {
 async fn group_memory_is_visible_to_group_but_only_creator_can_manage() {
     let service = test_service();
 
-    let group_memory = service
+    service
         .memory_store
         .create_scoped(CreateScopedMemoryRequest {
             scope_type: MemoryScopeType::Group,
@@ -165,11 +165,10 @@ async fn group_memory_is_visible_to_group_but_only_creator_can_manage() {
         .text
         .unwrap();
     assert!(b_list.contains("群规则：回复要简洁"));
-    let short_id = short_memory_id(&group_memory.id);
 
     let denied = service
         .respond(message_in_scope(
-            &format!("/memory group edit {short_id} 群规则：回复要更简洁"),
+            "/memory group edit 1 群规则：回复要更简洁",
             "group:g1",
             "u2",
             "g1",
@@ -806,10 +805,8 @@ async fn memory_delete_pending_waits_on_plain_text_without_chat() {
         .unwrap();
     let memory_id = short_memory_id(&record.id);
 
-    service
-        .respond(message(&format!("/memory delete {memory_id}")))
-        .await
-        .unwrap();
+    service.respond(message("/memory")).await.unwrap();
+    service.respond(message("/memory delete 1")).await.unwrap();
     let wait = service
         .respond(message("随便聊一下"))
         .await
@@ -923,6 +920,42 @@ async fn memory_management_uses_recent_list_index() {
     let delete = service.respond(message("/memory delete 1")).await.unwrap();
     assert!(delete.text.as_deref().unwrap().contains("确认删除这条记忆"));
     assert!(delete.markdown.as_deref().unwrap().contains("- 内容："));
+}
+
+#[tokio::test]
+async fn memory_management_rejects_id_target_and_requires_list_index() {
+    let service = test_service();
+    let record = service
+        .memory_store
+        .create(CreateMemoryRequest {
+            user_id: Some("u1".to_owned()),
+            group_id: Some("g1".to_owned()),
+            content: "只能通过列表序号管理".to_owned(),
+            source_text: "seed".to_owned(),
+            memory_type: "note".to_owned(),
+            scope: "general".to_owned(),
+        })
+        .unwrap();
+
+    let without_list = service.respond(message("/memory delete 1")).await.unwrap();
+    assert!(
+        without_list
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("请先发送 /memory")
+    );
+
+    service.respond(message("/memory")).await.unwrap();
+    let by_id = service
+        .respond(message(&format!(
+            "/memory delete {}",
+            short_memory_id(&record.id)
+        )))
+        .await
+        .unwrap();
+    assert!(by_id.text.as_deref().unwrap().contains("请先发送 /memory"));
+    assert!(service.memory_store.get(&record.id).is_ok());
 }
 
 #[tokio::test]
