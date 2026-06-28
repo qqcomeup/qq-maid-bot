@@ -58,18 +58,19 @@ run_gateway_once (protocol.rs:88)
 │    · 按 scope_key 创建 / 查找会话队列                     │
 │    · 有界 mpsc 队列入队                                  │
 │    · 单 scope 单 worker 串行                             │
-│    · 全局活跃 worker 上限                                │
-│    · worker 空闲回收                                     │
+│    · worker 状态机与退休协调                             │
+│    · 全局活跃 worker slot 上限                           │
 │    · 队列满载系统通知                                    │
 │    · 关闭信号传播                                        │
 │                                                         │
 ├─────────────────────────────────────────────────────────┤
-│ Core 层（qq-maid-core）                                  │
+│ Core / LLM 层（qq-maid-core + qq-maid-llm）              │
 │                                                         │
-│  LimitingLlmProvider（新增，包装 DynLlmProvider）         │
-│    · 全局 Semaphore 控制 LLM 调用并发                    │
-│    · 配置来自 Core AppConfig                             │
-│    · 对调用方完全透明（实现 LlmProvider trait）            │
+│  LimitingLlmProvider（位于 qq-maid-llm/src/provider/     │
+│  limiter.rs，由 Core 装配层按配置包装最终 DynLlmProvider）│
+│    · chat() / stream_chat() 统一受 Semaphore 约束        │
+│    · permit 覆盖完整流生命周期                           │
+│    · 对调用方完全透明（实现 LlmProvider trait）           │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -79,7 +80,7 @@ run_gateway_once (protocol.rs:88)
 | 组件 | 归属 | 职责 |
 |------|------|------|
 | `MessageDispatcher` | Gateway | 按 scope 排队、同会话串行、不同会话并发、worker 生命周期、消息背压、系统通知 |
-| `LimitingLlmProvider` | Core | 在 `LlmProvider::chat()` 入口统一控制所有 LLM 调用并发数 |
+| `LimitingLlmProvider` | qq-maid-llm | 在 `chat()` / `stream_chat()` 入口统一控制所有 LLM 调用并发数；Core 只负责装配 |
 
 Dispatcher **不持有** LLM Semaphore，不感知 Core 内部的 LLM 并发限制。
 
@@ -102,14 +103,12 @@ MessageDispatcher.try_enqueue(msg)
         │                                      ▼
         │                              CoreHandle::respond
         │                                      │
-        │                                      ▼
-        │                              LlmChatService::respond
-        │                                      │
-        │                                      ▼
-        │                              LimitingLlmProvider::chat  ← Semaphore permit
-        │                                      │
-        │                                      ▼
-        │                              真正的 Provider::chat
+        │                   ┌──────── stream_respond → LimitingLlmProvider::stream_chat
+        │                   │
+        │                   └──────── respond        → LimitingLlmProvider::chat
+        │                                                         │
+        │                                                         ▼
+        │                                            真正的 Provider::stream_chat / chat
         │
         └─ 队列满 → Dispatcher 系统通知通道 → send_rejection_message → QQ
 ```
@@ -143,7 +142,7 @@ MessageDispatcher.try_enqueue(msg)
 - 控制单会话队列容量（`CONVERSATION_QUEUE_CAPACITY`）
 - 控制全局活跃 worker 数量上限（`MAX_ACTIVE_CONVERSATION_WORKERS`）
 - 管理 worker 空闲回收（`CONVERSATION_WORKER_IDLE_TIMEOUT_SECS`）
-- 维护 worker 注册表及其竞态保护（见第 11 节）
+- 维护 worker 状态机、注册表及其串行化边界（见第 10 节）
 - 管理系统拒绝通知通道（见第 8 节）
 - 处理 Gateway 关闭（接收 `CancellationToken`）
 - 记录调度日志
@@ -154,68 +153,95 @@ C2C 和 Group 两种消息类型应转换为统一的内部消息后进入同一
 
 ### 3. LLM 并发限制器（LimitingLlmProvider）
 
-**目标文件**：新建 `qq-maid-core/src/provider/limiter.rs`
+**目标文件**：新建 `qq-maid-llm/src/provider/limiter.rs`
 
-LLM 并发限制是 Core 层的基础设施，不是 MessageDispatcher 的职责。
+LLM 并发限制属于 `qq-maid-llm` 的 provider 包装层，Core 只在装配阶段根据 `AppConfig` 包装最终的 `DynLlmProvider`。不要把实现放回 `qq-maid-core/src/provider/mod.rs` 这个兼容重导出入口。
 
-#### 3.1 注入位置
+#### 3.1 装配位置
 
-在 `LlmProvider` trait 的 `chat()` 入口统一控制。新建 `LimitingLlmProvider`，实现 `LlmProvider` trait，内部持有：
+`LlmRuntime::from_config_with_push_sink`（`qq-maid-core/src/app/mod.rs`）建议按以下顺序组装：
 
-- `inner: DynLlmProvider` — 真正的 provider
-- `semaphore: Option<Arc<tokio::sync::Semaphore>>` — 并发限制器
+1. `build_provider(&config.llm_config())`
+2. `observe_provider(...)`
+3. `LimitingLlmProvider::new(..., config.max_concurrent_responses)`
+4. 注入 `AppState` 和 `RustRespondService`
+
+`MAX_CONCURRENT_RESPONSES = 0` 时不创建 `Semaphore`，`chat()` 和 `stream_chat()` 都直接透传。
+
+#### 3.2 trait 实现
+
+`LimitingLlmProvider` 必须同时实现 `chat()` 和 `stream_chat()`，两者共用同一个 `Arc<Semaphore>`。
 
 ```rust
 #[async_trait]
 impl LlmProvider for LimitingLlmProvider {
     async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome, LlmError> {
-        let _permit = match &self.semaphore {
-            Some(sem) => Some(sem.acquire().await),
-            None => None,
+        let Some(semaphore) = &self.semaphore else {
+            return self.inner.chat(req).await;
         };
-        self.inner.chat(req).await
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| LlmError::provider("LLM semaphore closed", "limiter"))?;
+        let result = self.inner.chat(req).await;
+        drop(permit);
+        result
     }
-    // stream_chat 自动继承 chat 的 permit（由内部调用链保证）
+
+    async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+        let Some(semaphore) = &self.semaphore else {
+            return self.inner.stream_chat(req).await;
+        };
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| LlmError::provider("LLM semaphore closed", "limiter"))?;
+        let inner = self.inner.stream_chat(req).await?;
+        Ok(Box::pin(PermitHoldingStream { inner, _permit: permit }))
+    }
+
     fn name(&self) -> &'static str { self.inner.name() }
     fn model(&self) -> &str { self.inner.model() }
     fn stream_enabled(&self) -> bool { self.inner.stream_enabled() }
 }
 ```
 
-#### 3.2 为什么放在这里
+`PermitHoldingStream` 内部只保存 `inner: LlmStream` 和 `_permit: OwnedSemaphorePermit`；`Drop` 由字段自动释放 permit，`poll_next` 只是转发到底层流。
 
-所有重型 LLM 调用都经过 `LlmProvider::chat()`：
+#### 3.3 permit 生命周期
 
-| 调用场景 | 调用点 | 经过路径 |
-|---------|--------|---------|
-| 普通聊天 | `llm_service.rs:159` | `LlmChatService::respond` → `provider.chat()` |
-| `/查` 联网搜索 | `search_flow.rs` | 通过 `query_executor` → 内部 `provider.chat()` |
-| 自动标题 | `title.rs:51` | `generate_session_title` → `provider.chat()` |
-| 翻译命令 / RSS 翻译 | `translation.rs:145` | `TranslationService::translate` → `provider.chat()` |
-| 记忆草稿提取 | `memory_flow.rs` | `LlmChatService::respond` → `provider.chat()` |
-| 会话压缩 | `compact` flow | `LlmChatService::respond` → `provider.chat()` |
-| Todo LLM 解析 | `todo_flow` | `LlmChatService::respond` → `provider.chat()` |
-| RSS 翻译 | `scheduler.rs:335` | `TranslationService::translate` → `provider.chat()` |
+- `chat()`：在调用 `self.inner.chat(req)` 之前获取 permit，函数返回或被取消 / 超时 drop 时自动释放。
+- `stream_chat()`：在 `self.inner.stream_chat(req)` 成功后，把 permit 移入返回的 `PermitHoldingStream`，一直持有到以下任一时刻：
+  - 流正常 EOF；
+  - 流返回错误；
+  - 调用方提前 drop 流；
+  - 调用任务被取消。
+- `inner.stream_chat(req)` 创建失败时，permit 会随函数返回自动释放。
+- `Semaphore::acquire_owned()` 的 `AcquireError` 不能忽略，必须显式映射为错误并上抛。
 
-在 `chat()` 这一层控制，无需在每个调用点单独加 permit，也不会遗漏新增调用场景。
+#### 3.4 为什么不能依赖默认实现
 
-#### 3.3 不放 CoreHandle::respond 入口
+不能使用 `LlmProvider::stream_chat()` 的默认实现，因为它会退回到 `chat()` 并把单次结果伪装成一条流事件，从而丢失真实增量流。
 
-`CoreHandle::respond` 是所有消息的统一入口，包含本地命令（`/ping`、`/todo` 列表等）和重型 LLM 调用。在此处统一获取 permit 会导致本地命令被 Semaphore 阻塞。Semaphore 必须放在「真正调用模型」的边界，即 `LlmProvider::chat()`。
+`stream_chat()` 必须直接调用 `inner.stream_chat(req)`，不得用 `inner.chat(req)` 代替。这样 `TextDelta` 仍会按真实增量输出，而不是单次返回完整正文。
 
-#### 3.4 装配位置
+#### 3.5 需要覆盖的调用面
 
-`LimitingLlmProvider` 在 `LlmRuntime::from_config_with_push_sink`（`qq-maid-core/src/app/`）中组装，替换原始的 `DynLlmProvider` 后再注入 `AppState` 和 `RustRespondService`。
+`chat()` 继续覆盖标题、翻译、记忆、Todo、RSS 相关的结构化调用；`stream_chat()` 直接覆盖 Core 的真实流式主聊天。两个入口共用同一并发上限，避免流式主聊天绕开 limiter。
 
-#### 3.5 配置归属
+#### 3.6 流式 limiter 测试
 
-配置项 `MAX_CONCURRENT_RESPONSES` 属于 Core 配置，添加到 `qq-maid-core/src/config.rs` 的 `AppConfig`。
+至少覆盖以下场景：
 
-permit 申请与释放语义：
-- **申请**：`chat()` 被调用时，若 semaphore 存在则 `acquire().await`
-- **释放**：`chat()` 返回时（正常 / 错误），`_permit` drop 自动释放
-- **超时**：依赖已有的 `LLM_REQUEST_TIMEOUT_SECONDS`，在 CoreHandle 层通过 `tokio::time::timeout` 取消 future，取消时会 drop permit
-- **取消**：通过 `CoreResponseStream::cancel()` 取消，依赖 `CancellationToken` 或 timeout 传播到 `provider.chat()` future 的 drop，从而释放 permit
+1. 并发上限为 1 时，第一个流尚未消费完成，第二个流不得开始底层 Provider 调用。
+2. 第一个流对象创建完成但尚未消费完时，permit 仍未释放。
+3. 第一个流正常 EOF 后，第二个流可以开始。
+4. 第一个流被提前 drop 后，permit 可以释放。
+5. 流式 `TextDelta` 仍按增量产生，不退化为完整正文单次返回。
+6. 非流式 `chat()` 仍受同一个并发上限控制。
+7. `MAX_CONCURRENT_RESPONSES=0` 时，`chat()` 和 `stream_chat()` 都直接透传。
 
 ### 4. ConversationKey：直接复用 scope_key
 
@@ -265,9 +291,9 @@ Gateway 在 `respond.rs` 中调用 `core_request_from_c2c_message` / `core_reque
 
 ### 7. 轻型命令不得被 LLM 并发池阻塞
 
-LLM Semaphore 位于 `LlmProvider::chat()` 入口，不经过 `chat()` 的本地命令天然不受影响：
+LLM Semaphore 位于真正调用模型的 `chat()` / `stream_chat()` 入口，不经过这两个入口的本地命令天然不受影响：
 
-- `/ping` — 本地诊断，在 `handle_c2c_message` 中提前返回（mod.rs:358），不调用 `provider.chat()`
+- `/ping` — 本地诊断，在 `handle_c2c_message` 中提前返回（mod.rs:358），不调用 provider
 - `/todo` 本地查询、列表、完成、删除 — 纯 SQLite 操作，不调用 LLM
 - `/记忆` 不带参数查看列表 — 纯 SQLite 操作
 - `/恢复` / `/resume` 无参数列表 — 纯 SQLite 操作
@@ -275,7 +301,7 @@ LLM Semaphore 位于 `LlmProvider::chat()` 入口，不经过 `chat()` 的本地
 - `/rss` 订阅列表/删除 — 本地操作
 - `/state` — 本地状态查询
 
-即使消息进入 Dispatcher 队列并被 worker 处理，这些命令的调用链不经过 `LlmProvider::chat()`，不会请求 Semaphore permit。
+即使消息进入 Dispatcher 队列并被 worker 处理，这些命令的调用链也不会请求 LLM permit。
 
 ### 8. 消息背压与满载策略
 
@@ -284,8 +310,10 @@ LLM Semaphore 位于 `LlmProvider::chat()` 入口，不经过 `chat()` 的本地
 | 限制 | 配置 | 默认值 | 所属模块 |
 |------|------|--------|---------|
 | 单会话队列容量 | `CONVERSATION_QUEUE_CAPACITY` | 16 | Gateway |
-| 全局活跃 worker 上限 | `MAX_ACTIVE_CONVERSATION_WORKERS` | 64 | Gateway |
+| 全局活跃 worker slot 上限 | `MAX_ACTIVE_CONVERSATION_WORKERS` | 64 | Gateway |
 | 全局 LLM 调用并发 | `MAX_CONCURRENT_RESPONSES` | 4 | Core |
+
+`MAX_ACTIVE_CONVERSATION_WORKERS` 由独立的 `Arc<Semaphore>` slot 池保证；活跃 worker 计数器只用于日志和指标，不作为唯一正确性机制。`MAX_CONCURRENT_RESPONSES` 仍由 Core 侧的另一把 Semaphore 独立控制，两者不能混用。
 
 #### 8.2 队列满载处理
 
@@ -320,11 +348,13 @@ struct RejectNotification {
 
 #### 8.3 活跃 worker 满载处理
 
-当活跃 worker 数达到 `MAX_ACTIVE_CONVERSATION_WORKERS` 时：
+当活跃 worker slot 不足时：
 
-1. 已有 scope 的消息**仍可入队**（其 worker 已存在）。
-2. 新 scope 的消息**拒绝创建 worker**，通过系统通知通道返回错误。
-3. 日志记录当前活跃 worker 数和上限。
+1. 已有 scope 的消息**仍可入队**，只要对应 worker 已经存在且状态不是 `Closed`。
+2. 新 scope 的消息先通过 `try_acquire_owned()` 获取 slot；失败时直接拒绝创建 worker，并走系统通知通道返回错误。
+3. worker 正常退出、取消或 panic 时，其 `OwnedSemaphorePermit` 自动释放，slot 回到池中。
+4. 活跃 worker 计数器只记录当前数量和上限，不参与正确性判断。
+5. 该 slot 池只管会话 worker，上游 `MAX_CONCURRENT_RESPONSES` 仍由 Core 的 LLM Semaphore 独立控制。
 
 ### 9. Dispatcher 内部系统通知机制
 
@@ -337,52 +367,79 @@ struct RejectNotification {
 
 ### 10. worker 生命周期管理
 
-#### 10.1 创建与复用
+本设计明确采用**单一 Dispatcher actor 独占注册表**的路线：
 
-- 首条消息到达新 scope 时，若全局 worker 数未达上限，创建 worker（`tokio::spawn`）
-- 后续同 scope 消息通过已有 `mpsc::Sender` 入队，复用 worker
-- worker 创建成功后递增全局计数器，退出时递减
+- `MessageDispatcher` 对外只暴露 `try_enqueue()`；
+- scope 注册表、worker 状态、worker sender、待移交 backlog、slot permit、JoinHandle 观察都只由 Dispatcher actor 持有和修改；
+- enqueue、空闲退休、worker 退出、worker panic、shutdown 都通过同一条命令通道串行处理。
 
-#### 10.2 空闲回收
+这样可把以下操作放进同一个串行化边界：
 
-- Worker 在 `mpsc::Receiver::recv()` 上使用 `tokio::time::timeout(CONVERSATION_WORKER_IDLE_TIMEOUT_SECS)`
-- 超时后 worker 退出并从注册表删除自己的条目
+1. 查找 scope 注册项；
+2. 判断 worker 是否仍接受新消息；
+3. 向该 worker 队列入队；
+4. worker 从 `Active` 切换到 `Retiring`；
+5. 从注册表删除 worker；
+6. 为该 scope 创建新 worker。
 
-#### 10.3 worker 注册表竞态保护（关键设计）
+#### 10.1 状态机
 
-每个注册表条目携带单调递增的 `worker_id: u64`：
+每个 scope 只有一个注册表条目，状态为：
 
-```rust
-struct QueueEntry {
-    tx: mpsc::Sender<GatewayMessage>,
-    worker_id: u64,
-}
-
-struct MessageDispatcher {
-    queues: DashMap<String, QueueEntry>,
-    next_worker_id: AtomicU64,
-    // ...
-}
+```text
+Active   -> 接受新消息，拥有唯一对外可见 sender
+Retiring -> 不再接受新消息；旧 worker 等待完成退休或退出；新消息先进入 dispatcher 侧 backlog
+Closed   -> 无存活 worker；条目可删除或在同一 actor 轮次内重建
 ```
 
-创建规则：
-1. 新 worker 创建时，分配唯一 `worker_id`，写入 `QueueEntry`。
-2. Worker 退出时，比较注册表中当前 `worker_id` 与自身 `worker_id`：
-   - **相等** → 删除注册表条目（自己是当前 worker）
-   - **不等** → 说明已有新 worker 接管，不操作注册表
-3. `worker_id` 通过 `AtomicU64::fetch_add(1)` 递增，永不回绕（实际使用中不可能溢出）。
+可继续保留单调递增的 `worker_generation` 作为日志和事件关联字段，但它**不能**单独承担正确性保证；真正的正确性来自 Dispatcher actor 的串行协议。
 
-这保证以下竞态安全：
-- 旧 worker 空闲退出与新消息创建 worker 同时发生 → 新 worker 有更大的 `worker_id`，旧 worker 退出时发现 id 不匹配，不删除新条目
-- Worker panic 后新消息重新创建 → 新 worker 覆盖 `QueueEntry`（新 `tx` + 新 `worker_id`），旧 worker 的残留 sender 已无消费者
-- 新旧 worker 不会同时消费同一队列 → `QueueEntry.tx` 只有一个有效 sender（最新创建的）
+#### 10.2 创建、复用与 slot 获取
 
-#### 10.4 Worker panic 恢复
+- 新 scope 首条消息到达时，Dispatcher 先对 worker slot 池执行 `try_acquire_owned()`。
+- 获取成功后才创建 worker，并把 `OwnedSemaphorePermit` 与 worker 生命周期绑定。
+- 获取失败时，不创建 worker，直接走系统通知通道返回“当前会话较多，请稍后再试”。
+- 已存在 `Active` worker 的 scope 直接复用原 worker。
+- `Retiring` scope 的新消息不会直接发给旧 sender，而是进入 dispatcher 侧 backlog，等待旧 worker 真正关闭后由 successor worker 继续处理。
 
-- `tokio::spawn` 返回的 `JoinHandle` 不强制 `catch_unwind`
-- Panic 后 `JoinHandle` 变为 cancelled 状态，worker 对应的 `mpsc::Sender` 的 `send()` 会返回错误
-- 下一条消息到来时，由于 `send()` 失败，Dispatcher 检测到 worker 已死，分配新 `worker_id` 重建 worker 和队列
-- 旧队列中的残留消息丢失，记录 warning 日志（scope_key、原 worker_id、残留消息数）
+#### 10.3 空闲退休协议
+
+worker 空闲检测仍可基于 `tokio::time::timeout(CONVERSATION_WORKER_IDLE_TIMEOUT_SECS)`，但 timeout 触发后**不能直接自行删除注册表并退出**。
+
+正确流程：
+
+1. worker 超时后向 Dispatcher 发送 `WorkerIdleExpired { scope_key, generation }`。
+2. Dispatcher 在同一串行边界内检查该 scope：
+   - 若状态仍为 `Active`，且当前 sender/代次与事件匹配，则切换为 `Retiring`；
+   - 同时把注册表中的“可接受新消息 sender”移除或标记为不可用，保证后续 enqueue 不能再绕过退休状态；
+   - 若这时已经有 backlog，则只保留 backlog，不再让旧 worker 接受新消息。
+3. Dispatcher 回发退休决定给 worker：
+   - `RetireNow`：worker 结束循环并退出；
+   - `StayActive`：说明期间已有新活动或事件已过期，worker 继续工作。
+4. 旧 worker 报告 `WorkerExited` 后，Dispatcher 若发现该 scope backlog 非空，则在**同一 actor 轮次**内申请 / 复用 slot 并创建 successor worker，再把 backlog 按原顺序灌入新队列。
+5. backlog 为空时，再把条目标记为 `Closed` 并删除。
+
+这组约束保证：
+
+- 返回入队成功的消息，一定已进入活跃 worker 队列或 Dispatcher 自己维护的 backlog，后续一定会绑定消费者；
+- `Retiring` worker 不再接受新消息；
+- 新旧 worker 不会同时消费同一 scope；
+- sender clone 不会绕过 retirement 状态，因为真正对外暴露 sender 的只有 Dispatcher；
+- worker 退出与新消息同时发生时，enqueue 与退休决定在同一 actor 内串行裁决，不会出现“报告成功但消息丢失”。
+
+#### 10.4 Worker panic、取消与清理
+
+- 不再使用“下一条消息 `send()` 失败后再发现 worker 已死”的延迟清理方案。
+- 每个 worker 创建后都要有明确的结束观察者，可采用 supervisor await `JoinHandle`，或等价的 join 观察任务。
+- task panic 后，`JoinHandle.await` 返回 `JoinError`；应使用 `JoinError::is_panic()` 区分 panic，与 cancelled 不是同一状态。
+- supervisor 收到 worker 结束事件后，在 Dispatcher actor 内完成以下清理：
+  - 从注册表移除或关闭对应条目；
+  - 递减活跃 worker 指标；
+  - 释放 / 丢弃 worker 持有的 slot permit；
+  - 若该 scope backlog 非空，则创建 successor worker 继续处理；
+  - 记录 panic / cancel / normal exit 的结构化日志。
+
+因为 slot permit 绑定在 worker 任务持有的 `OwnedSemaphorePermit` 上，正常退出、任务取消和 panic unwind 都会自动释放 permit；Dispatcher 侧只负责把注册表和指标清理干净。
 
 ### 11. 关闭与重连语义
 
@@ -448,23 +505,44 @@ const WORKER_CANCEL_TIMEOUT_SECS: u64 = 1;
 
 #### 13.1 当前实现
 
-`MessageCache`（`mod.rs:58`）是 `HashMap<String, String>`，key 为 `message_id`（QQ 消息 ID）。
+`MessageCache`（`mod.rs:58`）当前是 `HashMap<String, String>`，仅以 `message_id` 为 key。
 
 `resolve_signals`（`mod.rs:81`）：
-- 将每条 C2C 消息的 `message_id → content` 写入 cache
+- 将每条消息的 `message_id → content` 写入 cache
 - 当 reply 引用了已知 `message_id` 时，回填 `reply.content`
 
-#### 13.2 隔离依据
+#### 13.2 修正后的 key 设计
 
-- **Key 隔离**：`message_id` 是 QQ 平台全局唯一的消息 ID，不同私聊、不同群的消息 ID 不会冲突。cache 隔离性由 key 的唯一性自然保证，**不依赖**会话队列隔离。
-- **并发保护**：当前无锁（单线程访问）。并发改造后需将其包裹为 `Arc<Mutex<HashMap<String, String>>>`。`resolve_signals` 在 worker 线程中调用，每次短暂获取锁后释放。
-- **淘汰策略**：当前 `MessageCache` 无淘汰（无限增长）。并发改造后可保持现状（内存占用极小），或增加简单 LRU 上限。
+除非能找到 QQ 官方协议对 `message_id` 跨所有私聊和群聊全局唯一的明确保证，否则 reply cache 必须改为组合 key：
 
-#### 13.3 回归测试要求
+```rust
+struct ReplyCacheKey {
+    conversation_kind: ConversationKind,
+    scope_id: String,
+    message_id: String,
+}
+```
 
-- 跨私聊：两个私聊用户同时发送互引 reply 消息，确认 cache key 不冲突
-- 跨群聊：两个群同时发送 reply，确认不互串
-- 私聊 + 群聊并发：同时发送，确认 cache key 空间不重叠
+其中：
+- `conversation_kind` 区分私聊 / 群聊；
+- `scope_id` 直接复用 `scope_key()` 的身份空间；
+- `message_id` 只在同一 scope 内做消息定位。
+
+也可以等价实现为 `(scope_key, message_id)`；关键点是**命名空间隔离由 key 负责，不是由 `Mutex` 负责**。
+
+#### 13.3 并发与存储约束
+
+- 并发改造后需将 cache 包裹为 `Arc<Mutex<HashMap<ReplyCacheKey, String>>>`。
+- `Mutex` 只负责并发读写安全，不负责跨 scope 隔离。
+- `resolve_signals` 在 worker 线程中调用，每次短暂获取锁后释放。
+- 淘汰策略可保持现状，或后续增加简单上限；但不能回退到只按 `message_id` 建 key。
+
+#### 13.4 回归测试要求
+
+- 不同私聊使用相同测试 `message_id` 不互相命中
+- 不同群使用相同测试 `message_id` 不互相命中
+- 私聊和群聊使用相同测试 `message_id` 不互相命中
+- 同 scope 引用消息仍能正确回填
 
 ### 14. 排查共享状态安全性
 
@@ -477,7 +555,7 @@ const WORKER_CANCEL_TIMEOUT_SECS: u64 = 1;
 | `TodoStore` | `storage/todo.rs` | `Mutex<Connection>` (std) | ✅ 同上 |
 | `RssStore` | `storage/rss.rs` | `Mutex<Connection>` (std) | ✅ 同上 |
 | `KnowledgeStore` | `storage/knowledge.rs` | `Mutex<Connection>` (std) | ✅ 同上 |
-| `reply_cache` | `mod.rs` `HashMap` | 无锁 | ⚠️ 需改为 `Arc<Mutex<HashMap>>` |
+| `reply_cache` | `mod.rs` `HashMap<ReplyCacheKey, String>` | 无锁 | ⚠️ 需改为 `Arc<Mutex<HashMap<ReplyCacheKey, String>>>` |
 | `group_outbound_cache` | `mod.rs` | `Arc<Mutex<BotOutboundCache>>` | ✅ 已有锁，但需检查 C2C 路径是否意外共享 |
 | `GatewayRuntimeStatus` | `ping/mod.rs` | 内部 `Mutex` | ✅ 已有锁 |
 | `MessageDedupe` | `dedupe.rs` | 内部 `Mutex<HashMap>` | ✅ 已有锁 |
@@ -602,13 +680,15 @@ CONVERSATION_WORKER_IDLE_TIMEOUT_SECS=300
 | 私聊处理 | `qq-maid-gateway-rs/src/gateway/mod.rs` | `handle_c2c_message` (line 333) |
 | 群聊处理 | `qq-maid-gateway-rs/src/gateway/mod.rs` | `handle_group_message` (line 163) |
 | 流消费 | `qq-maid-gateway-rs/src/gateway/mod.rs` | `consume_respond_stream` (line 301) |
-| Reply cache | `qq-maid-gateway-rs/src/gateway/mod.rs` | `resolve_signals` (line 81), `MessageCache` (line 58) |
+| Reply cache | `qq-maid-gateway-rs/src/gateway/mod.rs` | `resolve_signals` (line 81), `MessageCache`, `ReplyCacheKey` |
 | Gateway→Core | `qq-maid-gateway-rs/src/respond.rs` | `RespondClient`, `core_request_from_*` |
 | Core 入口 | `qq-maid-core/src/service.rs` | `CoreHandle::respond` (line 168) |
 | 流式起点 | `qq-maid-core/src/service.rs` | `start_core_response_stream` (line 319) |
 | scope_key | `qq-maid-core/src/service.rs` | `CoreRequest::scope_key` (line 429) |
-| LLM Provider trait | `qq-maid-llm/src/provider/mod.rs` | `LlmProvider` (line 60), `chat()` |
-| Provider 调用 | `qq-maid-core/src/runtime/respond/llm_service.rs` | `LlmChatService::respond` → `provider.chat()` (line 159) |
+| LLM Provider trait | `qq-maid-llm/src/provider/mod.rs` | `LlmProvider` (line 60), `chat()`, `stream_chat()` |
+| Limiter 装配 | `qq-maid-core/src/app/mod.rs` | `LlmRuntime::from_config_with_push_sink` |
+| Limiter 实现位置 | `qq-maid-llm/src/provider/limiter.rs` | `LimitingLlmProvider`, `PermitHoldingStream` |
+| Provider 调用 | `qq-maid-core/src/runtime/respond/llm_service.rs` | `LlmChatService::respond` → `provider.chat()`，`stream_respond` → `provider.stream_chat()` |
 | 自动标题 LLM | `qq-maid-core/src/runtime/respond/title.rs` | `provider.chat()` (line 51) |
 | 翻译 LLM | `qq-maid-core/src/runtime/translation.rs` | `self.provider.chat()` (line 145) |
 | RSS 翻译 LLM | `qq-maid-core/src/runtime/rss/scheduler.rs` | `translation_service.translate()` (line 335) |
@@ -644,15 +724,15 @@ CONVERSATION_WORKER_IDLE_TIMEOUT_SECS=300
 1. 不同 scope 历史不串线。
 2. 私聊与群聊历史不串线。
 3. pending 不被其他 scope 消费。
-4. reply cache 不返回其他 scope 消息（通过 message_id 全局唯一性 + Mutex 保护，不依赖会话队列隔离）。
+4. reply cache 通过组合 key 隔离，不再依赖 `message_id` 全局唯一性假设。
 
 ### 并发限制
 
 1. 同时运行的重型 LLM 调用不超过 `MAX_CONCURRENT_RESPONSES`（0 时不限制）。
 2. 同时活跃的会话 worker 不超过 `MAX_ACTIVE_CONVERSATION_WORKERS`。
 3. 等待 LLM permit 不阻塞 WS 继续读取消息。
-4. 同一 scope 积压消息不提前占用多个 LLM permit（permit 只在 `chat()` 入口获取）。
-5. 轻型本地命令不被 LLM Semaphore 阻塞（不经过 `chat()`）。
+4. 同一 scope 积压消息不提前占用多个 LLM permit；流式调用也必须持有 permit 直到流结束、错误、drop 或取消。
+5. 轻型本地命令不被 LLM Semaphore 阻塞（不经过 `chat()` / `stream_chat()`）。
 
 ### 背压与资源
 
@@ -676,11 +756,11 @@ CONVERSATION_WORKER_IDLE_TIMEOUT_SECS=300
 2. 正常退出时：停止接收新消息 → drain 已入队任务（等待 `SHUTDOWN_DRAIN_TIMEOUT_SECS`）→ 超时取消剩余 worker → 记录未完成任务数。
 3. 关闭过程不无限等待 LLM、流消费或 QQ 网络请求。
 
-### worker 注册表竞态
+### worker 生命周期竞态
 
-1. 旧 worker 空闲退出时，若已有新 worker 接管，不删除注册表条目。
-2. Worker panic 后下一条消息能重建 worker，不永久阻塞该 scope。
-3. 新旧 worker 不会同时消费同一 scope 消息（通过 `worker_id` 比较保证）。
+1. worker 从 `Active` 切到 `Retiring` 后，不再接受新消息；成功入队的消息要么进入活跃队列，要么进入 Dispatcher backlog。
+2. Worker panic 后由 supervisor 通过 `JoinError::is_panic()` 触发清理与重建，不依赖下一条消息 `send()` 失败后才发现。
+3. 同一 scope 不会同时存在两个 `Active` worker，sender clone 也不会绕过 retirement 状态。
 
 ## 测试要求
 
@@ -689,22 +769,37 @@ CONVERSATION_WORKER_IDLE_TIMEOUT_SECS=300
 - 同 scope 消息严格串行
 - 不同 scope 消息并发
 - 群聊长响应不阻塞私聊 `/ping`
-- 全局 LLM 并发上限生效（`MAX_CONCURRENT_RESPONSES`）
-- `MAX_CONCURRENT_RESPONSES=0` 时不限制
-- 全局活跃 worker 上限生效（`MAX_ACTIVE_CONVERSATION_WORKERS`）
-- 已达 worker 上限时已有 scope 仍可入队
-- 同 scope 积压不占用多个 LLM permit
+- `chat()` 与 `stream_chat()` 共用同一个 LLM Semaphore，上限生效
+- 第一个流未消费完成时，第二个流不得开始底层 Provider 调用
+- 第一个流正常 EOF 后，第二个流可以开始
+- 第一个流提前 drop 后，permit 可以释放
+- `stream_chat()` 真实输出 `TextDelta` 增量，不退化为单次完整正文
+- `MAX_CONCURRENT_RESPONSES=0` 时 `chat()` 与 `stream_chat()` 都透传
+- 全局活跃 worker slot 上限生效（`MAX_ACTIVE_CONVERSATION_WORKERS`）
+- 已达 worker slot 上限时已有 scope 仍可入队
 - 单会话队列满载：拒绝通知发送成功
 - 单会话队列满载：拒绝通知通道满时日志计数，不死循环
 - worker 空闲回收
-- worker 空闲退出与新消息创建 worker 的竞态
-- worker panic 后恢复
+- worker 退休与新消息入队竞态不丢消息
+- worker panic 后清理 registry / slot / metrics
 - Gateway 临时断线重连：Dispatcher 不重建
 - Gateway 正常关闭：drain + 超时取消 + 计数
 - session history 不乱序
 - pending 不串线
-- reply cache 跨私聊、跨群聊、私聊群聊并发隔离
+- reply cache 跨私聊、跨群聊、私聊群聊隔离
+- 同 scope reply cache 引用消息仍能正确回填
 - 流式响应跨 scope 不混合
+
+## PR 描述同步要点
+
+- `LimitingLlmProvider` 最终放在 `qq-maid-llm/src/provider/limiter.rs`，由 `qq-maid-core` 装配层包装最终 `DynLlmProvider`。
+- `chat()` 与 `stream_chat()` 都获取 permit；`stream_chat()` 必须调用真实 `inner.stream_chat(req)`。
+- permit 释放时机要明确写为：`chat()` 返回、流 EOF、流错误、调用方提前 drop、任务取消。
+- worker 上限由独立 worker slot Semaphore 保证，不再依赖“先读计数器再创建”的竞态方案。
+- worker retirement 使用 `Active / Retiring / Closed` 状态机，并由 Dispatcher actor 串行化 enqueue、退休与清理。
+- worker panic 由 supervisor 通过 `JoinHandle.await` + `JoinError::is_panic()` 观察和清理；cancelled 与 panic 要区分。
+- reply cache 使用组合 key，推荐 `ReplyCacheKey { conversation_kind, scope_id, message_id }`。
+- 实际新增配置共 4 项：`MAX_CONCURRENT_RESPONSES`、`CONVERSATION_QUEUE_CAPACITY`、`MAX_ACTIVE_CONVERSATION_WORKERS`、`CONVERSATION_WORKER_IDLE_TIMEOUT_SECS`。
 
 完成后运行：
 ```bash
