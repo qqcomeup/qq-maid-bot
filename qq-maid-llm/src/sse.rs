@@ -53,9 +53,6 @@ pub fn parse_sse_frame(frame: &[u8]) -> Result<Option<SseFrame>, LlmError> {
         return Ok(None);
     }
     let data = data_lines.join("\n");
-    if data.trim() == "[DONE]" {
-        return Ok(None);
-    }
     Ok(Some(SseFrame { event, data }))
 }
 
@@ -87,5 +84,12 @@ mod tests {
         assert_eq!(parsed.event.as_deref(), Some("done"));
         assert_eq!(parsed.data, "{\"ok\":true}");
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn keeps_done_frame_visible_to_stream_state_machine() {
+        let parsed = parse_sse_frame(b"data: [DONE]").unwrap().unwrap();
+
+        assert_eq!(parsed.data, "[DONE]");
     }
 }

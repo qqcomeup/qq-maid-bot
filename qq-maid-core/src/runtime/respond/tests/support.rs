@@ -10,6 +10,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDate};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::super::{
@@ -46,6 +47,7 @@ pub(super) struct MockProvider {
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<ChatRequest>>>,
     title_replies: Arc<Mutex<Vec<Result<String, LlmError>>>>,
+    title_delay: Option<std::time::Duration>,
 }
 
 pub(super) struct MockQueryExecutor;
@@ -68,6 +70,12 @@ pub(super) struct SupplementWeatherExecutor {
 
 pub(super) struct FailingQueryExecutor {
     pub(super) err: LlmError,
+}
+
+pub(super) struct StreamOnlyQueryExecutor {
+    pub(super) deltas: Vec<String>,
+    pub(super) query_calls: Arc<AtomicUsize>,
+    pub(super) stream_calls: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -103,6 +111,7 @@ impl MockProvider {
             calls: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
             title_replies: Arc::new(Mutex::new(Vec::new())),
+            title_delay: None,
         }
     }
 
@@ -111,6 +120,7 @@ impl MockProvider {
             calls,
             requests: Arc::new(Mutex::new(Vec::new())),
             title_replies: Arc::new(Mutex::new(Vec::new())),
+            title_delay: None,
         }
     }
 
@@ -122,8 +132,14 @@ impl MockProvider {
                     .map(|result| result.map(str::to_owned))
                     .collect(),
             )),
+            title_delay: None,
             ..Self::new()
         }
+    }
+
+    pub(super) fn with_title_delay(mut self, delay: std::time::Duration) -> Self {
+        self.title_delay = Some(delay);
+        self
     }
 
     pub(super) fn requests(&self) -> Vec<ChatRequest> {
@@ -252,6 +268,9 @@ impl LlmProvider for MockProvider {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().unwrap().push(req.clone());
         if req.metadata.get("purpose").map(String::as_str) == Some("session_title") {
+            if let Some(delay) = self.title_delay {
+                tokio::time::sleep(delay).await;
+            }
             let reply = self.title_replies.lock().unwrap().remove(0)?;
             return Ok(ChatOutcome {
                 reply,
@@ -497,6 +516,38 @@ impl QueryExecutor for FailingQueryExecutor {
 
     fn provider_name(&self) -> &'static str {
         "mock-query"
+    }
+}
+
+#[async_trait]
+impl QueryExecutor for StreamOnlyQueryExecutor {
+    async fn query(&self, _req: QueryRequest) -> Result<QueryOutcome, LlmError> {
+        self.query_calls.fetch_add(1, Ordering::SeqCst);
+        Err(LlmError::provider("query must not be called", "test"))
+    }
+
+    async fn query_stream(
+        &self,
+        _req: QueryRequest,
+        delta_tx: mpsc::Sender<String>,
+    ) -> Result<QueryOutcome, LlmError> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        for delta in &self.deltas {
+            delta_tx
+                .send(delta.clone())
+                .await
+                .map_err(|_| LlmError::new("cancelled", "receiver dropped", "test"))?;
+        }
+        Ok(QueryOutcome {
+            answer: self.deltas.join(""),
+            sources: Vec::new(),
+            provider: "stream-query".to_owned(),
+            elapsed_ms: 11,
+        })
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "stream-query"
     }
 }
 

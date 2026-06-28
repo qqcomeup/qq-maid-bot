@@ -46,6 +46,7 @@ pub enum LlmStreamEvent {
     Completed {
         usage: Option<TokenUsage>,
         finish_reason: Option<String>,
+        fallback_used: bool,
     },
 }
 
@@ -84,6 +85,7 @@ pub async fn collect_llm_stream(
     let mut reply = String::new();
     let mut usage = None;
     let mut completed = false;
+    let mut fallback_used = false;
     while let Some(event) = stream.next().await {
         match event? {
             LlmStreamEvent::TextDelta(delta) => {
@@ -94,7 +96,9 @@ pub async fn collect_llm_stream(
                 reply.push_str(&delta);
             }
             LlmStreamEvent::Completed {
-                usage: event_usage, ..
+                usage: event_usage,
+                fallback_used: event_fallback_used,
+                ..
             } => {
                 if completed {
                     return Err(LlmError::provider(
@@ -104,6 +108,7 @@ pub async fn collect_llm_stream(
                 }
                 completed = true;
                 usage = event_usage;
+                fallback_used |= event_fallback_used;
             }
         }
     }
@@ -123,7 +128,7 @@ pub async fn collect_llm_stream(
         reply,
         metrics: recorder.finish(provider, model, true),
         usage,
-        fallback_used: false,
+        fallback_used,
     })
 }
 
@@ -135,6 +140,7 @@ pub(crate) fn outcome_to_stream(outcome: ChatOutcome) -> LlmStream {
         Ok(LlmStreamEvent::Completed {
             usage,
             finish_reason: None,
+            fallback_used: outcome.fallback_used,
         }),
     ]))
 }
@@ -347,6 +353,37 @@ impl LlmProvider for ModelRouteProvider {
         Err(aggregate_route_error(task, failures))
     }
 
+    async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+        let route = match req.model.as_deref() {
+            Some(value) => ModelRoute::parse(value, "request")?,
+            None => self.default_route.clone(),
+        };
+        let task = model_task_name(&req).to_owned();
+        let candidates = route.candidates().to_vec();
+        let providers = self.providers.clone();
+        let default_provider = self.default_provider;
+
+        Ok(Box::pin(stream::unfold(
+            RouteStreamState {
+                req,
+                task,
+                candidates,
+                providers,
+                default_provider,
+                candidate_index: 0,
+                current_stream: None,
+                current_attempt: None,
+                failures: Vec::new(),
+                emitted_non_empty_delta: false,
+                done: false,
+            },
+            |mut state| async move {
+                let event = next_route_stream_event(&mut state).await;
+                event.map(|event| (event, state))
+            },
+        )))
+    }
+
     fn name(&self) -> &'static str {
         self.name
     }
@@ -360,6 +397,207 @@ impl LlmProvider for ModelRouteProvider {
             .first()
             .map(|(_, provider)| provider.stream_enabled())
             .unwrap_or(false)
+    }
+}
+
+struct RouteStreamState {
+    req: ChatRequest,
+    task: String,
+    candidates: Vec<ModelId>,
+    providers: Vec<(ModelProvider, DynLlmProvider)>,
+    default_provider: ModelProvider,
+    candidate_index: usize,
+    current_stream: Option<LlmStream>,
+    current_attempt: Option<(usize, ModelProvider, ModelId)>,
+    failures: Vec<ModelAttemptFailure>,
+    emitted_non_empty_delta: bool,
+    done: bool,
+}
+
+async fn next_route_stream_event(
+    state: &mut RouteStreamState,
+) -> Option<Result<LlmStreamEvent, LlmError>> {
+    loop {
+        if state.done {
+            return None;
+        }
+        if state.current_stream.is_none() {
+            match start_next_route_candidate(state).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    state.done = true;
+                    return Some(Err(aggregate_route_error(
+                        &state.task,
+                        std::mem::take(&mut state.failures),
+                    )));
+                }
+                Err(err) => {
+                    state.done = true;
+                    return Some(Err(err));
+                }
+            }
+        }
+
+        let Some(stream) = state.current_stream.as_mut() else {
+            continue;
+        };
+        match stream.next().await {
+            Some(Ok(LlmStreamEvent::TextDelta(delta))) => {
+                if !delta.is_empty() {
+                    state.emitted_non_empty_delta = true;
+                }
+                return Some(Ok(LlmStreamEvent::TextDelta(delta)));
+            }
+            Some(Ok(LlmStreamEvent::Completed {
+                usage,
+                finish_reason,
+                fallback_used,
+            })) => {
+                if !state.emitted_non_empty_delta {
+                    let err =
+                        LlmError::provider("LLM stream returned empty text output", "provider");
+                    record_current_route_failure(state, err);
+                    state.current_stream = None;
+                    state.current_attempt = None;
+                    continue;
+                }
+                let fallback_used = fallback_used
+                    || state
+                        .current_attempt
+                        .as_ref()
+                        .is_some_and(|(index, _, _)| *index > 0);
+                state.done = true;
+                return Some(Ok(LlmStreamEvent::Completed {
+                    usage,
+                    finish_reason,
+                    fallback_used,
+                }));
+            }
+            Some(Err(err)) => {
+                if state.emitted_non_empty_delta {
+                    state.done = true;
+                    return Some(Err(LlmError::new(
+                        err.code,
+                        err.message,
+                        "stream_after_delta",
+                    )));
+                }
+                record_current_route_failure(state, err);
+                state.current_stream = None;
+                state.current_attempt = None;
+            }
+            None => {
+                if state.emitted_non_empty_delta {
+                    state.done = true;
+                    return Some(Err(LlmError::provider(
+                        "LLM stream ended before completion after emitting text",
+                        "stream_after_delta",
+                    )));
+                }
+                let err = LlmError::provider("LLM stream ended without completion event", "stream");
+                record_current_route_failure(state, err);
+                state.current_stream = None;
+                state.current_attempt = None;
+            }
+        }
+    }
+}
+
+async fn start_next_route_candidate(state: &mut RouteStreamState) -> Result<bool, LlmError> {
+    while state.candidate_index < state.candidates.len() {
+        let index = state.candidate_index;
+        state.candidate_index += 1;
+        let candidate = state.candidates[index].clone();
+        let provider_kind = candidate.provider.unwrap_or(state.default_provider);
+        let provider = state
+            .providers
+            .iter()
+            .find(|(kind, _)| *kind == provider_kind)
+            .map(|(_, provider)| provider.clone())
+            .ok_or_else(|| {
+                LlmError::config(format!(
+                    "provider `{}` is not available for model candidate `{}`",
+                    provider_kind.as_str(),
+                    candidate.to_request_model()
+                ))
+            })?;
+        let mut candidate_req = state.req.clone();
+        candidate_req.model = Some(candidate.to_request_model());
+        match provider.stream_chat(candidate_req).await {
+            Ok(stream) => {
+                tracing::info!(
+                    task = state.task.as_str(),
+                    candidate_index = index,
+                    provider = provider_kind.as_str(),
+                    model = %candidate.name,
+                    result = "stream_started",
+                    "model candidate stream started"
+                );
+                state.current_stream = Some(stream);
+                state.current_attempt = Some((index, provider_kind, candidate));
+                return Ok(true);
+            }
+            Err(err) => {
+                let fallback =
+                    state.candidate_index < state.candidates.len() && should_try_next_model(&err);
+                tracing::warn!(
+                    task = state.task.as_str(),
+                    candidate_index = index,
+                    provider = provider_kind.as_str(),
+                    model = %candidate.name,
+                    result = "failed",
+                    error_code = err.code.as_str(),
+                    error_stage = err.stage.as_str(),
+                    error_kind = model_error_kind(&err),
+                    fallback,
+                    "model candidate stream init failed"
+                );
+                if !fallback {
+                    return Err(err);
+                }
+                state.failures.push(ModelAttemptFailure::new(
+                    index,
+                    provider_kind,
+                    &candidate,
+                    err,
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn record_current_route_failure(state: &mut RouteStreamState, err: LlmError) {
+    let Some((index, provider_kind, candidate)) = state.current_attempt.take() else {
+        state.failures.push(ModelAttemptFailure {
+            index: state.candidate_index,
+            provider: state.default_provider,
+            model: "<unknown>".to_owned(),
+            error: err,
+        });
+        return;
+    };
+    let fallback = state.candidate_index < state.candidates.len() && should_try_next_model(&err);
+    tracing::warn!(
+        task = state.task.as_str(),
+        candidate_index = index,
+        provider = provider_kind.as_str(),
+        model = %candidate.name,
+        result = "failed",
+        error_code = err.code.as_str(),
+        error_stage = err.stage.as_str(),
+        error_kind = model_error_kind(&err),
+        fallback,
+        "model candidate stream failed before text delta"
+    );
+    state.failures.push(ModelAttemptFailure::new(
+        index,
+        provider_kind,
+        &candidate,
+        err,
+    ));
+    if !fallback {
+        state.candidate_index = state.candidates.len();
     }
 }
 
@@ -601,6 +839,7 @@ mod tests {
         model: &'static str,
         stream: bool,
         results: Arc<Mutex<Vec<Result<ChatOutcome, LlmError>>>>,
+        stream_results: Arc<Mutex<Vec<Result<LlmStream, LlmError>>>>,
         calls: Arc<Mutex<usize>>,
         requests: Arc<Mutex<Vec<ChatRequest>>>,
     }
@@ -612,6 +851,19 @@ mod tests {
                 model: "mock-model",
                 stream: false,
                 results: Arc::new(Mutex::new(results)),
+                stream_results: Arc::new(Mutex::new(Vec::new())),
+                calls: Arc::new(Mutex::new(0)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_streams(name: &'static str, results: Vec<Result<LlmStream, LlmError>>) -> Self {
+            Self {
+                name,
+                model: "mock-model",
+                stream: true,
+                results: Arc::new(Mutex::new(Vec::new())),
+                stream_results: Arc::new(Mutex::new(results)),
                 calls: Arc::new(Mutex::new(0)),
                 requests: Arc::new(Mutex::new(Vec::new())),
             }
@@ -632,6 +884,12 @@ mod tests {
             *self.calls.lock().unwrap() += 1;
             self.requests.lock().unwrap().push(req);
             self.results.lock().unwrap().remove(0)
+        }
+
+        async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+            *self.calls.lock().unwrap() += 1;
+            self.requests.lock().unwrap().push(req);
+            self.stream_results.lock().unwrap().remove(0)
         }
 
         fn name(&self) -> &'static str {
@@ -670,6 +928,10 @@ mod tests {
             usage: None,
             fallback_used: false,
         }
+    }
+
+    fn stream_events(events: Vec<Result<LlmStreamEvent, LlmError>>) -> LlmStream {
+        Box::pin(stream::iter(events))
     }
 
     fn app_config(provider: ProviderMode, model: &str) -> LlmConfig {
@@ -993,6 +1255,96 @@ mod tests {
             deepseek.requests()[0].model.as_deref(),
             Some("deepseek:deepseek-chat")
         );
+    }
+
+    #[tokio::test]
+    async fn model_route_stream_falls_back_before_delta_only() {
+        let openai = Arc::new(MockProvider::with_streams(
+            "openai",
+            vec![Ok(stream_events(vec![Ok(LlmStreamEvent::Completed {
+                usage: None,
+                finish_reason: None,
+                fallback_used: false,
+            })]))],
+        ));
+        let deepseek = Arc::new(MockProvider::with_streams(
+            "deepseek",
+            vec![Ok(stream_events(vec![
+                Ok(LlmStreamEvent::TextDelta("fallback".to_owned())),
+                Ok(LlmStreamEvent::Completed {
+                    usage: None,
+                    finish_reason: None,
+                    fallback_used: false,
+                }),
+            ]))],
+        ));
+        let provider = ModelRouteProvider::new(
+            "auto",
+            ModelProvider::OpenAi,
+            ModelRoute::parse_config("openai:gpt-a,deepseek:deepseek-chat", "LLM_MODEL").unwrap(),
+            vec![
+                (ModelProvider::OpenAi, openai.clone()),
+                (ModelProvider::DeepSeek, deepseek.clone()),
+            ],
+        )
+        .unwrap();
+
+        let outcome = collect_llm_stream(
+            provider.stream_chat(request()).await.unwrap(),
+            provider.name(),
+            provider.model(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.reply, "fallback");
+        assert!(outcome.fallback_used);
+        assert_eq!(openai.calls(), 1);
+        assert_eq!(deepseek.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn model_route_stream_error_after_delta_does_not_fallback() {
+        let openai = Arc::new(MockProvider::with_streams(
+            "openai",
+            vec![Ok(stream_events(vec![
+                Ok(LlmStreamEvent::TextDelta("partial".to_owned())),
+                Err(LlmError::provider("broken", "stream")),
+            ]))],
+        ));
+        let deepseek = Arc::new(MockProvider::with_streams(
+            "deepseek",
+            vec![Ok(stream_events(vec![
+                Ok(LlmStreamEvent::TextDelta("fallback".to_owned())),
+                Ok(LlmStreamEvent::Completed {
+                    usage: None,
+                    finish_reason: None,
+                    fallback_used: false,
+                }),
+            ]))],
+        ));
+        let provider = ModelRouteProvider::new(
+            "auto",
+            ModelProvider::OpenAi,
+            ModelRoute::parse_config("openai:gpt-a,deepseek:deepseek-chat", "LLM_MODEL").unwrap(),
+            vec![
+                (ModelProvider::OpenAi, openai.clone()),
+                (ModelProvider::DeepSeek, deepseek.clone()),
+            ],
+        )
+        .unwrap();
+
+        let err = collect_llm_stream(
+            provider.stream_chat(request()).await.unwrap(),
+            provider.name(),
+            provider.model(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.stage, "stream_after_delta");
+        assert_eq!(openai.calls(), 1);
+        assert_eq!(deepseek.calls(), 0);
     }
 
     #[tokio::test]

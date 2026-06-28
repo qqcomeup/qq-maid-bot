@@ -3,6 +3,8 @@
 //! 承担 `RustRespondService` 中"兜底聊天"路径的实现：
 //! 组装 LLM 请求、发起调用、保存对话记录、自动生成会话标题等。
 
+use std::{future::Future, pin::Pin};
+
 use serde_json::{Value, json};
 
 use crate::{
@@ -125,7 +127,124 @@ impl RustRespondService {
         self.session_store
             .append_exchange(&mut session, &user_text, &reply)
             .map_err(session_error)?;
-        self.maybe_generate_auto_title(&mut session).await;
+        self.schedule_auto_title(session.clone());
+
+        let mut response = response_from_output(output);
+        response.session_id = Some(session.session_id);
+        response.command = None;
+        response.handled = Some(true);
+        response.diagnostics = Some(json!({
+            "backend": "rust",
+            "session_backend": "rust",
+            "used_memory": used_memory,
+            "used_knowledge": used_knowledge,
+            "knowledge_hit_count": knowledge_context.hit_count,
+            "used_search": false,
+        }));
+        Ok(response)
+    }
+
+    /// 普通聊天真流式路径：复用非流式聊天的上下文构造和后处理，只替换 LLM 调用方式。
+    pub async fn handle_chat_stream<F>(
+        &self,
+        req: RespondRequest,
+        on_delta: F,
+    ) -> Result<RespondResponse, LlmError>
+    where
+        F: FnMut(String) -> Pin<Box<dyn Future<Output = Result<(), LlmError>> + Send>> + Send,
+    {
+        let user_text = req.effective_user_text();
+        let meta = SessionMeta::new(
+            req.scope_key.clone(),
+            req.user_id.clone(),
+            req.group_id.clone(),
+            req.guild_id.clone(),
+            req.channel_id.clone(),
+            req.platform.clone(),
+        );
+        let mut session = self
+            .session_store
+            .get_or_create_active(&meta)
+            .map_err(session_error)?;
+        if user_text.trim().is_empty() {
+            return self.handle_chat(req, user_text, meta, session).await;
+        }
+
+        update_session_state_from_user(&mut session, &user_text);
+        let is_group_chat = meta
+            .group_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+        let member_matches = if is_group_chat {
+            Vec::new()
+        } else {
+            self.prompt_config.find_member_id_mentions(&user_text)?
+        };
+        if !is_group_chat
+            && let Some(unknown) = member_matches.iter().find(|item| item.name.is_none())
+        {
+            let mapping = self.prompt_config.load_member_id_mapping()?;
+            let reply = unknown_member_id_reply(&unknown.member_id, &mapping);
+            self.session_store
+                .append_exchange(&mut session, &user_text, &reply)
+                .map_err(session_error)?;
+            return Ok(command_response(
+                reply,
+                Some(session.session_id),
+                Some("member_id_unknown"),
+            ));
+        }
+        update_session_speaker_hint(&mut session, &member_matches);
+
+        let mut session_context = build_session_context(&session);
+        if let Some(identity_context) = build_member_identity_context(&member_matches) {
+            session_context.push_str("\n\n");
+            session_context.push_str(&identity_context);
+        }
+
+        let knowledge_context = self.knowledge_index.search_context(&user_text)?;
+        let used_knowledge = !knowledge_context.text.trim().is_empty();
+        let memory_context = self.build_memory_context(&meta)?;
+        let used_memory = !memory_context.trim().is_empty();
+        let system_prompts = if is_group_chat {
+            self.prompt_config.load_static_prompts_only()?
+        } else {
+            self.prompt_config.load_system_prompts()?
+        };
+        let service = LlmChatService::new(self.provider.clone());
+        let output = service
+            .stream_respond(
+                RespondRequest {
+                    session_id: session.session_id.clone(),
+                    purpose: RespondPurpose::Chat,
+                    user_text: user_text.clone(),
+                    system_prompts,
+                    memory_context,
+                    knowledge_context: knowledge_context.text.clone(),
+                    session_context,
+                    history_messages: recent_session_messages(
+                        &session,
+                        SESSION_HISTORY_MESSAGE_LIMIT,
+                    ),
+                    metadata: merge_metadata(
+                        req.metadata,
+                        &[
+                            ("purpose", "chat"),
+                            ("platform", meta.platform.as_str()),
+                            ("scope_key", meta.scope_key.as_str()),
+                        ],
+                    ),
+                    ..empty_respond_request()
+                },
+                on_delta,
+            )
+            .await?;
+
+        let reply = output.reply.clone();
+        self.session_store
+            .append_exchange(&mut session, &user_text, &reply)
+            .map_err(session_error)?;
+        self.schedule_auto_title(session.clone());
 
         let mut response = response_from_output(output);
         response.session_id = Some(session.session_id);
@@ -176,10 +295,13 @@ impl RustRespondService {
         }
     }
 
-    /// 如果会话标题还是默认值，且用户消息轮数在 2~4 之间，
-    /// 则调用标题生成模型自动生成标题。
-    async fn maybe_generate_auto_title(&self, session: &mut SessionRecord) {
-        let Some(title_model) = self.title_model.as_deref() else {
+    /// 如果会话标题还是默认值，且用户消息轮数在 2~4 之间，则后台尝试生成标题。
+    ///
+    /// 主聊天回复已经完成落库，标题只是展示增强；不能让标题模型的慢响应、
+    /// 失败或取消影响本轮 `Completed`。后台任务只允许条件更新标题，不能保存
+    /// 旧的完整会话快照，否则会覆盖期间继续写入的历史、pending 或手工重命名。
+    fn schedule_auto_title(&self, session: SessionRecord) {
+        let Some(title_model) = self.title_model.clone() else {
             return;
         };
         if session.title != DEFAULT_SESSION_TITLE {
@@ -194,27 +316,43 @@ impl RustRespondService {
             return;
         }
 
-        match generate_session_title(self.provider.as_ref(), title_model, &session.history, false)
-            .await
-        {
-            Ok(title) => {
-                session.title = title;
-                if let Err(err) = self.session_store.save(session) {
-                    tracing::warn!(
-                        error = %err.message(),
-                        session_id = %session.session_id,
-                        "failed to save generated session title"
+        let provider = self.provider.clone();
+        let session_store = self.session_store.clone();
+        let session_id = session.session_id.clone();
+        let history = session.history.clone();
+        tokio::spawn(async move {
+            match generate_session_title(provider.as_ref(), &title_model, &history, false).await {
+                Ok(title) => {
+                    match session_store.update_title_if_current(
+                        &session_id,
+                        DEFAULT_SESSION_TITLE,
+                        &title,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                "generated session title ignored because current title changed"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err.message(),
+                                session_id = %session_id,
+                                "failed to save generated session title"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        session_id = %session_id,
+                        "session auto title generation failed"
                     );
                 }
             }
-            Err(err) => {
-                tracing::debug!(
-                    error = %err,
-                    session_id = %session.session_id,
-                    "session auto title generation failed"
-                );
-            }
-        }
+        });
     }
 }
 
@@ -244,7 +382,6 @@ pub(super) fn recent_session_messages(session: &SessionRecord, limit: usize) -> 
         .rev()
         .collect()
 }
-
 /// 根据用户输入更新会话状态（话题、场景、模式、焦点等）。
 fn update_session_state_from_user(session: &mut SessionRecord, user_text: &str) {
     let text = user_text.trim();

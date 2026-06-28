@@ -3,14 +3,16 @@
 //! OpenAI fallback 和 DeepSeek 都复用同一套 `/chat/completions` HTTP/SSE 实现，
 //! 只在 base URL、API key 和模型规则上区分。
 
+use futures::stream;
 use reqwest::{StatusCode, header};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 
 use crate::{
     error::LlmError,
     metrics::MetricsRecorder,
     provider::{
-        ChatOutcome,
+        ChatOutcome, LlmStream, LlmStreamEvent, collect_llm_stream,
         types::{ChatMessage, ChatRole, TokenUsage},
     },
     sse::{parse_sse_frame, take_sse_frame},
@@ -19,6 +21,7 @@ use crate::{
 use super::fallback::{
     should_retry_non_stream_after_empty_stream, should_retry_non_stream_after_stream_error,
 };
+use super::responses::{incomplete_stream_eof_error, stream_transport_error};
 
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -259,65 +262,46 @@ pub(crate) async fn stream_completion(
     max_output_tokens: u64,
     messages: &[ChatMessage],
 ) -> Result<ChatOutcome, LlmError> {
-    let mut recorder = MetricsRecorder::start();
-    let payload = chat_completions_payload(messages, model, max_output_tokens, true)?;
-    let mut response = send_chat_completions_request(client, &payload, true).await?;
-    let mut frame_buffer = Vec::new();
-    let mut answer = String::new();
-    let mut final_message = String::new();
-    let mut usage = None;
+    let stream =
+        chat_completions_stream(client, provider, model, max_output_tokens, messages, true).await?;
+    collect_llm_stream(stream, provider, model).await
+}
 
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|err| LlmError::http(format!("Chat Completions stream failed: {err}")))?
-    {
-        frame_buffer.extend_from_slice(&chunk);
-        while let Some(frame) = take_sse_frame(&mut frame_buffer) {
-            let Some(event) = parse_sse_frame(&frame)? else {
-                continue;
-            };
-            recorder.mark_event();
-            handle_chat_stream_event(
-                &event.data,
-                &mut recorder,
-                &mut answer,
-                &mut final_message,
-                &mut usage,
-            )?;
-        }
-    }
-    if !frame_buffer.is_empty()
-        && let Some(event) = parse_sse_frame(&frame_buffer)?
-    {
-        recorder.mark_event();
-        handle_chat_stream_event(
-            &event.data,
-            &mut recorder,
-            &mut answer,
-            &mut final_message,
-            &mut usage,
-        )?;
-    }
+pub(crate) async fn chat_completions_stream(
+    client: &ChatCompletionsClient,
+    _provider: &str,
+    _model: &str,
+    max_output_tokens: u64,
+    messages: &[ChatMessage],
+    allow_completed_message_fallback: bool,
+) -> Result<LlmStream, LlmError> {
+    let recorder = MetricsRecorder::start();
+    let payload = chat_completions_payload(messages, _model, max_output_tokens, true)?;
+    let response = send_chat_completions_request(client, &payload, true).await?;
+    let frame_buffer = Vec::new();
+    let answer = String::new();
+    let final_message = String::new();
+    let usage = None;
 
-    if answer.trim().is_empty() {
-        answer = final_message;
-    }
-    let reply = answer.trim().to_owned();
-    if reply.is_empty() {
-        return Err(LlmError::provider(
-            "Chat Completions returned empty text output",
-            "provider",
-        ));
-    }
-    let metrics = recorder.finish(provider, model, true);
-
-    Ok(ChatOutcome {
-        reply,
-        metrics,
-        usage,
-        fallback_used: false,
-    })
+    Ok(Box::pin(stream::unfold(
+        ChatStreamState {
+            response,
+            frame_buffer,
+            recorder,
+            answer,
+            final_message,
+            usage,
+            pending_events: VecDeque::new(),
+            allow_completed_message_fallback,
+            saw_done: false,
+            finish_reason: None,
+            finished: false,
+        },
+        |mut state| async move {
+            let event = next_chat_stream_event(&mut state).await;
+            event.map(|event| (event, state))
+        },
+    )))
 }
 
 fn handle_chat_stream_event(
@@ -326,7 +310,7 @@ fn handle_chat_stream_event(
     answer: &mut String,
     final_message: &mut String,
     usage: &mut Option<TokenUsage>,
-) -> Result<(), LlmError> {
+) -> Result<(Vec<LlmStreamEvent>, Option<String>), LlmError> {
     let value = serde_json::from_str::<Value>(data).map_err(|err| {
         LlmError::provider(
             format!("invalid Chat Completions stream JSON: {err}"),
@@ -336,9 +320,11 @@ fn handle_chat_stream_event(
     if let Some(event_usage) = extract_chat_completion_usage(&value) {
         *usage = Some(event_usage);
     }
+    let mut events = Vec::new();
     let Some(choices) = value.get("choices").and_then(Value::as_array) else {
-        return Ok(());
+        return Ok((events, None));
     };
+    let mut finish_reason = None;
     for choice in choices {
         if let Some(delta) = choice
             .get("delta")
@@ -347,6 +333,7 @@ fn handle_chat_stream_event(
         {
             recorder.mark_token();
             answer.push_str(&delta);
+            events.push(LlmStreamEvent::TextDelta(delta));
         }
         if let Some(message) = choice
             .get("message")
@@ -355,8 +342,137 @@ fn handle_chat_stream_event(
         {
             final_message.push_str(&message);
         }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+            && !reason.trim().is_empty()
+        {
+            finish_reason = Some(reason.to_owned());
+        }
     }
-    Ok(())
+    Ok((events, finish_reason))
+}
+
+struct ChatStreamState {
+    response: reqwest::Response,
+    frame_buffer: Vec<u8>,
+    recorder: MetricsRecorder,
+    answer: String,
+    final_message: String,
+    usage: Option<TokenUsage>,
+    pending_events: VecDeque<LlmStreamEvent>,
+    allow_completed_message_fallback: bool,
+    saw_done: bool,
+    finish_reason: Option<String>,
+    finished: bool,
+}
+
+async fn next_chat_stream_event(
+    state: &mut ChatStreamState,
+) -> Option<Result<LlmStreamEvent, LlmError>> {
+    loop {
+        if let Some(event) = state.pending_events.pop_front() {
+            return Some(Ok(event));
+        }
+        if let Some(frame) = take_sse_frame(&mut state.frame_buffer) {
+            let Some(event) = (match parse_sse_frame(&frame) {
+                Ok(event) => event,
+                Err(err) => return Some(Err(err)),
+            }) else {
+                continue;
+            };
+            if event.data.trim() == "[DONE]" {
+                state.saw_done = true;
+                continue;
+            }
+            state.recorder.mark_event();
+            match handle_chat_stream_event(
+                &event.data,
+                &mut state.recorder,
+                &mut state.answer,
+                &mut state.final_message,
+                &mut state.usage,
+            ) {
+                Ok((events, finish_reason)) => {
+                    if finish_reason.is_some() {
+                        state.finish_reason = finish_reason;
+                    }
+                    state.pending_events.extend(events);
+                }
+                Err(err) => return Some(Err(err)),
+            }
+            continue;
+        }
+
+        if state.finished {
+            return None;
+        }
+
+        match state.response.chunk().await {
+            Ok(Some(chunk)) => {
+                state.frame_buffer.extend_from_slice(&chunk);
+            }
+            Ok(None) => {
+                if !state.frame_buffer.is_empty() {
+                    let Some(event) = (match parse_sse_frame(&state.frame_buffer) {
+                        Ok(event) => event,
+                        Err(err) => return Some(Err(err)),
+                    }) else {
+                        state.frame_buffer.clear();
+                        continue;
+                    };
+                    state.frame_buffer.clear();
+                    if event.data.trim() == "[DONE]" {
+                        state.saw_done = true;
+                    } else {
+                        state.recorder.mark_event();
+                        match handle_chat_stream_event(
+                            &event.data,
+                            &mut state.recorder,
+                            &mut state.answer,
+                            &mut state.final_message,
+                            &mut state.usage,
+                        ) {
+                            Ok((events, finish_reason)) => {
+                                if finish_reason.is_some() {
+                                    state.finish_reason = finish_reason;
+                                }
+                                state.pending_events.extend(events);
+                            }
+                            Err(err) => return Some(Err(err)),
+                        }
+                    }
+                }
+                if state.answer.trim().is_empty()
+                    && state.allow_completed_message_fallback
+                    && (state.saw_done || state.finish_reason.is_some())
+                    && !state.final_message.trim().is_empty()
+                {
+                    // 仅在没有真实 delta 时回补 completed message，避免把两套正文拼接。
+                    state.answer = state.final_message.clone();
+                    state.recorder.mark_token();
+                    return Some(Ok(LlmStreamEvent::TextDelta(state.final_message.clone())));
+                }
+                if !state.saw_done && state.finish_reason.is_none() {
+                    state.finished = true;
+                    return Some(Err(incomplete_stream_eof_error(
+                        "Chat Completions stream ended before [DONE] or finish_reason",
+                        &state.answer,
+                    )));
+                }
+                state.finished = true;
+                return Some(Ok(LlmStreamEvent::Completed {
+                    usage: state.usage.clone(),
+                    finish_reason: state.finish_reason.clone(),
+                    fallback_used: false,
+                }));
+            }
+            Err(err) => {
+                return Some(Err(stream_transport_error(
+                    format!("Chat Completions stream failed: {err}"),
+                    &state.answer,
+                )));
+            }
+        }
+    }
 }
 
 fn extract_chat_completion_text(body: &Value) -> Option<String> {
@@ -561,6 +677,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chat_completion_requires_done_after_delta() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n".to_owned();
+        let (base_url, _state) = spawn_mock_chat(vec![body], StatusCode::OK).await;
+        let client =
+            ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
+
+        let err = stream_completion(
+            &client,
+            "openai",
+            "gpt-test",
+            1200,
+            &[ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.stage, "stream_after_delta");
+        assert!(err.message.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_completion_accepts_finish_reason_without_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"好\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .to_owned();
+        let (base_url, _state) = spawn_mock_chat(vec![body], StatusCode::OK).await;
+        let client =
+            ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
+
+        let outcome = stream_completion(
+            &client,
+            "openai",
+            "gpt-test",
+            1200,
+            &[ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.reply, "你好");
+    }
+
+    #[tokio::test]
     async fn empty_stream_retries_non_stream() {
         let (base_url, state) = spawn_mock_chat(
             vec![
@@ -586,6 +747,71 @@ mod tests {
 
         assert_eq!(outcome.reply, "retry ok");
         assert_eq!(state.lock().await.requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_stream_fallback_retries_non_stream_after_stream_parse_error() {
+        let (base_url, state) = spawn_mock_chat(
+            vec![
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n",
+                    "data: {not-json}\n\n",
+                )
+                .to_owned(),
+                json!({"choices": [{"message": {"content": "non stream ok"}}]}).to_string(),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        let client =
+            ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
+
+        let outcome = chat_completions_with_stream_fallback(
+            true,
+            &client,
+            "openai",
+            "gpt-test",
+            1200,
+            &[ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.reply, "non stream ok");
+        let requests = &state.lock().await.requests;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], true);
+        assert!(requests[1].get("stream").is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_stream_chat_does_not_retry_non_stream_after_delta_error() {
+        let (base_url, state) = spawn_mock_chat(
+            vec![
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n",
+                    "data: {not-json}\n\n",
+                )
+                .to_owned(),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        let client =
+            ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
+
+        let err = stream_completion(
+            &client,
+            "openai",
+            "gpt-test",
+            1200,
+            &[ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.stage, "sse");
+        assert_eq!(state.lock().await.requests.len(), 1);
     }
 
     #[tokio::test]

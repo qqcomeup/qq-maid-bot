@@ -279,6 +279,32 @@ impl SessionStore {
         self.save_unlocked(&mut conn, session, true)
     }
 
+    /// 仅当当前标题仍为预期旧标题时更新标题，不回写会话历史或其他状态。
+    ///
+    /// 后台自动标题会基于某一时刻的会话快照生成结果；这里必须用条件更新，
+    /// 避免旧快照通过 `save` 覆盖后续聊天写入的消息、pending 或手工重命名。
+    pub fn update_title_if_current(
+        &self,
+        session_id: &str,
+        expected_title: &str,
+        new_title: &str,
+    ) -> Result<bool, SessionError> {
+        let title = normalize_session_title(new_title);
+        let now = now_iso_cn();
+        let conn = self.connection()?;
+        let changed = conn
+            .execute(
+                "UPDATE sessions
+                 SET title = ?1,
+                     updated_at = ?2
+                 WHERE session_id = ?3
+                   AND title = ?4",
+                params![title, now, session_id, expected_title],
+            )
+            .map_err(SessionError::from_sql)?;
+        Ok(changed > 0)
+    }
+
     /// 将指定会话设为某个作用域的活跃会话。
     pub fn set_active_session_id(
         &self,
@@ -1060,6 +1086,57 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|items| items.len() == 1)
         );
+    }
+
+    #[test]
+    fn update_title_if_current_preserves_newer_session_data() {
+        let store = test_store();
+        let meta = test_meta();
+        let mut snapshot = store.create(&meta, "", true).unwrap();
+        snapshot.append_message("user", "第二轮问题");
+        snapshot.append_message("assistant", "第二轮回复");
+        store.save(&mut snapshot).unwrap();
+
+        let mut current = store.get_or_create_active(&meta).unwrap();
+        current.append_message("user", "第三轮问题");
+        current.summary = "后续摘要".to_owned();
+        store.save(&mut current).unwrap();
+
+        let updated = store
+            .update_title_if_current(&snapshot.session_id, DEFAULT_SESSION_TITLE, "后台标题")
+            .unwrap();
+        let reloaded = store.get_or_create_active(&meta).unwrap();
+
+        assert!(updated);
+        assert_eq!(reloaded.title, "后台标题");
+        assert_eq!(reloaded.summary, "后续摘要");
+        assert_eq!(
+            reloaded
+                .history
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["第二轮问题", "第二轮回复", "第三轮问题"]
+        );
+    }
+
+    #[test]
+    fn update_title_if_current_skips_after_manual_rename() {
+        let store = test_store();
+        let meta = test_meta();
+        let session = store.create(&meta, "", true).unwrap();
+
+        let mut renamed = store.get_or_create_active(&meta).unwrap();
+        renamed.title = "手工标题".to_owned();
+        store.save(&mut renamed).unwrap();
+
+        let updated = store
+            .update_title_if_current(&session.session_id, DEFAULT_SESSION_TITLE, "后台标题")
+            .unwrap();
+        let reloaded = store.get_or_create_active(&meta).unwrap();
+
+        assert!(!updated);
+        assert_eq!(reloaded.title, "手工标题");
     }
 
     #[test]

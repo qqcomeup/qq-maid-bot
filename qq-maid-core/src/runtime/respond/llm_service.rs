@@ -12,14 +12,19 @@ use std::env;
 use async_trait::async_trait;
 use regex::Regex;
 
+use futures::StreamExt;
+
 use crate::{
     error::LlmError,
     provider::{
-        ChatOutcome, DynLlmProvider,
+        ChatOutcome, DynLlmProvider, LlmStreamEvent,
         types::{ChatMessage, ChatRequest, ChatRole},
     },
     runtime::session::redact_sensitive_text,
-    util::time_context::{RequestTimeContext, request_time_context},
+    util::{
+        metrics::MetricsRecorder,
+        time_context::{RequestTimeContext, request_time_context},
+    },
 };
 
 use super::{
@@ -67,6 +72,77 @@ impl LlmChatService {
     pub fn new(provider: DynLlmProvider) -> Self {
         Self { provider }
     }
+
+    /// 消费 provider 真流式输出，并把同一条流的非空 delta 交给上层转发。
+    ///
+    /// 最终正文只由本次 stream 的 delta 聚合得到；这里不做任何二次模型调用。
+    pub async fn stream_respond<F, Fut>(
+        &self,
+        req: RespondRequest,
+        mut on_delta: F,
+    ) -> Result<RespondOutput, LlmError>
+    where
+        F: FnMut(String) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), LlmError>> + Send,
+    {
+        let messages = build_respond_messages(&req);
+        trace_chat_messages(&req, &messages);
+        let chat_req = ChatRequest {
+            session_id: req.session_id.clone(),
+            model: req.model.clone(),
+            messages,
+            metadata: req.metadata.clone(),
+        };
+        let mut stream = self.provider.stream_chat(chat_req).await?;
+        let mut recorder = MetricsRecorder::start();
+        let mut raw_reply = String::new();
+        let mut usage = None;
+        let mut completed = false;
+        let mut fallback_used = false;
+        while let Some(event) = stream.next().await {
+            match event? {
+                LlmStreamEvent::TextDelta(delta) => {
+                    recorder.mark_event();
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    recorder.mark_token();
+                    raw_reply.push_str(&delta);
+                    on_delta(delta).await?;
+                }
+                LlmStreamEvent::Completed {
+                    usage: event_usage,
+                    fallback_used: event_fallback_used,
+                    ..
+                } => {
+                    if completed {
+                        return Err(LlmError::provider(
+                            "LLM stream produced multiple completion events",
+                            "stream",
+                        ));
+                    }
+                    completed = true;
+                    usage = event_usage;
+                    fallback_used |= event_fallback_used;
+                }
+            }
+        }
+        if !completed {
+            return Err(LlmError::provider(
+                "LLM stream ended without completion event",
+                "stream",
+            ));
+        }
+        let raw_reply = raw_reply.trim().to_owned();
+        let outcome = ChatOutcome {
+            reply: raw_reply.clone(),
+            metrics: recorder.finish(self.provider.name(), self.provider.model(), true),
+            usage,
+            fallback_used,
+        };
+        log_llm_request_completed(&req, &outcome);
+        output_from_raw_reply(&req, raw_reply, outcome)
+    }
 }
 
 #[async_trait]
@@ -83,48 +159,56 @@ impl ChatService for LlmChatService {
         let outcome = self.provider.chat(chat_req).await?;
         log_llm_request_completed(&req, &outcome);
         let raw_reply = outcome.reply.trim().to_owned();
-        trace_chat_raw_reply(&req, &raw_reply);
-        let (reply, text, markdown) = match req.purpose {
-            RespondPurpose::Chat => {
-                if raw_reply.is_empty() {
-                    (
-                        "唔，小女仆刚刚没整理出可用回复。可以再戳我一次。".to_owned(),
-                        "唔，小女仆刚刚没整理出可用回复。可以再戳我一次。".to_owned(),
-                        None,
-                    )
-                } else {
-                    let (text, markdown) = format_chat_reply_channels(&raw_reply);
-                    let reply = markdown.clone().unwrap_or_else(|| text.clone());
-                    (reply, text, markdown)
-                }
-            }
-            RespondPurpose::MemoryDraft if is_structured_memory_draft(&req) => {
-                let reply = raw_reply.clone();
-                (reply.clone(), reply, None)
-            }
-            RespondPurpose::MemoryDraft => {
-                let reply = clean_memory_draft_output(&raw_reply);
-                (reply.clone(), reply, None)
-            }
-            RespondPurpose::TodoParse => {
-                let reply = raw_reply.clone();
-                (reply.clone(), reply, None)
-            }
-            RespondPurpose::Compact => {
-                let reply = raw_reply.clone();
-                (reply.clone(), reply, None)
-            }
-        };
-        trace_chat_final_reply(&req, &text);
-        let chat = ChatResponse::ok(raw_reply.clone(), outcome.metrics, outcome.usage);
-
-        Ok(RespondOutput {
-            reply,
-            text,
-            markdown,
-            chat,
-        })
+        output_from_raw_reply(&req, raw_reply, outcome)
     }
+}
+
+fn output_from_raw_reply(
+    req: &RespondRequest,
+    raw_reply: String,
+    outcome: ChatOutcome,
+) -> Result<RespondOutput, LlmError> {
+    trace_chat_raw_reply(req, &raw_reply);
+    let (reply, text, markdown) = match req.purpose {
+        RespondPurpose::Chat => {
+            if raw_reply.is_empty() {
+                (
+                    "唔，小女仆刚刚没整理出可用回复。可以再戳我一次。".to_owned(),
+                    "唔，小女仆刚刚没整理出可用回复。可以再戳我一次。".to_owned(),
+                    None,
+                )
+            } else {
+                let (text, markdown) = format_chat_reply_channels(&raw_reply);
+                let reply = markdown.clone().unwrap_or_else(|| text.clone());
+                (reply, text, markdown)
+            }
+        }
+        RespondPurpose::MemoryDraft if is_structured_memory_draft(req) => {
+            let reply = raw_reply.clone();
+            (reply.clone(), reply, None)
+        }
+        RespondPurpose::MemoryDraft => {
+            let reply = clean_memory_draft_output(&raw_reply);
+            (reply.clone(), reply, None)
+        }
+        RespondPurpose::TodoParse => {
+            let reply = raw_reply.clone();
+            (reply.clone(), reply, None)
+        }
+        RespondPurpose::Compact => {
+            let reply = raw_reply.clone();
+            (reply.clone(), reply, None)
+        }
+    };
+    trace_chat_final_reply(req, &text);
+    let chat = ChatResponse::ok(raw_reply.clone(), outcome.metrics, outcome.usage);
+
+    Ok(RespondOutput {
+        reply,
+        text,
+        markdown,
+        chat,
+    })
 }
 
 /// 在请求完成后记录统一的脱敏结构化摘要，便于观察真实 token usage 与缓存命中。

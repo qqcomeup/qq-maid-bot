@@ -2,7 +2,10 @@
 //! 负责解析 `/查` `/查询` `/search` 等指令，调用查询执行器进行联网搜索，
 //! 并格式化搜索结果回复。同时处理超时、配置缺失、上游异常等错误场景。
 
+use std::{future::Future, pin::Pin};
+
 use serde_json::json;
+use tokio::sync::mpsc;
 
 use crate::{
     error::LlmError,
@@ -122,6 +125,99 @@ impl RustRespondService {
             false,
         );
         Ok(response)
+    }
+
+    /// `/查` 真流式路径：只消费执行器的 `query_stream`，不退回完整 `query()` 伪增量。
+    pub async fn handle_web_search_command_stream<F>(
+        &self,
+        command: ParsedCommand,
+        session: &mut SessionRecord,
+        mut on_delta: F,
+    ) -> Result<RespondResponse, LlmError>
+    where
+        F: FnMut(String) -> Pin<Box<dyn Future<Output = Result<(), LlmError>> + Send>> + Send,
+    {
+        let query = command.argument.trim();
+        if query.is_empty() {
+            return Ok(command_response(
+                WEB_SEARCH_USAGE_REPLY,
+                Some(session.session_id.clone()),
+                Some(command.action),
+            ));
+        }
+        if query.chars().count() > WEB_SEARCH_QUERY_MAX_LENGTH {
+            return Ok(command_response(
+                WEB_SEARCH_TOO_LONG_REPLY,
+                Some(session.session_id.clone()),
+                Some(command.action),
+            ));
+        }
+
+        let command_text = format!("/{} {}", command.raw_command, command.argument);
+        let (delta_tx, mut delta_rx) = mpsc::channel(16);
+        let query_executor = self.query_executor.clone();
+        let query_req = QueryRequest {
+            query: query.to_owned(),
+            raw_question: Some(command_text.clone()),
+            max_results: None,
+            context_size: None,
+        };
+        let query_task =
+            tokio::spawn(async move { query_executor.query_stream(query_req, delta_tx).await });
+        while let Some(delta) = delta_rx.recv().await {
+            if !delta.is_empty()
+                && let Err(err) = on_delta(delta).await
+            {
+                // 接收方取消时必须停止继续 poll provider stream，而不是只停止转发。
+                query_task.abort();
+                return Err(err);
+            }
+        }
+        let outcome = match query_task.await.map_err(|err| {
+            LlmError::provider(format!("web search stream task failed: {err}"), "internal")
+        })? {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!(
+                    error_code = err.code,
+                    error_stage = err.stage,
+                    query_provider = self.query_executor.provider_name(),
+                    "web search stream command failed"
+                );
+                let reply = format_web_search_error_reply(&err);
+                self.session_store
+                    .append_exchange(session, &command_text, &reply)
+                    .map_err(session_error)?;
+
+                let response = build_web_search_response(
+                    session.session_id.clone(),
+                    command.action.clone(),
+                    reply,
+                    self.query_executor.provider_name().to_owned(),
+                    Some(err.code.clone()),
+                    Some(err.stage.clone()),
+                    true,
+                );
+                return Ok(response);
+            }
+        };
+        let reply = if outcome.answer.trim().is_empty() {
+            WEB_SEARCH_EMPTY_RESULT_REPLY.to_owned()
+        } else {
+            format_web_search_command_reply(&outcome.answer)
+        };
+        self.session_store
+            .append_exchange(session, &command_text, &reply)
+            .map_err(session_error)?;
+
+        Ok(build_web_search_success_response(
+            session.session_id.clone(),
+            command.action,
+            reply,
+            outcome.provider,
+            outcome.elapsed_ms,
+            true,
+        ))
     }
 }
 

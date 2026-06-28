@@ -301,10 +301,11 @@ impl WebSearchExecutor for OpenAiWebSearchExecutor {
         let mut frame_buffer = Vec::new();
         let mut answer = String::new();
         let mut completed_response: Option<Value> = None;
+        let mut saw_completed = false;
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|err| LlmError::http(format!("OpenAI web query stream failed: {err}")))?
+            .map_err(|err| web_search_stream_transport_error(err, &answer))?
         {
             frame_buffer.extend_from_slice(&chunk);
             while let Some(frame) = take_sse_frame(&mut frame_buffer) {
@@ -315,6 +316,7 @@ impl WebSearchExecutor for OpenAiWebSearchExecutor {
                     event,
                     &mut answer,
                     &mut completed_response,
+                    &mut saw_completed,
                     &delta_tx,
                 )
                 .await?;
@@ -327,9 +329,14 @@ impl WebSearchExecutor for OpenAiWebSearchExecutor {
                 event,
                 &mut answer,
                 &mut completed_response,
+                &mut saw_completed,
                 &delta_tx,
             )
             .await?;
+        }
+
+        if !saw_completed {
+            return Err(web_search_incomplete_eof_error(&answer));
         }
 
         if answer.trim().is_empty()
@@ -470,6 +477,7 @@ async fn handle_openai_web_search_stream_event(
     event: SseFrame,
     answer: &mut String,
     completed_response: &mut Option<Value>,
+    saw_completed: &mut bool,
     delta_tx: &mpsc::Sender<String>,
 ) -> Result<(), LlmError> {
     let value = serde_json::from_str::<Value>(&event.data)
@@ -490,6 +498,7 @@ async fn handle_openai_web_search_stream_event(
             }
         }
         "response.completed" => {
+            *saw_completed = true;
             *completed_response = value
                 .get("response")
                 .cloned()
@@ -504,6 +513,31 @@ async fn handle_openai_web_search_stream_event(
     }
 
     Ok(())
+}
+
+fn web_search_incomplete_eof_error(answer: &str) -> LlmError {
+    let stage = if answer.trim().is_empty() {
+        "stream"
+    } else {
+        "stream_after_delta"
+    };
+    LlmError::provider(
+        "OpenAI web query stream ended before response.completed",
+        stage,
+    )
+}
+
+fn web_search_stream_transport_error(err: reqwest::Error, answer: &str) -> LlmError {
+    let stage = if answer.trim().is_empty() {
+        "http"
+    } else {
+        "stream_after_delta"
+    };
+    LlmError::new(
+        "http_error",
+        format!("OpenAI web query stream failed: {err}"),
+        stage,
+    )
 }
 
 fn stream_error_message(value: &Value) -> Option<String> {
@@ -677,7 +711,17 @@ fn collect_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        extract::State,
+        http::{StatusCode, header},
+        response::IntoResponse,
+        routing::post,
+    };
     use chrono::{FixedOffset, TimeZone};
+    use std::sync::Arc;
+    use tokio::{net::TcpListener, sync::Mutex};
 
     fn fixed_time_context() -> RequestTimeContext {
         let offset = FixedOffset::east_opt(8 * 60 * 60).unwrap();
@@ -751,6 +795,110 @@ mod tests {
 
         assert_eq!(parsed.event.as_deref(), Some("response.output_text.delta"));
         assert!(parsed.data.contains("你好"));
+    }
+
+    #[derive(Debug)]
+    struct MockSearchState {
+        body: String,
+        requests: Vec<Value>,
+    }
+
+    async fn mock_search_handler(
+        State(state): State<Arc<Mutex<MockSearchState>>>,
+        body: Body,
+    ) -> impl IntoResponse {
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut state = state.lock().await;
+        state.requests.push(request);
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            state.body.clone(),
+        )
+    }
+
+    async fn spawn_mock_search(body: String) -> (String, Arc<Mutex<MockSearchState>>) {
+        let state = Arc::new(Mutex::new(MockSearchState {
+            body,
+            requests: Vec::new(),
+        }));
+        let app = Router::new()
+            .route("/v1/responses", post(mock_search_handler))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1"), state)
+    }
+
+    #[tokio::test]
+    async fn query_stream_emits_real_sse_deltas_before_completion() {
+        let body = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"你\"}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"好\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"你好\",\"output\":[]}}\n\n",
+        )
+        .to_owned();
+        let (base_url, state) = spawn_mock_search(body).await;
+        let executor = OpenAiWebSearchExecutor {
+            client: reqwest::Client::new(),
+            api_key: "test-key".to_owned(),
+            base_url: Some(base_url),
+            search_model: "gpt-search".to_owned(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::channel(4);
+
+        let outcome = executor
+            .query_stream(
+                WebSearchRequest {
+                    query: "测试".to_owned(),
+                    raw_question: Some("/查 测试".to_owned()),
+                    max_results: None,
+                    context_size: None,
+                },
+                delta_tx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(delta_rx.recv().await.as_deref(), Some("你"));
+        assert_eq!(delta_rx.recv().await.as_deref(), Some("好"));
+        assert!(delta_rx.recv().await.is_none());
+        assert_eq!(outcome.answer, "你好");
+        assert_eq!(state.lock().await.requests[0]["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn query_stream_rejects_partial_delta_without_completed() {
+        let body = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"半截\"}\n\n"
+            .to_owned();
+        let (base_url, _state) = spawn_mock_search(body).await;
+        let executor = OpenAiWebSearchExecutor {
+            client: reqwest::Client::new(),
+            api_key: "test-key".to_owned(),
+            base_url: Some(base_url),
+            search_model: "gpt-search".to_owned(),
+        };
+        let (delta_tx, _delta_rx) = mpsc::channel(4);
+
+        let err = executor
+            .query_stream(
+                WebSearchRequest {
+                    query: "测试".to_owned(),
+                    raw_question: Some("/查 测试".to_owned()),
+                    max_results: None,
+                    context_size: None,
+                },
+                delta_tx,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.stage, "stream_after_delta");
+        assert!(err.message.contains("response.completed"));
     }
 
     #[test]

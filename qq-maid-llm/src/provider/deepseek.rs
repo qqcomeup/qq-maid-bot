@@ -11,8 +11,11 @@ use crate::{
     config::LlmConfig,
     error::LlmError,
     provider::{
-        ChatOutcome, LlmProvider,
-        openai::{ChatCompletionsClient, chat_completions_with_stream_fallback},
+        ChatOutcome, LlmProvider, LlmStream,
+        openai::{
+            ChatCompletionsClient, chat_completions_stream, chat_completions_with_stream_fallback,
+        },
+        outcome_to_stream,
         types::{ChatRequest, ModelId, ModelProvider},
     },
 };
@@ -72,6 +75,31 @@ impl LlmProvider for DeepSeekProvider {
         .await
     }
 
+    async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+        let effective_model = effective_deepseek_model(req.model.as_deref(), &self.model)?;
+        if !self.stream {
+            let outcome = chat_completions_with_stream_fallback(
+                false,
+                &self.client,
+                self.name(),
+                &effective_model,
+                self.max_output_tokens,
+                &req.messages,
+            )
+            .await?;
+            return Ok(outcome_to_stream(outcome));
+        }
+        chat_completions_stream(
+            &self.client,
+            self.name(),
+            &effective_model,
+            self.max_output_tokens,
+            &req.messages,
+            true,
+        )
+        .await
+    }
+
     fn name(&self) -> &'static str {
         "deepseek"
     }
@@ -118,6 +146,56 @@ fn effective_deepseek_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        extract::State,
+        http::{StatusCode, header},
+        response::IntoResponse,
+        routing::post,
+    };
+    use futures::StreamExt;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tokio::{net::TcpListener, sync::Mutex};
+
+    #[derive(Debug)]
+    struct MockChatState {
+        bodies: Vec<String>,
+        requests: Vec<Value>,
+    }
+
+    async fn mock_chat_handler(
+        State(state): State<Arc<Mutex<MockChatState>>>,
+        body: Body,
+    ) -> impl IntoResponse {
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut state = state.lock().await;
+        state.requests.push(request);
+        let body = state.bodies.remove(0);
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+    }
+
+    async fn spawn_mock_chat(bodies: Vec<String>) -> (String, Arc<Mutex<MockChatState>>) {
+        let state = Arc::new(Mutex::new(MockChatState {
+            bodies,
+            requests: Vec::new(),
+        }));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_chat_handler))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), state)
+    }
 
     #[test]
     fn effective_deepseek_model_strips_deepseek_prefix() {
@@ -139,5 +217,67 @@ mod tests {
     fn effective_deepseek_model_rejects_openai_prefix() {
         let err = effective_deepseek_model(Some("openai:gpt-5-mini"), "default").unwrap_err();
         assert_eq!(err.code, "bad_request");
+    }
+
+    #[tokio::test]
+    async fn chat_retries_non_stream_after_empty_sse_when_stream_enabled() {
+        let (base_url, state) = spawn_mock_chat(vec![
+            "data: [DONE]\n\n".to_owned(),
+            json!({"choices": [{"message": {"content": "deepseek non-stream"}}]}).to_string(),
+        ])
+        .await;
+        let provider = DeepSeekProvider {
+            client: ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new()),
+            model: "deepseek-chat".to_owned(),
+            stream: true,
+            max_output_tokens: 1200,
+        };
+
+        let outcome = provider
+            .chat(ChatRequest {
+                session_id: "s".to_owned(),
+                model: None,
+                messages: vec![crate::provider::types::ChatMessage::user("hi")],
+                metadata: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.reply, "deepseek non-stream");
+        let requests = &state.lock().await.requests;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], true);
+        assert!(requests[1].get("stream").is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_after_delta_error_does_not_retry_non_stream() {
+        let (base_url, state) = spawn_mock_chat(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\ndata: {not-json}\n\n"
+                .to_owned(),
+        ])
+        .await;
+        let provider = DeepSeekProvider {
+            client: ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new()),
+            model: "deepseek-chat".to_owned(),
+            stream: true,
+            max_output_tokens: 1200,
+        };
+
+        let mut stream = provider
+            .stream_chat(ChatRequest {
+                session_id: "s".to_owned(),
+                model: None,
+                messages: vec![crate::provider::types::ChatMessage::user("hi")],
+                metadata: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(crate::provider::LlmStreamEvent::TextDelta(_)))
+        ));
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(state.lock().await.requests.len(), 1);
     }
 }

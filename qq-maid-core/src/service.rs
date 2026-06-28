@@ -173,9 +173,16 @@ impl CoreService for CoreHandle {
         let scope_key = req.scope_key.clone();
         let state = self.state.as_ref();
         if should_stream {
+            let provider_stream_enabled = state.provider.stream_enabled();
             let result = timeout(
                 Duration::from_secs(state.config.request_timeout_seconds),
-                async { Ok::<_, LlmError>(start_core_response_stream(service, req)) },
+                async {
+                    Ok::<_, LlmError>(start_core_response_stream(
+                        service,
+                        req,
+                        provider_stream_enabled,
+                    ))
+                },
             )
             .await;
             return match result {
@@ -307,6 +314,7 @@ impl Drop for CoreResponseStream {
 fn start_core_response_stream(
     service: RustRespondService,
     req: RespondRequest,
+    provider_stream_enabled: bool,
 ) -> CoreResponseStream {
     let (tx, receiver) = mpsc::channel(16);
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -319,7 +327,14 @@ fn start_core_response_stream(
                 .await;
             return;
         }
-        let result = service.respond(req).await;
+        let result = run_streaming_respond(
+            &service,
+            req,
+            tx.clone(),
+            producer_cancelled.clone(),
+            provider_stream_enabled,
+        )
+        .await;
         if producer_cancelled.load(Ordering::SeqCst) {
             return;
         }
@@ -350,6 +365,51 @@ fn start_core_response_stream(
         receiver,
         cancelled,
     }
+}
+
+async fn run_streaming_respond(
+    service: &RustRespondService,
+    req: RespondRequest,
+    tx: mpsc::Sender<CoreResponseEvent>,
+    cancelled: Arc<AtomicBool>,
+    provider_stream_enabled: bool,
+) -> Result<RespondResponse, LlmError> {
+    if !provider_stream_enabled {
+        let response = service.respond(req).await?;
+        // provider 流式关闭时仍维持 Core/Gateway 的进程内流契约；
+        // 这里合成单个 delta，但上游请求保持原有非 SSE 行为。
+        if response.ok
+            && let Some(delta) = response
+                .markdown
+                .as_deref()
+                .or(response.text.as_deref())
+                .map(str::to_owned)
+                .filter(|value| !value.trim().is_empty())
+        {
+            send_core_delta(&tx, &cancelled, delta).await?;
+        }
+        return Ok(response);
+    }
+    service
+        .respond_stream(req, |delta| {
+            let tx = tx.clone();
+            let cancelled = cancelled.clone();
+            Box::pin(async move { send_core_delta(&tx, &cancelled, delta).await })
+        })
+        .await
+}
+
+async fn send_core_delta(
+    tx: &mpsc::Sender<CoreResponseEvent>,
+    cancelled: &Arc<AtomicBool>,
+    delta: String,
+) -> Result<(), LlmError> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(LlmError::new("cancelled", "stream cancelled", "stream"));
+    }
+    tx.send(CoreResponseEvent::TextDelta(delta))
+        .await
+        .map_err(|_| LlmError::new("cancelled", "stream receiver dropped", "stream"))
 }
 
 fn should_stream_respond(req: &RespondRequest) -> bool {
@@ -566,7 +626,7 @@ mod tests {
             DailyReminderTime, OpenAiApiMode, ProviderMode,
         },
         provider::{
-            ChatOutcome, LlmProvider,
+            ChatOutcome, LlmProvider, LlmStream, LlmStreamEvent,
             status::{UpstreamStatus, observe_provider},
             types::{ModelRoute, TokenUsage},
         },
@@ -702,6 +762,71 @@ mod tests {
         assert_eq!(response.text.as_deref(), Some("late"));
     }
 
+    #[tokio::test]
+    async fn chat_stream_forwards_text_delta_and_completed_from_same_stream() {
+        let provider = TestProvider::streaming(vec![
+            Ok(LlmStreamEvent::TextDelta("你".to_owned())),
+            Ok(LlmStreamEvent::TextDelta("好".to_owned())),
+            Ok(LlmStreamEvent::Completed {
+                usage: None,
+                finish_reason: None,
+                fallback_used: false,
+            }),
+        ]);
+        let state = test_state(provider.clone(), 5);
+        let session_store = state.session_store.clone();
+        let service = CoreHandle::new(state);
+        let CoreRespondOutput::Stream(mut stream) =
+            service.respond(private_request("hello")).await.unwrap()
+        else {
+            panic!("expected stream output");
+        };
+
+        assert_eq!(
+            stream.recv().await,
+            Some(CoreResponseEvent::TextDelta("你".to_owned()))
+        );
+        assert_eq!(
+            stream.recv().await,
+            Some(CoreResponseEvent::TextDelta("好".to_owned()))
+        );
+        let Some(CoreResponseEvent::Completed(response)) = stream.recv().await else {
+            panic!("expected completed response");
+        };
+
+        assert_eq!(response.text.as_deref(), Some("你好"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let sessions = session_store.list_for_scope("private:u1", None).unwrap();
+        assert_eq!(sessions[0].history.last().unwrap().content, "你好");
+    }
+
+    #[tokio::test]
+    async fn stream_disabled_chat_is_wrapped_as_process_stream() {
+        let provider = TestProvider::replying("非流完整回复");
+        let state = test_state(provider.clone(), 5);
+        let service = CoreHandle::new(state);
+        let CoreRespondOutput::Stream(mut stream) =
+            service.respond(private_request("hello")).await.unwrap()
+        else {
+            panic!("expected stream output");
+        };
+
+        assert_eq!(
+            stream.recv().await,
+            Some(CoreResponseEvent::TextDelta("非流完整回复".to_owned()))
+        );
+        let Some(CoreResponseEvent::Completed(response)) = stream.recv().await else {
+            panic!("expected completed response");
+        };
+
+        assert_eq!(response.text.as_deref(), Some("非流完整回复"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.requests()[0].metadata.get("purpose").unwrap(),
+            "chat"
+        );
+    }
+
     async fn collect_stream_failure(
         output: Result<CoreRespondOutput, CoreError>,
     ) -> CoreRespondFailure {
@@ -733,6 +858,7 @@ mod tests {
     #[derive(Clone)]
     enum ProviderBehavior {
         Reply(String),
+        Stream(Vec<Result<LlmStreamEvent, LlmError>>),
         Error(LlmError),
         Delayed { reply: String, delay: Duration },
     }
@@ -742,6 +868,7 @@ mod tests {
         behavior: ProviderBehavior,
         requests: Arc<Mutex<Vec<ChatRequest>>>,
         calls: Arc<AtomicUsize>,
+        stream_enabled: bool,
     }
 
     impl TestProvider {
@@ -751,6 +878,10 @@ mod tests {
 
         fn failing(error: LlmError) -> Self {
             Self::new(ProviderBehavior::Error(error))
+        }
+
+        fn streaming(events: Vec<Result<LlmStreamEvent, LlmError>>) -> Self {
+            Self::new(ProviderBehavior::Stream(events)).with_stream_enabled(true)
         }
 
         fn delayed(reply: &str, delay: Duration) -> Self {
@@ -765,7 +896,13 @@ mod tests {
                 behavior,
                 requests: Arc::new(Mutex::new(Vec::new())),
                 calls: Arc::new(AtomicUsize::new(0)),
+                stream_enabled: false,
             }
+        }
+
+        fn with_stream_enabled(mut self, enabled: bool) -> Self {
+            self.stream_enabled = enabled;
+            self
         }
 
         fn requests(&self) -> Vec<ChatRequest> {
@@ -780,10 +917,66 @@ mod tests {
             self.requests.lock().unwrap().push(req);
             match &self.behavior {
                 ProviderBehavior::Reply(reply) => Ok(chat_outcome(reply)),
+                ProviderBehavior::Stream(events) => {
+                    let reply = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            Ok(LlmStreamEvent::TextDelta(delta)) => Some(delta.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    Ok(chat_outcome(&reply))
+                }
                 ProviderBehavior::Error(error) => Err(error.clone()),
                 ProviderBehavior::Delayed { reply, delay } => {
                     tokio::time::sleep(*delay).await;
                     Ok(chat_outcome(reply))
+                }
+            }
+        }
+
+        async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(req);
+            match &self.behavior {
+                ProviderBehavior::Reply(reply) => Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(LlmStreamEvent::TextDelta(reply.clone())),
+                    Ok(LlmStreamEvent::Completed {
+                        usage: None,
+                        finish_reason: None,
+                        fallback_used: false,
+                    }),
+                ]))),
+                ProviderBehavior::Stream(events) => {
+                    Ok(Box::pin(futures::stream::iter(events.to_vec())))
+                }
+                ProviderBehavior::Error(error) => Err(error.clone()),
+                ProviderBehavior::Delayed { reply, delay } => {
+                    let reply = reply.clone();
+                    let delay = *delay;
+                    Ok(Box::pin(futures::stream::unfold(
+                        (0_u8, reply, delay),
+                        |(state, reply, delay)| async move {
+                            if state == 0 {
+                                tokio::time::sleep(delay).await;
+                                return Some((
+                                    Ok(LlmStreamEvent::TextDelta(reply)),
+                                    (1, String::new(), delay),
+                                ));
+                            }
+                            if state == 1 {
+                                return Some((
+                                    Ok(LlmStreamEvent::Completed {
+                                        usage: None,
+                                        finish_reason: None,
+                                        fallback_used: false,
+                                    }),
+                                    (2, String::new(), delay),
+                                ));
+                            }
+                            None
+                        },
+                    )))
                 }
             }
         }
@@ -797,7 +990,7 @@ mod tests {
         }
 
         fn stream_enabled(&self) -> bool {
-            false
+            self.stream_enabled
         }
     }
 
