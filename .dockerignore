@@ -1,0 +1,13 @@
+.git
+.github
+target
+dist
+runtime/data
+runtime/logs
+runtime/run
+runtime/config/.env
+runtime/config/member_id_mapping.json
+*.db
+*.sqlite
+*.sqlite3
+*.pid
