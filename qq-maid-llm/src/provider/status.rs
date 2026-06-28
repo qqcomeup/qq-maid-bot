@@ -11,6 +11,7 @@ use qq_maid_common::time_context::now_unix_seconds_marker;
 use serde::Serialize;
 
 use crate::error::LlmError;
+use crate::metrics::MetricsRecorder;
 
 use super::{
     ChatOutcome, DynLlmProvider, LlmProvider, LlmStream, LlmStreamEvent, types::ChatRequest,
@@ -194,6 +195,7 @@ impl LlmProvider for ObservedProvider {
                 reply: String::new(),
                 usage: None,
                 fallback_used: false,
+                recorder: MetricsRecorder::start(),
                 completed: false,
                 done: false,
             },
@@ -226,6 +228,7 @@ struct ObservedStreamState {
     reply: String,
     usage: Option<super::types::TokenUsage>,
     fallback_used: bool,
+    recorder: MetricsRecorder,
     completed: bool,
     done: bool,
 }
@@ -238,6 +241,10 @@ async fn next_observed_stream_event(
     }
     match state.inner.next().await {
         Some(Ok(LlmStreamEvent::TextDelta(delta))) => {
+            state.recorder.mark_event();
+            if !delta.is_empty() {
+                state.recorder.mark_token();
+            }
             state.reply.push_str(&delta);
             Some(Ok(LlmStreamEvent::TextDelta(delta)))
         }
@@ -249,16 +256,10 @@ async fn next_observed_stream_event(
             state.usage = usage.clone();
             state.fallback_used |= fallback_used;
             state.completed = true;
+            let recorder = std::mem::replace(&mut state.recorder, MetricsRecorder::start());
             let outcome = ChatOutcome {
                 reply: state.reply.clone(),
-                metrics: crate::metrics::LlmMetrics {
-                    provider: state.provider_name.clone(),
-                    model: state.model.clone(),
-                    stream: true,
-                    ttfe_ms: None,
-                    ttft_ms: None,
-                    total_latency_ms: 0,
-                },
+                metrics: recorder.finish(&state.provider_name, &state.model, true),
                 usage: state.usage.clone(),
                 fallback_used: state.fallback_used,
             };

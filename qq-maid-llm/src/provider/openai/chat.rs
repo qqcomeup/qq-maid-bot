@@ -21,6 +21,7 @@ use crate::{
 use super::fallback::{
     should_retry_non_stream_after_empty_stream, should_retry_non_stream_after_stream_error,
 };
+use super::responses::{incomplete_stream_eof_error, stream_transport_error};
 
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -292,6 +293,8 @@ pub(crate) async fn chat_completions_stream(
             usage,
             pending_events: VecDeque::new(),
             allow_completed_message_fallback,
+            saw_done: false,
+            finish_reason: None,
             finished: false,
         },
         |mut state| async move {
@@ -307,7 +310,7 @@ fn handle_chat_stream_event(
     answer: &mut String,
     final_message: &mut String,
     usage: &mut Option<TokenUsage>,
-) -> Result<Vec<LlmStreamEvent>, LlmError> {
+) -> Result<(Vec<LlmStreamEvent>, Option<String>), LlmError> {
     let value = serde_json::from_str::<Value>(data).map_err(|err| {
         LlmError::provider(
             format!("invalid Chat Completions stream JSON: {err}"),
@@ -319,8 +322,9 @@ fn handle_chat_stream_event(
     }
     let mut events = Vec::new();
     let Some(choices) = value.get("choices").and_then(Value::as_array) else {
-        return Ok(events);
+        return Ok((events, None));
     };
+    let mut finish_reason = None;
     for choice in choices {
         if let Some(delta) = choice
             .get("delta")
@@ -338,8 +342,13 @@ fn handle_chat_stream_event(
         {
             final_message.push_str(&message);
         }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+            && !reason.trim().is_empty()
+        {
+            finish_reason = Some(reason.to_owned());
+        }
     }
-    Ok(events)
+    Ok((events, finish_reason))
 }
 
 struct ChatStreamState {
@@ -351,6 +360,8 @@ struct ChatStreamState {
     usage: Option<TokenUsage>,
     pending_events: VecDeque<LlmStreamEvent>,
     allow_completed_message_fallback: bool,
+    saw_done: bool,
+    finish_reason: Option<String>,
     finished: bool,
 }
 
@@ -368,6 +379,10 @@ async fn next_chat_stream_event(
             }) else {
                 continue;
             };
+            if event.data.trim() == "[DONE]" {
+                state.saw_done = true;
+                continue;
+            }
             state.recorder.mark_event();
             match handle_chat_stream_event(
                 &event.data,
@@ -376,7 +391,12 @@ async fn next_chat_stream_event(
                 &mut state.final_message,
                 &mut state.usage,
             ) {
-                Ok(events) => state.pending_events.extend(events),
+                Ok((events, finish_reason)) => {
+                    if finish_reason.is_some() {
+                        state.finish_reason = finish_reason;
+                    }
+                    state.pending_events.extend(events);
+                }
                 Err(err) => return Some(Err(err)),
             }
             continue;
@@ -400,20 +420,30 @@ async fn next_chat_stream_event(
                         continue;
                     };
                     state.frame_buffer.clear();
-                    state.recorder.mark_event();
-                    match handle_chat_stream_event(
-                        &event.data,
-                        &mut state.recorder,
-                        &mut state.answer,
-                        &mut state.final_message,
-                        &mut state.usage,
-                    ) {
-                        Ok(events) => state.pending_events.extend(events),
-                        Err(err) => return Some(Err(err)),
+                    if event.data.trim() == "[DONE]" {
+                        state.saw_done = true;
+                    } else {
+                        state.recorder.mark_event();
+                        match handle_chat_stream_event(
+                            &event.data,
+                            &mut state.recorder,
+                            &mut state.answer,
+                            &mut state.final_message,
+                            &mut state.usage,
+                        ) {
+                            Ok((events, finish_reason)) => {
+                                if finish_reason.is_some() {
+                                    state.finish_reason = finish_reason;
+                                }
+                                state.pending_events.extend(events);
+                            }
+                            Err(err) => return Some(Err(err)),
+                        }
                     }
                 }
                 if state.answer.trim().is_empty()
                     && state.allow_completed_message_fallback
+                    && (state.saw_done || state.finish_reason.is_some())
                     && !state.final_message.trim().is_empty()
                 {
                     // 仅在没有真实 delta 时回补 completed message，避免把两套正文拼接。
@@ -421,17 +451,25 @@ async fn next_chat_stream_event(
                     state.recorder.mark_token();
                     return Some(Ok(LlmStreamEvent::TextDelta(state.final_message.clone())));
                 }
+                if !state.saw_done && state.finish_reason.is_none() {
+                    state.finished = true;
+                    return Some(Err(incomplete_stream_eof_error(
+                        "Chat Completions stream ended before [DONE] or finish_reason",
+                        &state.answer,
+                    )));
+                }
                 state.finished = true;
                 return Some(Ok(LlmStreamEvent::Completed {
                     usage: state.usage.clone(),
-                    finish_reason: None,
+                    finish_reason: state.finish_reason.clone(),
                     fallback_used: false,
                 }));
             }
             Err(err) => {
-                return Some(Err(LlmError::http(format!(
-                    "Chat Completions stream failed: {err}"
-                ))));
+                return Some(Err(stream_transport_error(
+                    format!("Chat Completions stream failed: {err}"),
+                    &state.answer,
+                )));
             }
         }
     }
@@ -639,6 +677,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chat_completion_requires_done_after_delta() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n".to_owned();
+        let (base_url, _state) = spawn_mock_chat(vec![body], StatusCode::OK).await;
+        let client =
+            ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
+
+        let err = stream_completion(
+            &client,
+            "openai",
+            "gpt-test",
+            1200,
+            &[ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.stage, "stream_after_delta");
+        assert!(err.message.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_completion_accepts_finish_reason_without_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"好\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .to_owned();
+        let (base_url, _state) = spawn_mock_chat(vec![body], StatusCode::OK).await;
+        let client =
+            ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
+
+        let outcome = stream_completion(
+            &client,
+            "openai",
+            "gpt-test",
+            1200,
+            &[ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.reply, "你好");
+    }
+
+    #[tokio::test]
     async fn empty_stream_retries_non_stream() {
         let (base_url, state) = spawn_mock_chat(
             vec![
@@ -664,6 +747,71 @@ mod tests {
 
         assert_eq!(outcome.reply, "retry ok");
         assert_eq!(state.lock().await.requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_stream_fallback_retries_non_stream_after_stream_parse_error() {
+        let (base_url, state) = spawn_mock_chat(
+            vec![
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n",
+                    "data: {not-json}\n\n",
+                )
+                .to_owned(),
+                json!({"choices": [{"message": {"content": "non stream ok"}}]}).to_string(),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        let client =
+            ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
+
+        let outcome = chat_completions_with_stream_fallback(
+            true,
+            &client,
+            "openai",
+            "gpt-test",
+            1200,
+            &[ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.reply, "non stream ok");
+        let requests = &state.lock().await.requests;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], true);
+        assert!(requests[1].get("stream").is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_stream_chat_does_not_retry_non_stream_after_delta_error() {
+        let (base_url, state) = spawn_mock_chat(
+            vec![
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n",
+                    "data: {not-json}\n\n",
+                )
+                .to_owned(),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        let client =
+            ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
+
+        let err = stream_completion(
+            &client,
+            "openai",
+            "gpt-test",
+            1200,
+            &[ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.stage, "sse");
+        assert_eq!(state.lock().await.requests.len(), 1);
     }
 
     #[tokio::test]

@@ -4,12 +4,54 @@ use std::sync::{
 };
 
 use serde_json::Value;
+use tokio::time::{Duration, sleep};
 
 use super::support::*;
 use crate::{
     error::LlmError,
     runtime::session::{DEFAULT_SESSION_TITLE, SessionMeta},
 };
+
+async fn wait_for_session_title(
+    service: &crate::runtime::respond::RustRespondService,
+    title: &str,
+) {
+    for _ in 0..50 {
+        let session = service
+            .session_store
+            .get_or_create_active(&test_meta())
+            .unwrap();
+        if session.title == title {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let session = service
+        .session_store
+        .get_or_create_active(&test_meta())
+        .unwrap();
+    assert_eq!(session.title, title);
+}
+
+async fn wait_for_title_request_count(inspector: &MockProvider, expected: usize) {
+    for _ in 0..50 {
+        let count = inspector
+            .requests()
+            .iter()
+            .filter(|req| req.metadata.get("purpose").map(String::as_str) == Some("session_title"))
+            .count();
+        if count == expected {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let count = inspector
+        .requests()
+        .iter()
+        .filter(|req| req.metadata.get("purpose").map(String::as_str) == Some("session_title"))
+        .count();
+    assert_eq!(count, expected);
+}
 
 #[tokio::test]
 async fn help_without_argument_returns_concise_overview() {
@@ -311,6 +353,7 @@ async fn auto_title_retries_after_failure_and_uses_per_call_model() {
     );
 
     service.respond(message("第三条确认方案")).await.unwrap();
+    wait_for_session_title(&service, "部署排障").await;
     let session = service
         .session_store
         .get_or_create_active(&test_meta())
@@ -338,6 +381,57 @@ async fn auto_title_retries_after_failure_and_uses_per_call_model() {
             .iter()
             .filter(|req| req.metadata.get("purpose").map(String::as_str) == Some("chat"))
             .all(|req| req.model.is_none())
+    );
+}
+
+#[tokio::test]
+async fn auto_title_delay_does_not_block_chat_response() {
+    let provider = MockProvider::with_title_replies(vec![Ok("后台标题")])
+        .with_title_delay(Duration::from_millis(300));
+    let (service, _) = test_service_with_title_provider(provider);
+
+    service.respond(message("第一条")).await.unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_millis(100),
+        service.respond(message("第二条触发标题")),
+    )
+    .await
+    .expect("chat response should not wait for auto title")
+    .unwrap();
+
+    assert_eq!(response.text.as_deref(), Some("回复：第二条触发标题"));
+    assert_eq!(
+        service
+            .session_store
+            .get_or_create_active(&test_meta())
+            .unwrap()
+            .title,
+        DEFAULT_SESSION_TITLE
+    );
+    wait_for_session_title(&service, "后台标题").await;
+}
+
+#[tokio::test]
+async fn auto_title_failure_does_not_fail_chat_response() {
+    let provider = MockProvider::with_title_replies(vec![Err(LlmError::provider(
+        "title blocked",
+        "provider",
+    ))]);
+    let inspector = provider.clone();
+    let (service, _) = test_service_with_title_provider(provider);
+
+    service.respond(message("第一条")).await.unwrap();
+    let response = service.respond(message("第二条")).await.unwrap();
+
+    assert_eq!(response.text.as_deref(), Some("回复：第二条"));
+    wait_for_title_request_count(&inspector, 1).await;
+    assert_eq!(
+        service
+            .session_store
+            .get_or_create_active(&test_meta())
+            .unwrap()
+            .title,
+        DEFAULT_SESSION_TITLE
     );
 }
 
@@ -413,6 +507,7 @@ async fn auto_title_stops_after_fourth_user_message() {
     for text in ["第一条", "第二条", "第三条", "第四条", "第五条"] {
         service.respond(message(text)).await.unwrap();
     }
+    wait_for_title_request_count(&inspector, 3).await;
 
     let session = service
         .session_store

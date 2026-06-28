@@ -21,7 +21,10 @@ use crate::{
         types::{ChatMessage, ChatRequest, ChatRole},
     },
     runtime::session::redact_sensitive_text,
-    util::time_context::{RequestTimeContext, request_time_context},
+    util::{
+        metrics::MetricsRecorder,
+        time_context::{RequestTimeContext, request_time_context},
+    },
 };
 
 use super::{
@@ -91,20 +94,26 @@ impl LlmChatService {
             metadata: req.metadata.clone(),
         };
         let mut stream = self.provider.stream_chat(chat_req).await?;
+        let mut recorder = MetricsRecorder::start();
         let mut raw_reply = String::new();
         let mut usage = None;
         let mut completed = false;
+        let mut fallback_used = false;
         while let Some(event) = stream.next().await {
             match event? {
                 LlmStreamEvent::TextDelta(delta) => {
+                    recorder.mark_event();
                     if delta.is_empty() {
                         continue;
                     }
+                    recorder.mark_token();
                     raw_reply.push_str(&delta);
                     on_delta(delta).await?;
                 }
                 LlmStreamEvent::Completed {
-                    usage: event_usage, ..
+                    usage: event_usage,
+                    fallback_used: event_fallback_used,
+                    ..
                 } => {
                     if completed {
                         return Err(LlmError::provider(
@@ -114,6 +123,7 @@ impl LlmChatService {
                     }
                     completed = true;
                     usage = event_usage;
+                    fallback_used |= event_fallback_used;
                 }
             }
         }
@@ -126,16 +136,9 @@ impl LlmChatService {
         let raw_reply = raw_reply.trim().to_owned();
         let outcome = ChatOutcome {
             reply: raw_reply.clone(),
-            metrics: crate::util::metrics::LlmMetrics {
-                provider: self.provider.name().to_owned(),
-                model: self.provider.model().to_owned(),
-                stream: true,
-                ttfe_ms: None,
-                ttft_ms: None,
-                total_latency_ms: 0,
-            },
+            metrics: recorder.finish(self.provider.name(), self.provider.model(), true),
             usage,
-            fallback_used: false,
+            fallback_used,
         };
         log_llm_request_completed(&req, &outcome);
         output_from_raw_reply(&req, raw_reply, outcome)

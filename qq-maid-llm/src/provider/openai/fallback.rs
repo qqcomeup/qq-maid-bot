@@ -15,8 +15,10 @@ pub(crate) fn should_retry_non_stream_after_stream_error(err: &LlmError) -> bool
     matches!(
         err.code.as_str(),
         "provider_error" | "http_error" | "timeout"
-    ) && matches!(err.stage.as_str(), "provider" | "stream" | "http")
-        && err.stage != "stream_after_delta"
+    ) && matches!(
+        err.stage.as_str(),
+        "provider" | "stream" | "http" | "sse" | "stream_after_delta"
+    )
 }
 
 /// 当 Responses 主链路失败时，是否允许降级到 Chat Completions。
@@ -24,7 +26,7 @@ pub(crate) fn should_fallback_to_chat_after_responses_error(err: &LlmError) -> b
     matches!(
         err.code.as_str(),
         "provider_error" | "http_error" | "timeout"
-    )
+    ) && err.stage != "stream_after_delta"
 }
 
 #[cfg(test)]

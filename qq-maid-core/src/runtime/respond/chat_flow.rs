@@ -127,7 +127,7 @@ impl RustRespondService {
         self.session_store
             .append_exchange(&mut session, &user_text, &reply)
             .map_err(session_error)?;
-        self.maybe_generate_auto_title(&mut session).await;
+        self.schedule_auto_title(session.clone());
 
         let mut response = response_from_output(output);
         response.session_id = Some(session.session_id);
@@ -244,7 +244,7 @@ impl RustRespondService {
         self.session_store
             .append_exchange(&mut session, &user_text, &reply)
             .map_err(session_error)?;
-        self.maybe_generate_auto_title(&mut session).await;
+        self.schedule_auto_title(session.clone());
 
         let mut response = response_from_output(output);
         response.session_id = Some(session.session_id);
@@ -295,10 +295,12 @@ impl RustRespondService {
         }
     }
 
-    /// 如果会话标题还是默认值，且用户消息轮数在 2~4 之间，
-    /// 则调用标题生成模型自动生成标题。
-    async fn maybe_generate_auto_title(&self, session: &mut SessionRecord) {
-        let Some(title_model) = self.title_model.as_deref() else {
+    /// 如果会话标题还是默认值，且用户消息轮数在 2~4 之间，则后台尝试生成标题。
+    ///
+    /// 主聊天回复已经完成落库，标题只是展示增强；不能让标题模型的慢响应、
+    /// 失败或取消影响本轮 `Completed`。
+    fn schedule_auto_title(&self, mut session: SessionRecord) {
+        let Some(title_model) = self.title_model.clone() else {
             return;
         };
         if session.title != DEFAULT_SESSION_TITLE {
@@ -313,27 +315,31 @@ impl RustRespondService {
             return;
         }
 
-        match generate_session_title(self.provider.as_ref(), title_model, &session.history, false)
-            .await
-        {
-            Ok(title) => {
-                session.title = title;
-                if let Err(err) = self.session_store.save(session) {
-                    tracing::warn!(
-                        error = %err.message(),
+        let provider = self.provider.clone();
+        let session_store = self.session_store.clone();
+        tokio::spawn(async move {
+            match generate_session_title(provider.as_ref(), &title_model, &session.history, false)
+                .await
+            {
+                Ok(title) => {
+                    session.title = title;
+                    if let Err(err) = session_store.save(&mut session) {
+                        tracing::warn!(
+                            error = %err.message(),
+                            session_id = %session.session_id,
+                            "failed to save generated session title"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
                         session_id = %session.session_id,
-                        "failed to save generated session title"
+                        "session auto title generation failed"
                     );
                 }
             }
-            Err(err) => {
-                tracing::debug!(
-                    error = %err,
-                    session_id = %session.session_id,
-                    "session auto title generation failed"
-                );
-            }
-        }
+        });
     }
 }
 

@@ -47,6 +47,7 @@ pub(super) struct MockProvider {
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<ChatRequest>>>,
     title_replies: Arc<Mutex<Vec<Result<String, LlmError>>>>,
+    title_delay: Option<std::time::Duration>,
 }
 
 pub(super) struct MockQueryExecutor;
@@ -110,6 +111,7 @@ impl MockProvider {
             calls: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
             title_replies: Arc::new(Mutex::new(Vec::new())),
+            title_delay: None,
         }
     }
 
@@ -118,6 +120,7 @@ impl MockProvider {
             calls,
             requests: Arc::new(Mutex::new(Vec::new())),
             title_replies: Arc::new(Mutex::new(Vec::new())),
+            title_delay: None,
         }
     }
 
@@ -129,8 +132,14 @@ impl MockProvider {
                     .map(|result| result.map(str::to_owned))
                     .collect(),
             )),
+            title_delay: None,
             ..Self::new()
         }
+    }
+
+    pub(super) fn with_title_delay(mut self, delay: std::time::Duration) -> Self {
+        self.title_delay = Some(delay);
+        self
     }
 
     pub(super) fn requests(&self) -> Vec<ChatRequest> {
@@ -259,6 +268,9 @@ impl LlmProvider for MockProvider {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().unwrap().push(req.clone());
         if req.metadata.get("purpose").map(String::as_str) == Some("session_title") {
+            if let Some(delay) = self.title_delay {
+                tokio::time::sleep(delay).await;
+            }
             let reply = self.title_replies.lock().unwrap().remove(0)?;
             return Ok(ChatOutcome {
                 reply,

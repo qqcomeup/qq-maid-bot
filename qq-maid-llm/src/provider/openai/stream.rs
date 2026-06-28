@@ -16,6 +16,7 @@ pub(crate) fn handle_openai_chat_stream_event(
     recorder: &mut MetricsRecorder,
     answer: &mut String,
     completed_response: &mut Option<Value>,
+    saw_completed: &mut bool,
 ) -> Result<Option<String>, LlmError> {
     let value = serde_json::from_str::<Value>(&event.data).map_err(|err| {
         LlmError::provider(format!("invalid OpenAI chat stream JSON: {err}"), "sse")
@@ -37,6 +38,7 @@ pub(crate) fn handle_openai_chat_stream_event(
             }
         }
         "response.completed" => {
+            *saw_completed = true;
             *completed_response = extract_completed_response(&value);
         }
         "response.failed" | "response.incomplete" | "error" => {
@@ -99,6 +101,7 @@ mod tests {
         let mut recorder = MetricsRecorder::start();
         let mut answer = String::new();
         let mut completed_response = None;
+        let mut saw_completed = false;
 
         handle_openai_chat_stream_event(
             SseFrame {
@@ -108,6 +111,7 @@ mod tests {
             &mut recorder,
             &mut answer,
             &mut completed_response,
+            &mut saw_completed,
         )
         .unwrap();
         handle_openai_chat_stream_event(
@@ -119,10 +123,12 @@ mod tests {
             &mut recorder,
             &mut answer,
             &mut completed_response,
+            &mut saw_completed,
         )
         .unwrap();
 
         assert_eq!(answer, "你");
+        assert!(saw_completed);
         assert_eq!(
             completed_response.as_ref().and_then(|value| {
                 value

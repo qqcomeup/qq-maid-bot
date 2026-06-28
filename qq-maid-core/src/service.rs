@@ -173,9 +173,16 @@ impl CoreService for CoreHandle {
         let scope_key = req.scope_key.clone();
         let state = self.state.as_ref();
         if should_stream {
+            let provider_stream_enabled = state.provider.stream_enabled();
             let result = timeout(
                 Duration::from_secs(state.config.request_timeout_seconds),
-                async { Ok::<_, LlmError>(start_core_response_stream(service, req)) },
+                async {
+                    Ok::<_, LlmError>(start_core_response_stream(
+                        service,
+                        req,
+                        provider_stream_enabled,
+                    ))
+                },
             )
             .await;
             return match result {
@@ -307,6 +314,7 @@ impl Drop for CoreResponseStream {
 fn start_core_response_stream(
     service: RustRespondService,
     req: RespondRequest,
+    provider_stream_enabled: bool,
 ) -> CoreResponseStream {
     let (tx, receiver) = mpsc::channel(16);
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -319,8 +327,14 @@ fn start_core_response_stream(
                 .await;
             return;
         }
-        let result =
-            run_streaming_respond(&service, req, tx.clone(), producer_cancelled.clone()).await;
+        let result = run_streaming_respond(
+            &service,
+            req,
+            tx.clone(),
+            producer_cancelled.clone(),
+            provider_stream_enabled,
+        )
+        .await;
         if producer_cancelled.load(Ordering::SeqCst) {
             return;
         }
@@ -358,7 +372,24 @@ async fn run_streaming_respond(
     req: RespondRequest,
     tx: mpsc::Sender<CoreResponseEvent>,
     cancelled: Arc<AtomicBool>,
+    provider_stream_enabled: bool,
 ) -> Result<RespondResponse, LlmError> {
+    if !provider_stream_enabled {
+        let response = service.respond(req).await?;
+        // provider 流式关闭时仍维持 Core/Gateway 的进程内流契约；
+        // 这里合成单个 delta，但上游请求保持原有非 SSE 行为。
+        if response.ok
+            && let Some(delta) = response
+                .markdown
+                .as_deref()
+                .or(response.text.as_deref())
+                .map(str::to_owned)
+                .filter(|value| !value.trim().is_empty())
+        {
+            send_core_delta(&tx, &cancelled, delta).await?;
+        }
+        return Ok(response);
+    }
     service
         .respond_stream(req, |delta| {
             let tx = tx.clone();
@@ -769,6 +800,33 @@ mod tests {
         assert_eq!(sessions[0].history.last().unwrap().content, "你好");
     }
 
+    #[tokio::test]
+    async fn stream_disabled_chat_is_wrapped_as_process_stream() {
+        let provider = TestProvider::replying("非流完整回复");
+        let state = test_state(provider.clone(), 5);
+        let service = CoreHandle::new(state);
+        let CoreRespondOutput::Stream(mut stream) =
+            service.respond(private_request("hello")).await.unwrap()
+        else {
+            panic!("expected stream output");
+        };
+
+        assert_eq!(
+            stream.recv().await,
+            Some(CoreResponseEvent::TextDelta("非流完整回复".to_owned()))
+        );
+        let Some(CoreResponseEvent::Completed(response)) = stream.recv().await else {
+            panic!("expected completed response");
+        };
+
+        assert_eq!(response.text.as_deref(), Some("非流完整回复"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.requests()[0].metadata.get("purpose").unwrap(),
+            "chat"
+        );
+    }
+
     async fn collect_stream_failure(
         output: Result<CoreRespondOutput, CoreError>,
     ) -> CoreRespondFailure {
@@ -810,6 +868,7 @@ mod tests {
         behavior: ProviderBehavior,
         requests: Arc<Mutex<Vec<ChatRequest>>>,
         calls: Arc<AtomicUsize>,
+        stream_enabled: bool,
     }
 
     impl TestProvider {
@@ -822,7 +881,7 @@ mod tests {
         }
 
         fn streaming(events: Vec<Result<LlmStreamEvent, LlmError>>) -> Self {
-            Self::new(ProviderBehavior::Stream(events))
+            Self::new(ProviderBehavior::Stream(events)).with_stream_enabled(true)
         }
 
         fn delayed(reply: &str, delay: Duration) -> Self {
@@ -837,7 +896,13 @@ mod tests {
                 behavior,
                 requests: Arc::new(Mutex::new(Vec::new())),
                 calls: Arc::new(AtomicUsize::new(0)),
+                stream_enabled: false,
             }
+        }
+
+        fn with_stream_enabled(mut self, enabled: bool) -> Self {
+            self.stream_enabled = enabled;
+            self
         }
 
         fn requests(&self) -> Vec<ChatRequest> {
@@ -925,7 +990,7 @@ mod tests {
         }
 
         fn stream_enabled(&self) -> bool {
-            false
+            self.stream_enabled
         }
     }
 

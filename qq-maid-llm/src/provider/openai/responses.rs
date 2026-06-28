@@ -160,6 +160,7 @@ pub(crate) async fn openai_responses_chat_stream(
     let frame_buffer = Vec::new();
     let answer = String::new();
     let completed_response: Option<Value> = None;
+    let saw_completed = false;
     Ok(Box::pin(stream::unfold(
         ResponsesStreamState {
             response,
@@ -167,6 +168,7 @@ pub(crate) async fn openai_responses_chat_stream(
             recorder,
             answer,
             completed_response,
+            saw_completed,
             allow_completed_response_fallback: req.allow_completed_response_fallback,
             finished: false,
         },
@@ -183,6 +185,7 @@ struct ResponsesStreamState {
     recorder: MetricsRecorder,
     answer: String,
     completed_response: Option<Value>,
+    saw_completed: bool,
     allow_completed_response_fallback: bool,
     finished: bool,
 }
@@ -204,6 +207,7 @@ async fn next_responses_stream_event(
                 &mut state.recorder,
                 &mut state.answer,
                 &mut state.completed_response,
+                &mut state.saw_completed,
             ) {
                 Ok(Some(delta)) => return Some(Ok(LlmStreamEvent::TextDelta(delta))),
                 Ok(None) => continue,
@@ -235,6 +239,7 @@ async fn next_responses_stream_event(
                         &mut state.recorder,
                         &mut state.answer,
                         &mut state.completed_response,
+                        &mut state.saw_completed,
                     ) {
                         Ok(Some(delta)) => return Some(Ok(LlmStreamEvent::TextDelta(delta))),
                         Ok(None) => {}
@@ -252,6 +257,13 @@ async fn next_responses_stream_event(
                     state.recorder.mark_token();
                     return Some(Ok(LlmStreamEvent::TextDelta(answer)));
                 }
+                if !state.saw_completed {
+                    state.finished = true;
+                    return Some(Err(incomplete_stream_eof_error(
+                        "OpenAI Responses chat stream ended before response.completed",
+                        &state.answer,
+                    )));
+                }
                 let usage = state
                     .completed_response
                     .as_ref()
@@ -264,12 +276,31 @@ async fn next_responses_stream_event(
                 }));
             }
             Err(err) => {
-                return Some(Err(LlmError::http(format!(
-                    "OpenAI chat stream failed: {err}"
-                ))));
+                return Some(Err(stream_transport_error(
+                    format!("OpenAI chat stream failed: {err}"),
+                    &state.answer,
+                )));
             }
         }
     }
+}
+
+pub(crate) fn incomplete_stream_eof_error(message: &str, answer: &str) -> LlmError {
+    let stage = if answer.trim().is_empty() {
+        "stream"
+    } else {
+        "stream_after_delta"
+    };
+    LlmError::provider(message, stage)
+}
+
+pub(crate) fn stream_transport_error(message: String, answer: &str) -> LlmError {
+    let stage = if answer.trim().is_empty() {
+        "http"
+    } else {
+        "stream_after_delta"
+    };
+    LlmError::new("http_error", message, stage)
 }
 
 #[cfg(test)]
@@ -350,5 +381,60 @@ mod tests {
         assert_eq!(outcome.reply, "stream fallback");
         let state = state.lock().await;
         assert_eq!(state.calls, 1);
+    }
+
+    #[tokio::test]
+    async fn openai_responses_stream_requires_completed_after_delta() {
+        let (base_url, _state) = spawn_mock_responses(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"半截\"}\n\n"
+                .to_owned(),
+            StatusCode::OK,
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let err = openai_responses_stream_chat(
+            &client,
+            "test-key",
+            Some(&base_url),
+            "openai",
+            "gpt-5.5",
+            1200,
+            &[crate::provider::types::ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.stage, "stream_after_delta");
+        assert!(err.message.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn openai_responses_stream_accepts_delta_then_completed() {
+        let (base_url, _state) = spawn_mock_responses(
+            concat!(
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"你\"}\n\n",
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"好\"}\n\n",
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"你好\"}}\n\n",
+            )
+            .to_owned(),
+            StatusCode::OK,
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let outcome = openai_responses_stream_chat(
+            &client,
+            "test-key",
+            Some(&base_url),
+            "openai",
+            "gpt-5.5",
+            1200,
+            &[crate::provider::types::ChatMessage::user("hi")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.reply, "你好");
     }
 }

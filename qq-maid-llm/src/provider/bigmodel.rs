@@ -12,10 +12,11 @@ use crate::{
     config::LlmConfig,
     error::LlmError,
     provider::{
-        ChatOutcome, LlmProvider, LlmStream, collect_llm_stream,
+        ChatOutcome, LlmProvider, LlmStream,
         openai::{
             ChatCompletionsClient, chat_completions_stream, chat_completions_with_stream_fallback,
         },
+        outcome_to_stream,
         types::{ChatRequest, ModelId, ModelProvider},
     },
 };
@@ -64,10 +65,6 @@ impl BigModelProvider {
 impl LlmProvider for BigModelProvider {
     async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome, LlmError> {
         let effective_model = effective_bigmodel_model(req.model.as_deref(), &self.model)?;
-        if self.stream {
-            let stream = self.stream_chat(req).await?;
-            return collect_llm_stream(stream, self.name(), &effective_model).await;
-        }
         chat_completions_with_stream_fallback(
             self.stream,
             &self.client,
@@ -81,6 +78,18 @@ impl LlmProvider for BigModelProvider {
 
     async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
         let effective_model = effective_bigmodel_model(req.model.as_deref(), &self.model)?;
+        if !self.stream {
+            let outcome = chat_completions_with_stream_fallback(
+                false,
+                &self.client,
+                self.name(),
+                &effective_model,
+                self.max_output_tokens,
+                &req.messages,
+            )
+            .await?;
+            return Ok(outcome_to_stream(outcome));
+        }
         chat_completions_stream(
             &self.client,
             self.name(),
@@ -138,6 +147,55 @@ fn effective_bigmodel_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        extract::State,
+        http::{StatusCode, header},
+        response::IntoResponse,
+        routing::post,
+    };
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tokio::{net::TcpListener, sync::Mutex};
+
+    #[derive(Debug)]
+    struct MockChatState {
+        bodies: Vec<String>,
+        requests: Vec<Value>,
+    }
+
+    async fn mock_chat_handler(
+        State(state): State<Arc<Mutex<MockChatState>>>,
+        body: Body,
+    ) -> impl IntoResponse {
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut state = state.lock().await;
+        state.requests.push(request);
+        let body = state.bodies.remove(0);
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+    }
+
+    async fn spawn_mock_chat(bodies: Vec<String>) -> (String, Arc<Mutex<MockChatState>>) {
+        let state = Arc::new(Mutex::new(MockChatState {
+            bodies,
+            requests: Vec::new(),
+        }));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_chat_handler))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), state)
+    }
 
     #[test]
     fn effective_bigmodel_model_strips_bigmodel_prefix() {
@@ -166,5 +224,36 @@ mod tests {
 
         let err = bigmodel_config_model("deepseek:deepseek-chat").unwrap_err();
         assert_eq!(err.code, "config");
+    }
+
+    #[tokio::test]
+    async fn chat_retries_non_stream_after_empty_sse_when_stream_enabled() {
+        let (base_url, state) = spawn_mock_chat(vec![
+            "data: [DONE]\n\n".to_owned(),
+            json!({"choices": [{"message": {"content": "bigmodel non-stream"}}]}).to_string(),
+        ])
+        .await;
+        let provider = BigModelProvider {
+            client: ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new()),
+            model: "glm-5.2".to_owned(),
+            stream: true,
+            max_output_tokens: 1200,
+        };
+
+        let outcome = provider
+            .chat(ChatRequest {
+                session_id: "s".to_owned(),
+                model: None,
+                messages: vec![crate::provider::types::ChatMessage::user("hi")],
+                metadata: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.reply, "bigmodel non-stream");
+        let requests = &state.lock().await.requests;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], true);
+        assert!(requests[1].get("stream").is_none());
     }
 }
