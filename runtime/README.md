@@ -173,6 +173,25 @@ cp config/.env.example config/.env
 
 升级时不要直接覆盖已有运行目录中的私有文件和运行数据，尤其是 `config/.env`、私有 prompt、私有知识资料、成员映射、SQLite 数据库、日志和 pid。
 
+## 测试容器镜像
+
+Fork 测试仓库可通过 GitHub Actions 构建并推送 GHCR 测试镜像。镜像构建使用多阶段 Dockerfile，最终镜像只保留运行目录所需文件；构建阶段会复用 `scripts/validate-release-runtime.sh` 校验 runtime payload，避免把真实 `.env`、数据库、日志、pid 或备份文件写入镜像。
+
+推送到 fork 的 `master`、推送 `v*` tag 或手动触发 `Container Image` workflow 后，会发布镜像：
+
+```text
+ghcr.io/qqcomeup/qq-maid-bot
+```
+
+首次运行前，先从镜像中的 `.env.example` 准备本机私有 `config/.env`。运行容器时建议把配置和数据挂载到容器外部，避免升级镜像时覆盖私有配置或 SQLite 数据：
+
+```bash
+docker run -d --name qq-maid-bot \
+  -v /opt/qqbot/private/config:/app/runtime/config \
+  -v /opt/qqbot/data:/app/runtime/data \
+  ghcr.io/qqcomeup/qq-maid-bot:latest
+```
+
 ## 控制脚本和诊断
 
 常用控制命令：

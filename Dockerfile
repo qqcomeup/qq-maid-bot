@@ -14,7 +14,18 @@ RUN apt-get update \
 
 COPY . .
 
-RUN cargo build --workspace --release --all-features
+RUN cargo build --workspace --release --all-features \
+    && mkdir -p /tmp/runtime-payload/config /tmp/runtime-payload/data/storage /tmp/runtime-payload/static \
+    && install -m 0755 target/release/qq-maid-bot /tmp/runtime-payload/qq-maid-bot \
+    && install -m 0755 scripts/botctl.sh /tmp/runtime-payload/botctl.sh \
+    && install -m 0755 scripts/diagnose-network.sh /tmp/runtime-payload/diagnose-network.sh \
+    && install -m 0755 scripts/validate-runtime.sh /tmp/runtime-payload/validate-runtime.sh \
+    && install -m 0644 runtime/README.md /tmp/runtime-payload/README.md \
+    && install -m 0644 runtime/config/.env.example /tmp/runtime-payload/.env.example \
+    && cp -R runtime/config/. /tmp/runtime-payload/config/ \
+    && cp -R runtime/static/. /tmp/runtime-payload/static/ \
+    && find /tmp/runtime-payload/config -type f ! -name '*.example.*' ! -name '.env.example' -delete \
+    && bash scripts/validate-release-runtime.sh /tmp/runtime-payload
 
 FROM debian:bookworm-slim AS runtime
 
@@ -28,14 +39,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p config data/storage logs run static
 
-COPY --from=builder /src/target/release/qq-maid-bot /app/runtime/qq-maid-bot
-COPY --from=builder /src/scripts/botctl.sh /app/runtime/botctl.sh
-COPY --from=builder /src/scripts/diagnose-network.sh /app/runtime/diagnose-network.sh
-COPY --from=builder /src/scripts/validate-runtime.sh /app/runtime/validate-runtime.sh
-COPY --from=builder /src/runtime/README.md /app/runtime/README.md
-COPY --from=builder /src/runtime/config/.env.example /app/runtime/.env.example
-COPY --from=builder /src/runtime/config /app/runtime/config
-COPY --from=builder /src/runtime/static /app/runtime/static
+COPY --from=builder /tmp/runtime-payload/ /app/runtime/
 
 RUN chmod +x /app/runtime/qq-maid-bot \
     /app/runtime/botctl.sh \
