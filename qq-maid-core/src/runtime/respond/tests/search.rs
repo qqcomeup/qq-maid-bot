@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use super::support::*;
 use crate::error::LlmError;
@@ -25,6 +28,39 @@ async fn web_search_command_uses_query_executor() {
     );
     assert_eq!(response.diagnostics.unwrap()["used_search"], true);
     assert_eq!(response.command.as_deref(), Some("web_search"));
+}
+
+#[tokio::test]
+async fn web_search_stream_uses_query_stream_and_forwards_deltas() {
+    let query_calls = Arc::new(AtomicUsize::new(0));
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+    let (service, _base) = test_service_with_provider_base_title_and_query(
+        MockProvider::new(),
+        None,
+        Arc::new(StreamOnlyQueryExecutor {
+            deltas: vec!["你".to_owned(), "好".to_owned()],
+            query_calls: query_calls.clone(),
+            stream_calls: stream_calls.clone(),
+        }),
+    );
+    let deltas = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected = deltas.clone();
+
+    let response = service
+        .respond_stream(message("/查 keyword"), move |delta| {
+            let collected = collected.clone();
+            Box::pin(async move {
+                collected.lock().unwrap().push(delta);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(deltas.lock().unwrap().as_slice(), ["你", "好"]);
+    assert_eq!(response.text.as_deref(), Some("【联网查询】\n\n你好"));
+    assert_eq!(query_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

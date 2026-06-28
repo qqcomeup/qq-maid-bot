@@ -3,12 +3,13 @@
 //! 这里仅负责 Responses API 的流式/非流式聊天执行，以及在需要时回退到同 provider
 //! 的非流式请求；不直接接触 Chat Completions，以保证 Responses 与 fallback provider 解耦。
 
+use futures::stream;
 use serde_json::Value;
 
 use crate::{
     error::LlmError,
     metrics::MetricsRecorder,
-    provider::{ChatOutcome, types::ChatMessage},
+    provider::{ChatOutcome, LlmStream, LlmStreamEvent, collect_llm_stream, types::ChatMessage},
     sse::{parse_sse_frame, take_sse_frame},
 };
 
@@ -34,6 +35,7 @@ pub(crate) struct OpenAiResponsesChatRequest<'a> {
     pub(crate) model: &'a str,
     pub(crate) max_output_tokens: u64,
     pub(crate) messages: &'a [ChatMessage],
+    pub(crate) allow_completed_response_fallback: bool,
 }
 
 /// 执行 OpenAI Responses API 聊天补全，并在流式异常时补一次非流式请求。
@@ -131,67 +133,143 @@ pub(crate) async fn openai_responses_stream_chat(
     max_output_tokens: u64,
     messages: &[ChatMessage],
 ) -> Result<ChatOutcome, LlmError> {
-    let mut recorder = MetricsRecorder::start();
-    let payload = openai_responses_payload(messages, model, max_output_tokens, true)?;
-    let mut response =
-        send_openai_responses_request(client, api_key, base_url, &payload, true).await?;
+    let stream = openai_responses_chat_stream(OpenAiResponsesChatRequest {
+        stream: true,
+        client,
+        api_key,
+        base_url,
+        provider,
+        model,
+        max_output_tokens,
+        messages,
+        allow_completed_response_fallback: true,
+    })
+    .await?;
+    collect_llm_stream(stream, provider, model).await
+}
 
-    let mut frame_buffer = Vec::new();
-    let mut answer = String::new();
-    let mut completed_response: Option<Value> = None;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|err| LlmError::http(format!("OpenAI chat stream failed: {err}")))?
-    {
-        frame_buffer.extend_from_slice(&chunk);
-        while let Some(frame) = take_sse_frame(&mut frame_buffer) {
-            let Some(event) = parse_sse_frame(&frame)? else {
+pub(crate) async fn openai_responses_chat_stream(
+    req: OpenAiResponsesChatRequest<'_>,
+) -> Result<LlmStream, LlmError> {
+    let recorder = MetricsRecorder::start();
+    let payload = openai_responses_payload(req.messages, req.model, req.max_output_tokens, true)?;
+    let response =
+        send_openai_responses_request(req.client, req.api_key, req.base_url, &payload, true)
+            .await?;
+
+    let frame_buffer = Vec::new();
+    let answer = String::new();
+    let completed_response: Option<Value> = None;
+    Ok(Box::pin(stream::unfold(
+        ResponsesStreamState {
+            response,
+            frame_buffer,
+            recorder,
+            answer,
+            completed_response,
+            allow_completed_response_fallback: req.allow_completed_response_fallback,
+            finished: false,
+        },
+        |mut state| async move {
+            let event = next_responses_stream_event(&mut state).await;
+            event.map(|event| (event, state))
+        },
+    )))
+}
+
+struct ResponsesStreamState {
+    response: reqwest::Response,
+    frame_buffer: Vec<u8>,
+    recorder: MetricsRecorder,
+    answer: String,
+    completed_response: Option<Value>,
+    allow_completed_response_fallback: bool,
+    finished: bool,
+}
+
+async fn next_responses_stream_event(
+    state: &mut ResponsesStreamState,
+) -> Option<Result<LlmStreamEvent, LlmError>> {
+    loop {
+        if let Some(frame) = take_sse_frame(&mut state.frame_buffer) {
+            let Some(event) = (match parse_sse_frame(&frame) {
+                Ok(event) => event,
+                Err(err) => return Some(Err(err)),
+            }) else {
                 continue;
             };
-            recorder.mark_event();
-            handle_openai_chat_stream_event(
+            state.recorder.mark_event();
+            match handle_openai_chat_stream_event(
                 event,
-                &mut recorder,
-                &mut answer,
-                &mut completed_response,
-            )?;
+                &mut state.recorder,
+                &mut state.answer,
+                &mut state.completed_response,
+            ) {
+                Ok(Some(delta)) => return Some(Ok(LlmStreamEvent::TextDelta(delta))),
+                Ok(None) => continue,
+                Err(err) => return Some(Err(err)),
+            }
+        }
+
+        if state.finished {
+            return None;
+        }
+
+        match state.response.chunk().await {
+            Ok(Some(chunk)) => {
+                state.frame_buffer.extend_from_slice(&chunk);
+            }
+            Ok(None) => {
+                if !state.frame_buffer.is_empty() {
+                    let Some(event) = (match parse_sse_frame(&state.frame_buffer) {
+                        Ok(event) => event,
+                        Err(err) => return Some(Err(err)),
+                    }) else {
+                        state.frame_buffer.clear();
+                        continue;
+                    };
+                    state.frame_buffer.clear();
+                    state.recorder.mark_event();
+                    match handle_openai_chat_stream_event(
+                        event,
+                        &mut state.recorder,
+                        &mut state.answer,
+                        &mut state.completed_response,
+                    ) {
+                        Ok(Some(delta)) => return Some(Ok(LlmStreamEvent::TextDelta(delta))),
+                        Ok(None) => {}
+                        Err(err) => return Some(Err(err)),
+                    }
+                }
+                if state.answer.trim().is_empty()
+                    && state.allow_completed_response_fallback
+                    && let Some(response) = state.completed_response.as_ref()
+                    && let Some(answer) = extract_response_output_text(response)
+                    && !answer.trim().is_empty()
+                {
+                    // 只在没有真实 delta 时从 completed response 回补，保证最终正文来源单一。
+                    state.answer = answer.clone();
+                    state.recorder.mark_token();
+                    return Some(Ok(LlmStreamEvent::TextDelta(answer)));
+                }
+                let usage = state
+                    .completed_response
+                    .as_ref()
+                    .and_then(extract_response_usage);
+                state.finished = true;
+                return Some(Ok(LlmStreamEvent::Completed {
+                    usage,
+                    finish_reason: None,
+                    fallback_used: false,
+                }));
+            }
+            Err(err) => {
+                return Some(Err(LlmError::http(format!(
+                    "OpenAI chat stream failed: {err}"
+                ))));
+            }
         }
     }
-    if !frame_buffer.is_empty()
-        && let Some(event) = parse_sse_frame(&frame_buffer)?
-    {
-        recorder.mark_event();
-        handle_openai_chat_stream_event(
-            event,
-            &mut recorder,
-            &mut answer,
-            &mut completed_response,
-        )?;
-    }
-
-    // 某些兼容层不会把完整正文持续写成 delta，而是只在 completed 事件中附带最终响应。
-    if answer.trim().is_empty()
-        && let Some(response) = completed_response.as_ref()
-    {
-        answer = extract_response_output_text(response).unwrap_or_default();
-    }
-    let reply = answer.trim().to_owned();
-    if reply.is_empty() {
-        return Err(LlmError::provider(
-            "OpenAI chat returned empty text output",
-            "provider",
-        ));
-    }
-    let usage = completed_response.as_ref().and_then(extract_response_usage);
-    let metrics = recorder.finish(provider, model, true);
-
-    Ok(ChatOutcome {
-        reply,
-        metrics,
-        usage,
-        fallback_used: false,
-    })
 }
 
 #[cfg(test)]

@@ -11,8 +11,10 @@ use crate::{
     config::LlmConfig,
     error::LlmError,
     provider::{
-        ChatOutcome, LlmProvider,
-        openai::{ChatCompletionsClient, chat_completions_with_stream_fallback},
+        ChatOutcome, LlmProvider, LlmStream, collect_llm_stream,
+        openai::{
+            ChatCompletionsClient, chat_completions_stream, chat_completions_with_stream_fallback,
+        },
         types::{ChatRequest, ModelId, ModelProvider},
     },
 };
@@ -61,6 +63,10 @@ impl DeepSeekProvider {
 impl LlmProvider for DeepSeekProvider {
     async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome, LlmError> {
         let effective_model = effective_deepseek_model(req.model.as_deref(), &self.model)?;
+        if self.stream {
+            let stream = self.stream_chat(req).await?;
+            return collect_llm_stream(stream, self.name(), &effective_model).await;
+        }
         chat_completions_with_stream_fallback(
             self.stream,
             &self.client,
@@ -68,6 +74,19 @@ impl LlmProvider for DeepSeekProvider {
             &effective_model,
             self.max_output_tokens,
             &req.messages,
+        )
+        .await
+    }
+
+    async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+        let effective_model = effective_deepseek_model(req.model.as_deref(), &self.model)?;
+        chat_completions_stream(
+            &self.client,
+            self.name(),
+            &effective_model,
+            self.max_output_tokens,
+            &req.messages,
+            true,
         )
         .await
     }

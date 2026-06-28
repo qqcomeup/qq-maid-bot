@@ -6,12 +6,15 @@
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use futures::{StreamExt, stream};
 use qq_maid_common::time_context::now_unix_seconds_marker;
 use serde::Serialize;
 
 use crate::error::LlmError;
 
-use super::{ChatOutcome, DynLlmProvider, LlmProvider, types::ChatRequest};
+use super::{
+    ChatOutcome, DynLlmProvider, LlmProvider, LlmStream, LlmStreamEvent, types::ChatRequest,
+};
 
 /// 最近一次真实 provider 调用状态。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -164,6 +167,43 @@ impl LlmProvider for ObservedProvider {
         result
     }
 
+    async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+        // 自动标题等旁路任务不应覆盖主聊天健康状态；stream_chat 也保持同一约束。
+        if req.metadata.get("health_observation").map(String::as_str) == Some("ignore") {
+            return self.provider.stream_chat(req).await;
+        }
+        let provider_name = self.provider.name().to_owned();
+        let model = self.provider.model().to_owned();
+        let status = self.status.clone();
+        let attempt = status.begin_attempt();
+        let stream = match self.provider.stream_chat(req).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                status.record_failure(&err);
+                attempt.complete();
+                return Err(err);
+            }
+        };
+        Ok(Box::pin(stream::unfold(
+            ObservedStreamState {
+                inner: stream,
+                status,
+                provider_name,
+                model,
+                attempt: Some(attempt),
+                reply: String::new(),
+                usage: None,
+                fallback_used: false,
+                completed: false,
+                done: false,
+            },
+            |mut state| async move {
+                let event = next_observed_stream_event(&mut state).await;
+                event.map(|event| (event, state))
+            },
+        )))
+    }
+
     fn name(&self) -> &'static str {
         self.provider.name()
     }
@@ -174,6 +214,86 @@ impl LlmProvider for ObservedProvider {
 
     fn stream_enabled(&self) -> bool {
         self.provider.stream_enabled()
+    }
+}
+
+struct ObservedStreamState {
+    inner: LlmStream,
+    status: UpstreamStatus,
+    provider_name: String,
+    model: String,
+    attempt: Option<UpstreamAttemptGuard>,
+    reply: String,
+    usage: Option<super::types::TokenUsage>,
+    fallback_used: bool,
+    completed: bool,
+    done: bool,
+}
+
+async fn next_observed_stream_event(
+    state: &mut ObservedStreamState,
+) -> Option<Result<LlmStreamEvent, LlmError>> {
+    if state.done {
+        return None;
+    }
+    match state.inner.next().await {
+        Some(Ok(LlmStreamEvent::TextDelta(delta))) => {
+            state.reply.push_str(&delta);
+            Some(Ok(LlmStreamEvent::TextDelta(delta)))
+        }
+        Some(Ok(LlmStreamEvent::Completed {
+            usage,
+            finish_reason,
+            fallback_used,
+        })) => {
+            state.usage = usage.clone();
+            state.fallback_used |= fallback_used;
+            state.completed = true;
+            let outcome = ChatOutcome {
+                reply: state.reply.clone(),
+                metrics: crate::metrics::LlmMetrics {
+                    provider: state.provider_name.clone(),
+                    model: state.model.clone(),
+                    stream: true,
+                    ttfe_ms: None,
+                    ttft_ms: None,
+                    total_latency_ms: 0,
+                },
+                usage: state.usage.clone(),
+                fallback_used: state.fallback_used,
+            };
+            state.status.record_success(&outcome);
+            if let Some(attempt) = state.attempt.take() {
+                attempt.complete();
+            }
+            state.done = true;
+            Some(Ok(LlmStreamEvent::Completed {
+                usage,
+                finish_reason,
+                fallback_used,
+            }))
+        }
+        Some(Err(err)) => {
+            state.status.record_failure(&err);
+            if let Some(attempt) = state.attempt.take() {
+                attempt.complete();
+            }
+            state.done = true;
+            Some(Err(err))
+        }
+        None => {
+            if !state.completed {
+                state.status.record_failure(&LlmError::provider(
+                    "LLM stream ended before completion",
+                    "stream",
+                ));
+            }
+            if let Some(attempt) = state.attempt.take() {
+                attempt.complete();
+            }
+            state.done = true;
+            None
+        }
     }
 }
 

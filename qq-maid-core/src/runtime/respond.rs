@@ -4,6 +4,8 @@
 //! 发来的 `RespondRequest`，根据请求类型和会话状态将其分派到对应的子处理
 //! 模块（聊天、翻译、待办、记忆、天气、搜索、会话管理），最终返回 `RespondResponse`。
 
+use std::{future::Future, pin::Pin};
+
 use crate::{
     error::LlmError,
     provider::DynLlmProvider,
@@ -281,5 +283,62 @@ impl RustRespondService {
 
         // 兜底：进入普通 LLM 聊天流程
         self.handle_chat(req, user_text, meta, session).await
+    }
+
+    /// 仅供 Core 进程内 stream 边界使用的真流式入口。
+    ///
+    /// 本阶段只接通 `/查` 和普通聊天；短命令仍走完整响应路径，避免改变用户可见语义。
+    pub async fn respond_stream<F>(
+        &self,
+        req: RespondRequest,
+        on_delta: F,
+    ) -> Result<RespondResponse, LlmError>
+    where
+        F: FnMut(String) -> Pin<Box<dyn Future<Output = Result<(), LlmError>> + Send>> + Send,
+    {
+        let user_text = req.effective_user_text();
+        let meta = SessionMeta::new(
+            req.scope_key.clone(),
+            req.user_id.clone(),
+            req.group_id.clone(),
+            req.guild_id.clone(),
+            req.channel_id.clone(),
+            clean_string(req.platform.clone()).unwrap_or_else(|| "qq".to_owned()),
+        );
+        let mut active_session = self
+            .session_store
+            .get_active(&meta)
+            .map_err(session_error)?;
+
+        let bypass_pending_for_session_command =
+            session_flow::parse_pending_bypass_session_command(&user_text).is_some();
+        if !bypass_pending_for_session_command
+            && let Some(session) = active_session.as_mut()
+            && let Some(response) = self
+                .handle_pending_operation(&user_text, &meta, session)
+                .await?
+        {
+            return Ok(response);
+        }
+
+        if let Some(command) = session_flow::parse_session_command(&user_text) {
+            return self.handle_session_command(command, &meta).await;
+        }
+
+        let mut session = match active_session {
+            Some(session) => session,
+            None => self
+                .session_store
+                .get_or_create_active(&meta)
+                .map_err(session_error)?,
+        };
+
+        if let Some(command) = search_flow::parse_web_search_command(&user_text) {
+            return self
+                .handle_web_search_command_stream(command, &mut session, on_delta)
+                .await;
+        }
+
+        self.handle_chat_stream(req, on_delta).await
     }
 }

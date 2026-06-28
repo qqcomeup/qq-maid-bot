@@ -19,12 +19,14 @@ use crate::{
     config::{LlmConfig, OpenAiApiMode},
     error::LlmError,
     provider::{
-        ChatOutcome, LlmProvider,
+        ChatOutcome, LlmProvider, LlmStream, collect_llm_stream,
         types::{ChatMessage, ChatRequest, ModelProvider, ModelRoute},
     },
 };
 
-pub(crate) use chat::{ChatCompletionsClient, chat_completions_with_stream_fallback};
+pub(crate) use chat::{
+    ChatCompletionsClient, chat_completions_stream, chat_completions_with_stream_fallback,
+};
 
 struct OpenAiChatFallbackRequest<'a> {
     api_mode: OpenAiApiMode,
@@ -95,9 +97,42 @@ impl LlmProvider for OpenAiProvider {
     /// 执行聊天补全，根据配置选择 Responses 或 Chat Completions。`model` 支持 `"openai:"` 前缀。
     async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome, LlmError> {
         let effective_model = effective_openai_model(req.model.as_deref(), &self.model)?;
+        if self.stream {
+            let stream = openai_stream_with_chat_fallback(OpenAiChatFallbackRequest {
+                api_mode: self.api_mode,
+                stream: true,
+                responses_client: &self.responses_client,
+                chat_client: &self.chat_client,
+                api_key: &self.api_key,
+                base_url: self.base_url.as_deref(),
+                provider: self.name(),
+                model: &effective_model,
+                max_output_tokens: self.max_output_tokens,
+                messages: &req.messages,
+            })
+            .await?;
+            return collect_llm_stream(stream, self.name(), &effective_model).await;
+        }
         openai_chat_with_chat_fallback(OpenAiChatFallbackRequest {
             api_mode: self.api_mode,
             stream: self.stream,
+            responses_client: &self.responses_client,
+            chat_client: &self.chat_client,
+            api_key: &self.api_key,
+            base_url: self.base_url.as_deref(),
+            provider: self.name(),
+            model: &effective_model,
+            max_output_tokens: self.max_output_tokens,
+            messages: &req.messages,
+        })
+        .await
+    }
+
+    async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+        let effective_model = effective_openai_model(req.model.as_deref(), &self.model)?;
+        openai_stream_with_chat_fallback(OpenAiChatFallbackRequest {
+            api_mode: self.api_mode,
+            stream: true,
             responses_client: &self.responses_client,
             chat_client: &self.chat_client,
             api_key: &self.api_key,
@@ -123,6 +158,25 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+async fn openai_stream_with_chat_fallback(
+    req: OpenAiChatFallbackRequest<'_>,
+) -> Result<LlmStream, LlmError> {
+    match req.api_mode {
+        OpenAiApiMode::Auto => openai_auto_stream_with_chat_fallback(req).await,
+        OpenAiApiMode::ChatOnly => {
+            chat::chat_completions_stream(
+                req.chat_client,
+                req.provider,
+                req.model,
+                req.max_output_tokens,
+                req.messages,
+                true,
+            )
+            .await
+        }
+    }
+}
+
 async fn openai_chat_with_chat_fallback(
     req: OpenAiChatFallbackRequest<'_>,
 ) -> Result<ChatOutcome, LlmError> {
@@ -142,6 +196,45 @@ async fn openai_chat_with_chat_fallback(
     }
 }
 
+async fn openai_auto_stream_with_chat_fallback(
+    req: OpenAiChatFallbackRequest<'_>,
+) -> Result<LlmStream, LlmError> {
+    match responses::openai_responses_chat_stream(responses::OpenAiResponsesChatRequest {
+        stream: true,
+        client: req.responses_client,
+        api_key: req.api_key,
+        base_url: req.base_url,
+        provider: req.provider,
+        model: req.model,
+        max_output_tokens: req.max_output_tokens,
+        messages: req.messages,
+        allow_completed_response_fallback: true,
+    })
+    .await
+    {
+        Ok(stream) => Ok(stream),
+        Err(err) if fallback::should_fallback_to_chat_after_responses_error(&err) => {
+            tracing::warn!(
+                provider = req.provider,
+                model = %req.model,
+                error_code = err.code.as_str(),
+                error_stage = err.stage.as_str(),
+                "OpenAI Responses stream init failed; falling back to Chat Completions stream"
+            );
+            chat::chat_completions_stream(
+                req.chat_client,
+                req.provider,
+                req.model,
+                req.max_output_tokens,
+                req.messages,
+                true,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn openai_auto_chat_with_chat_fallback(
     req: OpenAiChatFallbackRequest<'_>,
 ) -> Result<ChatOutcome, LlmError> {
@@ -155,6 +248,7 @@ async fn openai_auto_chat_with_chat_fallback(
             model: req.model,
             max_output_tokens: req.max_output_tokens,
             messages: req.messages,
+            allow_completed_response_fallback: true,
         },
     )
     .await

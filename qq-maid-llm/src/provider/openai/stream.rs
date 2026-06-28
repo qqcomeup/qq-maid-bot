@@ -16,7 +16,7 @@ pub(crate) fn handle_openai_chat_stream_event(
     recorder: &mut MetricsRecorder,
     answer: &mut String,
     completed_response: &mut Option<Value>,
-) -> Result<(), LlmError> {
+) -> Result<Option<String>, LlmError> {
     let value = serde_json::from_str::<Value>(&event.data).map_err(|err| {
         LlmError::provider(format!("invalid OpenAI chat stream JSON: {err}"), "sse")
     })?;
@@ -33,6 +33,7 @@ pub(crate) fn handle_openai_chat_stream_event(
             {
                 recorder.mark_token();
                 answer.push_str(delta);
+                return Ok(Some(delta.to_owned()));
             }
         }
         "response.completed" => {
@@ -46,7 +47,7 @@ pub(crate) fn handle_openai_chat_stream_event(
         _ => {}
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn stream_error_message(value: &Value) -> Option<String> {

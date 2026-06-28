@@ -10,6 +10,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDate};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::super::{
@@ -68,6 +69,12 @@ pub(super) struct SupplementWeatherExecutor {
 
 pub(super) struct FailingQueryExecutor {
     pub(super) err: LlmError,
+}
+
+pub(super) struct StreamOnlyQueryExecutor {
+    pub(super) deltas: Vec<String>,
+    pub(super) query_calls: Arc<AtomicUsize>,
+    pub(super) stream_calls: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -497,6 +504,38 @@ impl QueryExecutor for FailingQueryExecutor {
 
     fn provider_name(&self) -> &'static str {
         "mock-query"
+    }
+}
+
+#[async_trait]
+impl QueryExecutor for StreamOnlyQueryExecutor {
+    async fn query(&self, _req: QueryRequest) -> Result<QueryOutcome, LlmError> {
+        self.query_calls.fetch_add(1, Ordering::SeqCst);
+        Err(LlmError::provider("query must not be called", "test"))
+    }
+
+    async fn query_stream(
+        &self,
+        _req: QueryRequest,
+        delta_tx: mpsc::Sender<String>,
+    ) -> Result<QueryOutcome, LlmError> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        for delta in &self.deltas {
+            delta_tx
+                .send(delta.clone())
+                .await
+                .map_err(|_| LlmError::new("cancelled", "receiver dropped", "test"))?;
+        }
+        Ok(QueryOutcome {
+            answer: self.deltas.join(""),
+            sources: Vec::new(),
+            provider: "stream-query".to_owned(),
+            elapsed_ms: 11,
+        })
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "stream-query"
     }
 }
 

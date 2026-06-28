@@ -319,7 +319,8 @@ fn start_core_response_stream(
                 .await;
             return;
         }
-        let result = service.respond(req).await;
+        let result =
+            run_streaming_respond(&service, req, tx.clone(), producer_cancelled.clone()).await;
         if producer_cancelled.load(Ordering::SeqCst) {
             return;
         }
@@ -350,6 +351,34 @@ fn start_core_response_stream(
         receiver,
         cancelled,
     }
+}
+
+async fn run_streaming_respond(
+    service: &RustRespondService,
+    req: RespondRequest,
+    tx: mpsc::Sender<CoreResponseEvent>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<RespondResponse, LlmError> {
+    service
+        .respond_stream(req, |delta| {
+            let tx = tx.clone();
+            let cancelled = cancelled.clone();
+            Box::pin(async move { send_core_delta(&tx, &cancelled, delta).await })
+        })
+        .await
+}
+
+async fn send_core_delta(
+    tx: &mpsc::Sender<CoreResponseEvent>,
+    cancelled: &Arc<AtomicBool>,
+    delta: String,
+) -> Result<(), LlmError> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(LlmError::new("cancelled", "stream cancelled", "stream"));
+    }
+    tx.send(CoreResponseEvent::TextDelta(delta))
+        .await
+        .map_err(|_| LlmError::new("cancelled", "stream receiver dropped", "stream"))
 }
 
 fn should_stream_respond(req: &RespondRequest) -> bool {
@@ -566,7 +595,7 @@ mod tests {
             DailyReminderTime, OpenAiApiMode, ProviderMode,
         },
         provider::{
-            ChatOutcome, LlmProvider,
+            ChatOutcome, LlmProvider, LlmStream, LlmStreamEvent,
             status::{UpstreamStatus, observe_provider},
             types::{ModelRoute, TokenUsage},
         },
@@ -702,6 +731,44 @@ mod tests {
         assert_eq!(response.text.as_deref(), Some("late"));
     }
 
+    #[tokio::test]
+    async fn chat_stream_forwards_text_delta_and_completed_from_same_stream() {
+        let provider = TestProvider::streaming(vec![
+            Ok(LlmStreamEvent::TextDelta("你".to_owned())),
+            Ok(LlmStreamEvent::TextDelta("好".to_owned())),
+            Ok(LlmStreamEvent::Completed {
+                usage: None,
+                finish_reason: None,
+                fallback_used: false,
+            }),
+        ]);
+        let state = test_state(provider.clone(), 5);
+        let session_store = state.session_store.clone();
+        let service = CoreHandle::new(state);
+        let CoreRespondOutput::Stream(mut stream) =
+            service.respond(private_request("hello")).await.unwrap()
+        else {
+            panic!("expected stream output");
+        };
+
+        assert_eq!(
+            stream.recv().await,
+            Some(CoreResponseEvent::TextDelta("你".to_owned()))
+        );
+        assert_eq!(
+            stream.recv().await,
+            Some(CoreResponseEvent::TextDelta("好".to_owned()))
+        );
+        let Some(CoreResponseEvent::Completed(response)) = stream.recv().await else {
+            panic!("expected completed response");
+        };
+
+        assert_eq!(response.text.as_deref(), Some("你好"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let sessions = session_store.list_for_scope("private:u1", None).unwrap();
+        assert_eq!(sessions[0].history.last().unwrap().content, "你好");
+    }
+
     async fn collect_stream_failure(
         output: Result<CoreRespondOutput, CoreError>,
     ) -> CoreRespondFailure {
@@ -733,6 +800,7 @@ mod tests {
     #[derive(Clone)]
     enum ProviderBehavior {
         Reply(String),
+        Stream(Vec<Result<LlmStreamEvent, LlmError>>),
         Error(LlmError),
         Delayed { reply: String, delay: Duration },
     }
@@ -751,6 +819,10 @@ mod tests {
 
         fn failing(error: LlmError) -> Self {
             Self::new(ProviderBehavior::Error(error))
+        }
+
+        fn streaming(events: Vec<Result<LlmStreamEvent, LlmError>>) -> Self {
+            Self::new(ProviderBehavior::Stream(events))
         }
 
         fn delayed(reply: &str, delay: Duration) -> Self {
@@ -780,10 +852,66 @@ mod tests {
             self.requests.lock().unwrap().push(req);
             match &self.behavior {
                 ProviderBehavior::Reply(reply) => Ok(chat_outcome(reply)),
+                ProviderBehavior::Stream(events) => {
+                    let reply = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            Ok(LlmStreamEvent::TextDelta(delta)) => Some(delta.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    Ok(chat_outcome(&reply))
+                }
                 ProviderBehavior::Error(error) => Err(error.clone()),
                 ProviderBehavior::Delayed { reply, delay } => {
                     tokio::time::sleep(*delay).await;
                     Ok(chat_outcome(reply))
+                }
+            }
+        }
+
+        async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(req);
+            match &self.behavior {
+                ProviderBehavior::Reply(reply) => Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(LlmStreamEvent::TextDelta(reply.clone())),
+                    Ok(LlmStreamEvent::Completed {
+                        usage: None,
+                        finish_reason: None,
+                        fallback_used: false,
+                    }),
+                ]))),
+                ProviderBehavior::Stream(events) => {
+                    Ok(Box::pin(futures::stream::iter(events.to_vec())))
+                }
+                ProviderBehavior::Error(error) => Err(error.clone()),
+                ProviderBehavior::Delayed { reply, delay } => {
+                    let reply = reply.clone();
+                    let delay = *delay;
+                    Ok(Box::pin(futures::stream::unfold(
+                        (0_u8, reply, delay),
+                        |(state, reply, delay)| async move {
+                            if state == 0 {
+                                tokio::time::sleep(delay).await;
+                                return Some((
+                                    Ok(LlmStreamEvent::TextDelta(reply)),
+                                    (1, String::new(), delay),
+                                ));
+                            }
+                            if state == 1 {
+                                return Some((
+                                    Ok(LlmStreamEvent::Completed {
+                                        usage: None,
+                                        finish_reason: None,
+                                        fallback_used: false,
+                                    }),
+                                    (2, String::new(), delay),
+                                ));
+                            }
+                            None
+                        },
+                    )))
                 }
             }
         }

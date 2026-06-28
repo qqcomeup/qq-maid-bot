@@ -9,7 +9,7 @@ use crate::{
     config::LlmConfig,
     error::LlmError,
     provider::{
-        ChatOutcome, DynLlmProvider, build_provider,
+        ChatOutcome, DynLlmProvider, LlmStream, build_provider,
         status::{UpstreamStatus, observe_provider},
         types::ChatRequest,
     },
@@ -39,6 +39,10 @@ impl LlmService {
 
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome, LlmError> {
         self.provider.chat(req).await
+    }
+
+    pub async fn stream_chat(&self, req: ChatRequest) -> Result<LlmStream, LlmError> {
+        self.provider.stream_chat(req).await
     }
 
     pub async fn web_search(&self, req: WebSearchRequest) -> Result<WebSearchOutcome, LlmError> {
