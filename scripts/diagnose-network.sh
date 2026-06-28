@@ -191,7 +191,6 @@ print_env_files() {
 
 gateway_app_id="$(lookup_env QQ_BOT_APP_ID "${GATEWAY_ENV_FILES[@]}" || lookup_env QQ_APPID "${GATEWAY_ENV_FILES[@]}" || true)"
 gateway_secret="$(lookup_env QQ_BOT_APP_SECRET "${GATEWAY_ENV_FILES[@]}" || lookup_env QQ_SECRET "${GATEWAY_ENV_FILES[@]}" || true)"
-respond_url="$(lookup_env_default QQ_MAID_RESPOND_URL "http://127.0.0.1:8787/v1/respond" "${GATEWAY_ENV_FILES[@]}")"
 
 llm_provider="$(lookup_env_default LLM_PROVIDER "openai" "${LLM_ENV_FILES[@]}")"
 llm_model="$(lookup_env_default LLM_MODEL "gpt-5.5" "${LLM_ENV_FILES[@]}")"
@@ -208,8 +207,7 @@ print_env_files "Env files:" "${GATEWAY_ENV_FILES[@]}" "${LLM_ENV_FILES[@]}"
 
 printf 'Gateway config:\n'
 printf '  QQ_BOT_APP_ID: %s\n' "$(mask_value "${gateway_app_id}")"
-printf '  QQ_BOT_APP_SECRET: %s\n' "$(set_status "${gateway_secret}")"
-printf '  QQ_MAID_RESPOND_URL: %s\n\n' "$(mask_url "${respond_url}")"
+printf '  QQ_BOT_APP_SECRET: %s\n\n' "$(set_status "${gateway_secret}")"
 
 printf 'LLM config:\n'
 printf '  LLM_PROVIDER: %s\n' "${llm_provider}"

@@ -4,20 +4,26 @@ use time::{UtcOffset, macros::format_description};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{config::AppConfig, gateway, logging::mask_url};
+use crate::{
+    config::AppConfig,
+    gateway::{self, push::GatewayPushSink},
+    respond::RespondClient,
+};
 
 /// 应用入口：加载本地配置、初始化 tracing，并启动 QQ gateway 主循环。
 pub async fn run() -> anyhow::Result<()> {
-    load_dotenv_files();
-    init_tracing()?;
-    run_with_config(AppConfig::from_env()?).await
+    anyhow::bail!("qq-maid-gateway-rs 不再支持独立 HTTP Core 模式，请通过统一 qq-maid-bot 入口启动")
 }
 
 /// 统一进程入口会在完成全局初始化后直接复用这里的 gateway 启动逻辑，
 /// 避免把 QQ 接入层初始化细节复制到新的聚合程序里。
-pub async fn run_with_config(config: AppConfig) -> anyhow::Result<()> {
+pub async fn run_with_config(
+    config: AppConfig,
+    respond: RespondClient,
+    push_sink: GatewayPushSink,
+) -> anyhow::Result<()> {
     log_startup(&config);
-    gateway::run(config).await
+    gateway::run(config, respond, push_sink).await
 }
 
 /// 依次尝试加载当前工作目录下的 `config/.env` 和 `.env` 文件。
@@ -44,16 +50,12 @@ pub fn init_tracing() -> anyhow::Result<()> {
 fn log_startup(config: &AppConfig) {
     info!(
         api_base = %config.api_base,
-        respond_url = %mask_url(&config.respond_url),
         sandbox = config.sandbox,
         enable_markdown = config.enable_markdown,
         enable_image = config.enable_image,
         enable_group_messages = config.enable_group_messages,
         verbose_log = config.verbose_log,
-        push_enabled = config.push_enabled,
-        push_addr = %format!("{}:{}", config.push_host, config.push_port),
-        push_token_configured = config.push_token.is_some(),
-        "starting qq-maid Rust C2C gateway"
+        "starting qq-maid Rust gateway"
     );
 }
 

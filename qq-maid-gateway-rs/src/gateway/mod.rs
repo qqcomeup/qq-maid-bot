@@ -8,7 +8,6 @@ mod outbound;
 pub mod ping;
 mod protocol;
 pub mod push;
-mod streaming;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -33,8 +32,7 @@ use self::{
         is_ping_command,
     },
     protocol::ResumeState,
-    push::{PushServerConfig, run_push_server},
-    streaming::{collect_streaming_final_response, handle_streaming_respond_response},
+    push::GatewayPushSink,
 };
 use crate::{
     api::{
@@ -46,9 +44,8 @@ use crate::{
     markdown::MarkdownPayload,
     render::{OutboundMessage, render_respond_response},
     respond::{
-        RespondClient, RespondResponse, RespondTransport, build_group_respond_content,
-        build_respond_content, respond_error_to_qq_text, respond_not_ok_to_qq_text,
-        respond_response_error_summary,
+        RespondClient, RespondResponse, build_group_respond_content, build_respond_content,
+        respond_error_to_qq_text,
     },
 };
 
@@ -75,7 +72,7 @@ impl BotOutboundCache {
 
 /// Signal Layer 只是 gateway 内部的临时语义增强层，不是业务核心。
 /// 这里只维护一个短时 `message_id -> content` 缓存，用于 reply.content 本地回填。
-/// gateway 不负责 prompt 构建；真正发往 `/v1/respond` 的字符串统一在 respond.rs 的 Egress 层生成。
+/// gateway 不负责 prompt 构建；真正交给 CoreService 的字符串统一在 respond.rs 的 Egress 层生成。
 fn resolve_signals(message: &mut C2cMessage, cache: &mut MessageCache) {
     if !message.message_id.trim().is_empty() {
         cache.insert(message.message_id.clone(), message.content.clone());
@@ -94,7 +91,11 @@ fn resolve_signals(message: &mut C2cMessage, cache: &mut MessageCache) {
 }
 /// QQ 网关主循环：初始化所有共享组件后，反复获取网关地址并建立 WebSocket 连接。
 /// 连接断开或失败后会等待 `RECONNECT_DELAY` 后重连，从而保证长期在线。
-pub async fn run(config: AppConfig) -> anyhow::Result<()> {
+pub async fn run(
+    config: AppConfig,
+    respond: RespondClient,
+    push_sink: GatewayPushSink,
+) -> anyhow::Result<()> {
     let http_client = reqwest::Client::new();
     let auth = AccessTokenManager::new(
         http_client.clone(),
@@ -102,29 +103,14 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         config.app_secret.clone(),
         config.token_refresh_margin,
     );
-    let respond = RespondClient::new(http_client.clone(), config.respond_url.clone());
     let api = QqApiClient::new(http_client.clone(), config.api_base.clone(), auth.clone());
     // 消息去重器，用于防止短时间内重复处理同一条 C2C 消息
     let dedupe = MessageDedupe::new(DEDUPE_TTL);
     // 运行时状态，记录网关连接、收发消息等统计信息，供 /ping 等命令使用
     let runtime = GatewayRuntimeStatus::new();
     let group_outbound_cache = Arc::new(Mutex::new(BotOutboundCache::default()));
-    if config.push_enabled {
-        let push_config = PushServerConfig {
-            host: config.push_host.clone(),
-            port: config.push_port,
-            token: config.push_token.clone(),
-        };
-        let push_api = api.clone();
-        let push_runtime = runtime.clone();
-        let push_cache = group_outbound_cache.clone();
-        tokio::spawn(async move {
-            if let Err(err) = run_push_server(push_config, push_api, push_runtime, push_cache).await
-            {
-                warn!(error = %err, "gateway internal push server stopped");
-            }
-        });
-    }
+    // 主动推送已经进程内化；Core 通过 PushSink 进入这里，仍由 Gateway 负责 QQ 发送。
+    push_sink.bind(api.clone(), runtime.clone(), group_outbound_cache.clone());
     // reply 只需要一个极简 HashMap 缓存，不引入额外抽象层或持久化。
     let mut reply_cache = HashMap::new();
     let mut group_cooldowns = GroupCooldowns::default();
@@ -232,10 +218,10 @@ async fn handle_group_message(
         group = %masked_group,
         "calling respond backend for group"
     );
-    let transport = match respond.respond_group(&message, respond_content).await {
-        Ok(transport) => {
+    let response = match respond.respond_group(&message, respond_content).await {
+        Ok(response) => {
             runtime.record_respond_success();
-            transport
+            response
         }
         Err(err) => {
             runtime.record_respond_failure(err.log_summary());
@@ -262,34 +248,15 @@ async fn handle_group_message(
         }
     };
 
-    match transport {
-        RespondTransport::Json(response) => {
-            send_group_respond_response(
-                api,
-                runtime,
-                config,
-                group_outbound_cache,
-                &message,
-                &response,
-            )
-            .await?;
-        }
-        RespondTransport::Stream(stream) => {
-            let response =
-                collect_streaming_final_response(&message.message_id, &masked_group, stream).await;
-            if let Some(response) = response {
-                send_group_respond_response(
-                    api,
-                    runtime,
-                    config,
-                    group_outbound_cache,
-                    &message,
-                    &response,
-                )
-                .await?;
-            }
-        }
-    }
+    send_group_respond_response(
+        api,
+        runtime,
+        config,
+        group_outbound_cache,
+        &message,
+        &response,
+    )
+    .await?;
     Ok(())
 }
 
@@ -301,26 +268,6 @@ async fn send_group_respond_response(
     message: &GroupMessage,
     response: &RespondResponse,
 ) -> anyhow::Result<()> {
-    if !response.ok {
-        let qq_text = respond_not_ok_to_qq_text(response);
-        warn!(
-            message_id = %message.message_id,
-            group = %mask_openid(&message.group_openid),
-            error_summary = %respond_response_error_summary(response),
-            qq_error_text = %qq_text,
-            "respond backend returned not-ok group response"
-        );
-        let sent_message_id = send_group_text_with_status(
-            api,
-            runtime,
-            &message.group_openid,
-            Some(&message.message_id),
-            &qq_text,
-        )
-        .await?;
-        group_outbound_cache.lock().unwrap().insert(sent_message_id);
-        return Ok(());
-    }
     let Some(outbound) =
         render_respond_response(response, config.enable_markdown, config.enable_image)
     else {
@@ -405,6 +352,7 @@ async fn handle_c2c_message(
             config,
             runtime,
             auth,
+            &respond.health_snapshot(),
             check_failure.as_deref(),
         )
         .await;
@@ -441,10 +389,10 @@ async fn handle_c2c_message(
         user = %masked_user,
         "calling respond backend"
     );
-    let transport = match respond.respond_c2c(&message, respond_content).await {
-        Ok(transport) => {
+    let response = match respond.respond_c2c(&message, respond_content).await {
+        Ok(response) => {
             runtime.record_respond_success();
-            transport
+            response
         }
         Err(err) => {
             runtime.record_respond_failure(err.log_summary());
@@ -485,76 +433,37 @@ async fn handle_c2c_message(
         user_openid: message.user_openid.clone(),
         msg_id: Some(message.message_id.clone()),
     };
-    match transport {
-        RespondTransport::Json(response) => {
-            if !response.ok {
-                let qq_text = respond_not_ok_to_qq_text(&response);
-                warn!(
-                    message_id = %message.message_id,
-                    user = %masked_user,
-                    error_summary = %respond_response_error_summary(&response),
-                    qq_error_text = %qq_text,
-                    "respond backend returned not-ok response"
-                );
-                send_c2c_text_with_status(
-                    api,
-                    runtime,
-                    &message.user_openid,
-                    Some(&message.message_id),
-                    &qq_text,
-                )
-                .await
-                .inspect_err(|send_err| {
-                    warn!(
-                        message_id = %message.message_id,
-                        user = %masked_user,
-                        error = %send_err.log_summary(),
-                        local_fallback = true,
-                        fallback_reason = "respond_not_ok",
-                        qq_error_text = %qq_text,
-                        "respond not-ok QQ fallback send failed"
-                    );
-                })?;
-                return Ok(());
-            }
+    let Some(outbound) =
+        render_respond_response(&response, config.enable_markdown, config.enable_image)
+    else {
+        debug!(
+            message_id = %message.message_id,
+            user = %masked_user,
+            "respond backend produced no reply text"
+        );
+        return Ok(());
+    };
 
-            let Some(outbound) =
-                render_respond_response(&response, config.enable_markdown, config.enable_image)
-            else {
-                debug!(
-                    message_id = %message.message_id,
-                    user = %masked_user,
-                    "respond backend produced no reply text"
-                );
-                return Ok(());
-            };
-
-            debug!(
+    debug!(
+        message_id = target.msg_id.as_deref().unwrap_or(""),
+        user = %mask_openid(&target.user_openid),
+        reply_len = outbound.fallback_text().chars().count(),
+        "preparing QQ reply"
+    );
+    let sender = RuntimeRecordingSender {
+        inner: api,
+        runtime,
+    };
+    send_outbound_with_fallback(&sender, &target, &outbound)
+        .await
+        .inspect_err(|err| {
+            warn!(
                 message_id = target.msg_id.as_deref().unwrap_or(""),
                 user = %mask_openid(&target.user_openid),
-                reply_len = outbound.fallback_text().chars().count(),
-                "preparing QQ reply"
+                error = %err.log_summary(),
+                "QQ reply send failed"
             );
-            let sender = RuntimeRecordingSender {
-                inner: api,
-                runtime,
-            };
-            send_outbound_with_fallback(&sender, &target, &outbound)
-                .await
-                .inspect_err(|err| {
-                    warn!(
-                        message_id = target.msg_id.as_deref().unwrap_or(""),
-                        user = %mask_openid(&target.user_openid),
-                        error = %err.log_summary(),
-                        "QQ reply send failed"
-                    );
-                })?;
-        }
-        RespondTransport::Stream(stream) => {
-            handle_streaming_respond_response(api, runtime, &message, &target, config, stream)
-                .await?;
-        }
-    }
+        })?;
     Ok(())
 }
 
@@ -624,50 +533,7 @@ fn log_group_message_received(message: &GroupMessage, verbose_log: bool) {
 mod tests {
     use super::event::{C2cMessage, MessageReply};
     use super::*;
-    // 以下项已提取到子模块，`use super::*` 不会带入父模块的私有 `use` 导入，需显式引用。
-    use super::streaming::build_streaming_buffered_response;
     use crate::config::GroupMessageMode;
-
-    #[test]
-    fn build_streaming_buffered_response_prefers_final_text() {
-        let response = RespondResponse {
-            ok: true,
-            text: Some("最终完整回复".to_owned()),
-            markdown: Some("# 最终完整回复".to_owned()),
-            handled: Some(true),
-            session_id: Some("sess-1".to_owned()),
-            command: Some("web_search".to_owned()),
-            diagnostics: None,
-            error: None,
-        };
-
-        let buffered =
-            build_streaming_buffered_response(&response, "中间增量").expect("buffered response");
-
-        assert_eq!(buffered.text.as_deref(), Some("最终完整回复"));
-        assert_eq!(buffered.markdown.as_deref(), Some("# 最终完整回复"));
-        assert_eq!(buffered.command.as_deref(), Some("web_search"));
-    }
-
-    #[test]
-    fn build_streaming_buffered_response_falls_back_to_buffered_delta_text() {
-        let response = RespondResponse {
-            ok: true,
-            text: None,
-            markdown: Some("# 结构化最终回复".to_owned()),
-            handled: Some(true),
-            session_id: Some("sess-1".to_owned()),
-            command: Some("web_search".to_owned()),
-            diagnostics: None,
-            error: None,
-        };
-
-        let buffered = build_streaming_buffered_response(&response, "我会按北京时间整理今天新闻")
-            .expect("buffered response");
-
-        assert_eq!(buffered.text.as_deref(), Some("我会按北京时间整理今天新闻"));
-        assert_eq!(buffered.markdown.as_deref(), Some("# 结构化最终回复"));
-    }
 
     #[test]
     fn local_ping_reply_respects_markdown_config() {

@@ -1,7 +1,7 @@
 //! 应用启动模块。负责初始化日志、加载配置、构建各个运行时组件，
 //! 并启动 Axum HTTP 服务。
 
-use std::{future::Future, net::SocketAddr};
+use std::{future::Future, net::SocketAddr, sync::Arc};
 
 use time::{UtcOffset, macros::format_description};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -17,7 +17,7 @@ use crate::{
         knowledge::KnowledgeIndex,
         memory::MemoryStore,
         prompt::PromptConfig,
-        push::GatewayPushClient,
+        push::PushSink,
         query::build_query_executor,
         rss::{RssFetchConfig, RssFetcher, RssScheduler, RssSchedulerConfig, RssStore},
         session::SessionStore,
@@ -32,7 +32,7 @@ use crate::{
 };
 
 /// 统一进程入口会先组装 Core 运行时，再决定何时开始监听和何时关停。
-/// 这样既能复用当前 `/v1/respond` 边界，也能避免双入口重复初始化 dotenv 和 tracing。
+/// 这样既能把聊天调用交给进程内 CoreService，也能避免双入口重复初始化 dotenv 和 tracing。
 pub struct LlmRuntime {
     addr: SocketAddr,
     state: AppState,
@@ -54,6 +54,13 @@ pub async fn run_with_config(config: AppConfig) -> anyhow::Result<()> {
 
 impl LlmRuntime {
     pub fn from_config(config: AppConfig) -> anyhow::Result<Self> {
+        Self::from_config_with_push_sink(config, None)
+    }
+
+    pub fn from_config_with_push_sink(
+        config: AppConfig,
+        push_sink: Option<Arc<dyn PushSink>>,
+    ) -> anyhow::Result<Self> {
         let addr: SocketAddr = format!("{}:{}", config.server_host, config.server_port).parse()?;
         let upstream_status = UpstreamStatus::default();
         let provider = observe_provider(
@@ -88,12 +95,10 @@ impl LlmRuntime {
             config.member_id_mapping_file.clone(),
         )
         .with_builtin_prompt_defaults(config.prompt_dir_uses_builtin_defaults);
-        let push_client = if config.rss_enabled || config.todo_daily_reminder_enabled {
-            Some(GatewayPushClient::new(
-                config.rss_push_url.clone(),
-                config.rss_push_token.clone(),
-                config.rss_http_timeout_seconds,
-            )?)
+        let push_sink = if config.rss_enabled || config.todo_daily_reminder_enabled {
+            Some(push_sink.ok_or_else(|| {
+                anyhow::anyhow!("RSS 或 Todo 每日提醒已启用，但未注入进程内 PushSink")
+            })?)
         } else {
             None
         };
@@ -101,9 +106,9 @@ impl LlmRuntime {
             Some(RssScheduler::new(
                 rss_store.clone(),
                 rss_fetcher.clone(),
-                push_client
+                push_sink
                     .clone()
-                    .expect("push client must exist when RSS scheduler is enabled"),
+                    .expect("push sink must exist when RSS scheduler is enabled"),
                 translation_service.clone(),
                 RssSchedulerConfig {
                     enabled: config.rss_enabled,
@@ -121,9 +126,9 @@ impl LlmRuntime {
         let todo_reminder_scheduler = if config.todo_daily_reminder_enabled {
             Some(TodoReminderScheduler::new(
                 todo_store.clone(),
-                push_client
+                push_sink
                     .clone()
-                    .expect("push client must exist when Todo reminder is enabled"),
+                    .expect("push sink must exist when Todo reminder is enabled"),
                 TodoReminderSchedulerConfig {
                     enabled: true,
                     reminder_time: config.todo_daily_reminder_time,
@@ -156,6 +161,10 @@ impl LlmRuntime {
         })
     }
 
+    pub fn core_handle(&self) -> crate::service::CoreHandle {
+        crate::service::CoreHandle::new(self.state.clone())
+    }
+
     /// 返回 Core HTTP 健康检查 URL。
     ///
     /// 当 bind 地址为通配地址（0.0.0.0 / ::）时，自动映射为本地回环地址，
@@ -171,6 +180,15 @@ impl LlmRuntime {
 
     pub async fn serve(self) -> anyhow::Result<()> {
         self.serve_with_shutdown(std::future::pending::<()>()).await
+    }
+
+    pub fn spawn_schedulers(&self) {
+        if let Some(scheduler) = self.rss_scheduler.clone() {
+            scheduler.spawn();
+        }
+        if let Some(scheduler) = self.todo_reminder_scheduler.clone() {
+            scheduler.spawn();
+        }
     }
 
     pub async fn serve_with_shutdown<F>(self, shutdown: F) -> anyhow::Result<()>

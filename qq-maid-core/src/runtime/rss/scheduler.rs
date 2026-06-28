@@ -3,16 +3,14 @@
 //! 调度器只启动一个循环，逐个处理启用中的订阅，避免同一订阅并发拉取。
 //! 网络请求不在 SQLite 锁内执行；发送成功后才写入 pushed_at。
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use sha2::{Digest, Sha256};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{debug, info, warn};
 
 use crate::{
-    runtime::push::{
-        GatewayPushClient, GatewayPushError, GatewayPushTarget, GatewayPushTargetType,
-    },
+    runtime::push::{PushError, PushIntent, PushSink, PushTarget, PushTargetType},
     runtime::translation::{
         TRANSLATION_SOURCE_MAX_LENGTH, TranslationPurpose, TranslationRequest, TranslationService,
         looks_like_chinese_text,
@@ -38,7 +36,7 @@ pub struct RssSchedulerConfig {
 pub struct RssScheduler {
     store: RssStore,
     fetcher: RssFetcher,
-    push_client: GatewayPushClient,
+    push_sink: Arc<dyn PushSink>,
     translation_service: TranslationService,
     config: RssSchedulerConfig,
 }
@@ -47,14 +45,14 @@ impl RssScheduler {
     pub fn new(
         store: RssStore,
         fetcher: RssFetcher,
-        push_client: GatewayPushClient,
+        push_sink: Arc<dyn PushSink>,
         translation_service: TranslationService,
         config: RssSchedulerConfig,
     ) -> Self {
         Self {
             store,
             fetcher,
-            push_client,
+            push_sink,
             translation_service,
             config,
         }
@@ -187,10 +185,10 @@ impl RssScheduler {
     }
 
     async fn push_item(&self, subscription: &RssSubscription, item: &RssPendingItem) {
-        let target = GatewayPushTarget {
+        let target = PushTarget {
             target_type: match subscription.target_type {
-                crate::storage::rss::RssTargetType::Private => GatewayPushTargetType::Private,
-                crate::storage::rss::RssTargetType::Group => GatewayPushTargetType::Group,
+                crate::storage::rss::RssTargetType::Private => PushTargetType::Private,
+                crate::storage::rss::RssTargetType::Group => PushTargetType::Group,
             },
             target_id: subscription.target_id.clone(),
         };
@@ -204,11 +202,16 @@ impl RssScheduler {
             ("text", fallback_text.as_str())
         };
         match self
-            .push_client
-            .send(&target, message_type, text, Some(&fallback_text))
+            .push_sink
+            .push(PushIntent {
+                target,
+                message_type: message_type.to_owned(),
+                text: text.to_owned(),
+                fallback_text: Some(fallback_text.clone()),
+            })
             .await
         {
-            Ok(()) => {
+            Ok(_) => {
                 if let Err(err) = self
                     .store
                     .mark_item_pushed(&subscription.id, &item.item_key)
@@ -438,10 +441,9 @@ fn safe_feed_error(err: &RssFeedError) -> String {
     err.to_string()
 }
 
-fn safe_push_error(err: &GatewayPushError) -> String {
+fn safe_push_error(err: &PushError) -> String {
     match err {
-        GatewayPushError::Status { status, .. } => format!("push endpoint returned {status}"),
-        _ => err.to_string(),
+        PushError::Failed { summary } => summary.clone(),
     }
 }
 
@@ -458,14 +460,9 @@ fn short_id(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        io::{Read, Write},
-        net::TcpListener,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-        thread,
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use async_trait::async_trait;
@@ -476,6 +473,7 @@ mod tests {
             ChatOutcome, LlmProvider,
             types::{ChatRequest, TokenUsage},
         },
+        runtime::push::{PushResult, PushSink},
         runtime::rss::RssFetchConfig,
         storage::{
             APP_MIGRATIONS,
@@ -490,6 +488,19 @@ mod tests {
         calls: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<ChatRequest>>>,
         replies: Arc<Mutex<Vec<Result<String, LlmError>>>>,
+    }
+
+    #[derive(Default)]
+    struct TestPushSink {
+        requests: Arc<Mutex<Vec<PushIntent>>>,
+    }
+
+    #[async_trait]
+    impl PushSink for TestPushSink {
+        async fn push(&self, intent: PushIntent) -> Result<PushResult, PushError> {
+            self.requests.lock().unwrap().push(intent);
+            Ok(PushResult { message_id: None })
+        }
     }
 
     impl MockTranslationProvider {
@@ -566,7 +577,7 @@ mod tests {
         RssScheduler::new(
             RssStore::new(database),
             RssFetcher::new(RssFetchConfig::default()).unwrap(),
-            GatewayPushClient::new("http://127.0.0.1:9/internal/push", None, 1).unwrap(),
+            Arc::new(TestPushSink::default()),
             TranslationService::new(
                 Arc::new(provider),
                 Some("openai:translation-model".to_owned()),
@@ -613,21 +624,6 @@ mod tests {
             consecutive_failures: 0,
             initialized: true,
         }
-    }
-
-    fn spawn_push_server() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut buffer = [0_u8; 4096];
-            let _ = stream.read(&mut buffer);
-            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-            let _ = stream.write_all(response.as_bytes());
-        });
-        format!("http://{addr}/internal/push")
     }
 
     #[tokio::test]
@@ -729,7 +725,7 @@ mod tests {
         let scheduler = RssScheduler::new(
             store.clone(),
             RssFetcher::new(RssFetchConfig::default()).unwrap(),
-            GatewayPushClient::new(spawn_push_server(), None, 5).unwrap(),
+            Arc::new(TestPushSink::default()),
             TranslationService::new(Arc::new(provider), None),
             RssSchedulerConfig {
                 enabled: true,

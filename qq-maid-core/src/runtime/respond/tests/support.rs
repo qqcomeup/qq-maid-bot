@@ -1389,7 +1389,6 @@ fn test_service_with_provider_base_title_query_weather_and_models(
             memory_model: models.memory_model,
             compact_model: models.compact_model,
             translation_model: models.translation_model,
-            send_mode: "final".to_owned(),
             rss_summary_max_chars: DEFAULT_RSS_SUMMARY_MAX_CHARS as usize,
             rss_seen_retention: 500,
         },

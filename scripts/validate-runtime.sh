@@ -16,7 +16,6 @@ RUNTIME_DIR="${QQ_MAID_RUNTIME_DIR:-${DEFAULT_RUNTIME_DIR}}"
 BOT_CTL="${RUNTIME_DIR}/botctl.sh"
 LLM_URL="${LLM_SERVER_URL:-http://127.0.0.1:${LLM_SERVER_PORT:-8787}}"
 HEALTH_URL="${LLM_URL%/}/healthz"
-RESPOND_URL="${LLM_URL%/}/v1/respond"
 CONSOLE_URL="${LLM_URL%/}/console/"
 SOURCE_BOT_BINARY="${SOURCE_BOT_BINARY:-${REPO_DIR}/target/debug/qq-maid-bot}"
 SOURCE_BOT_PID_FILE="${SOURCE_BOT_PID_FILE:-${RUNTIME_DIR}/run/qq-maid-bot-source.pid}"
@@ -28,8 +27,8 @@ usage() {
 Usage: validate-runtime.sh <command>
 
 Commands:
-  check             Check service status, LLM health, GLM upstream, console, and bot logs
-  glm              Run only the GLM/OpenAI-compatible upstream diagnostic
+  check             Check service status, LLM health, upstream status snapshot, console, and bot logs
+  glm              Show only the GLM/OpenAI-compatible upstream health snapshot
   console          Check only the web console route
   logs             Show recent bot logs
   restart          Restart deployed qq-maid-bot, then run check
@@ -37,7 +36,7 @@ Commands:
 
 Environment overrides:
   QQ_MAID_RUNTIME_DIR       Runtime directory, default: runtime/
-  LLM_SERVER_URL            LLM base URL, default: http://127.0.0.1:8787
+  LLM_SERVER_URL            进程级 ops HTTP base URL, default: http://127.0.0.1:8787
   LINES                     Log lines to show, default: 80
   SOURCE_BOT_BINARY         Debug/source bot binary for restart-source
 EOF
@@ -80,12 +79,9 @@ health_check() {
 }
 
 glm_check() {
-    print_heading "GLM/OpenAI-compatible upstream check"
-    curl_json "${RESPOND_URL}" \
-        -X POST \
-        -H 'Content-Type: application/json' \
-        -d '{"diagnostic":"upstream_check","scope_key":"diagnostic:validate-runtime","content":"ping","platform":"local","event_type":"diagnostic"}'
-    printf '\n'
+    print_heading "GLM/OpenAI-compatible upstream health snapshot"
+    # 统一服务不再公开内部 respond HTTP；主动模型探活由 QQ `/ping check`
+    # 通过进程内 CoreService 执行，这里只读取 healthz 中最近一次上游观测结果。
     curl_json "${HEALTH_URL}"
     printf '\n'
 }

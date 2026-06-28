@@ -22,10 +22,7 @@ use crate::{
 };
 
 mod types;
-pub use types::{
-    ChatResponse, RespondPurpose, RespondRequest, RespondResponse, RespondStream,
-    RespondStreamEvent, RespondTransport,
-};
+pub use types::{ChatResponse, RespondPurpose, RespondRequest, RespondResponse};
 
 mod chat_flow;
 mod command_render;
@@ -90,8 +87,6 @@ pub struct RespondServiceOptions {
     pub compact_model: Option<String>,
     /// 翻译专用模型（可选）；未配置时沿用主 provider 模型。
     pub translation_model: Option<String>,
-    /// HTTP 输出模式（final / streaming）
-    pub send_mode: String,
     /// RSS 摘要最大字符数
     pub rss_summary_max_chars: usize,
     /// RSS 去重记录保留数量
@@ -136,8 +131,6 @@ pub struct RustRespondService {
     memory_model: Option<String>,
     /// 会话上下文压缩专用模型名
     compact_model: Option<String>,
-    /// HTTP 输出模式（final / streaming）
-    send_mode: String,
     /// RSS 摘要最大字符数
     rss_summary_max_chars: usize,
     /// 每个订阅保留的去重指纹数量
@@ -176,7 +169,6 @@ impl RustRespondService {
             todo_model: options.todo_model,
             memory_model: options.memory_model,
             compact_model: options.compact_model,
-            send_mode: options.send_mode,
             rss_summary_max_chars: options.rss_summary_max_chars,
             rss_seen_retention: options.rss_seen_retention,
         }
@@ -195,21 +187,6 @@ impl RustRespondService {
     /// 8. 检查是否为**长期记忆操作**。
     /// 9. 兜底：进入**普通聊天**处理流程。
     pub async fn respond(&self, req: RespondRequest) -> Result<RespondResponse, LlmError> {
-        match self.respond_transport(req, false).await? {
-            RespondTransport::Json(response) => Ok(*response),
-            RespondTransport::Stream(_) => unreachable!("respond() must never return stream"),
-        }
-    }
-
-    /// 面向 HTTP 层的统一入口。
-    ///
-    /// `allow_streaming` 由路由层控制；即使配置开启 streaming，调用方不允许时
-    /// 也会继续返回原本的完整 JSON 响应，保证内部调用行为不变。
-    pub async fn respond_transport(
-        &self,
-        req: RespondRequest,
-        allow_streaming: bool,
-    ) -> Result<RespondTransport, LlmError> {
         let user_text = req.effective_user_text();
         let meta = SessionMeta::new(
             req.scope_key.clone(),
@@ -235,14 +212,12 @@ impl RustRespondService {
                 .handle_pending_operation(&user_text, &meta, session)
                 .await?
         {
-            return Ok(json_transport(response));
+            return Ok(response);
         }
 
         // 检查是否为会话管理指令（/new, /clear, /state 等）
         if let Some(command) = session_flow::parse_session_command(&user_text) {
-            return Ok(json_transport(
-                self.handle_session_command(command, &meta).await?,
-            ));
+            return self.handle_session_command(command, &meta).await;
         }
 
         // 确保存在活跃会话（无则创建）
@@ -256,39 +231,28 @@ impl RustRespondService {
 
         // 检查是否为翻译指令（如 "/翻译 文本"、"/翻译日语 文本"）
         if let Some(command) = translation_flow::parse_translation_command(&user_text) {
-            return Ok(json_transport(
-                self.handle_translation_command(command, &meta, &user_text, &mut session)
-                    .await?,
-            ));
+            return self
+                .handle_translation_command(command, &meta, &user_text, &mut session)
+                .await;
         }
 
         // 检查是否为天气查询指令（如 "/北京天气" 或 "/天气北京"）
         if let Some(command) = weather_flow::parse_weather_command(&user_text) {
-            return Ok(json_transport(
-                self.handle_weather_command(command, &user_text, &mut session)
-                    .await?,
-            ));
+            return self
+                .handle_weather_command(command, &user_text, &mut session)
+                .await;
         }
 
         // 检查是否为列车时刻查询指令（如 "/火车 G1 明天"）
         if let Some(command) = train_flow::parse_train_command(&user_text) {
-            return Ok(json_transport(
-                self.handle_train_command(command, &user_text, &mut session)
-                    .await?,
-            ));
+            return self
+                .handle_train_command(command, &user_text, &mut session)
+                .await;
         }
 
         // 检查是否为联网搜索指令（如 "/查 关键词"）
         if let Some(command) = search_flow::parse_web_search_command(&user_text) {
-            if allow_streaming && self.send_mode.eq_ignore_ascii_case("streaming") {
-                return self
-                    .handle_web_search_command_stream(command, &mut session)
-                    .await;
-            }
-            return Ok(json_transport(
-                self.handle_web_search_command(command, &mut session)
-                    .await?,
-            ));
+            return self.handle_web_search_command(command, &mut session).await;
         }
 
         // 检查是否为 RSS 订阅指令（如 "/rss add ..." 或 "/订阅"）
@@ -296,7 +260,7 @@ impl RustRespondService {
             .handle_rss_flow(&user_text, &meta, &mut session)
             .await?
         {
-            return Ok(json_transport(response));
+            return Ok(response);
         }
 
         // 检查是否为待办相关操作（新增、查看、完成、编辑、删除等）
@@ -304,7 +268,7 @@ impl RustRespondService {
             .handle_todo_flow(&user_text, &meta, &mut session)
             .await?
         {
-            return Ok(json_transport(response));
+            return Ok(response);
         }
 
         // 检查是否为长期记忆相关操作（记忆新增、查看、更新、删除等）
@@ -312,16 +276,10 @@ impl RustRespondService {
             .handle_memory_flow(&user_text, &meta, &mut session)
             .await?
         {
-            return Ok(json_transport(response));
+            return Ok(response);
         }
 
         // 兜底：进入普通 LLM 聊天流程
-        Ok(json_transport(
-            self.handle_chat(req, user_text, meta, session).await?,
-        ))
+        self.handle_chat(req, user_text, meta, session).await
     }
-}
-
-fn json_transport(response: RespondResponse) -> RespondTransport {
-    RespondTransport::Json(Box::new(response))
 }
