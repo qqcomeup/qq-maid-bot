@@ -1,0 +1,15 @@
+services:
+  qq-maid-bot:
+    image: ghcr.io/qqcomeup/qq-maid-bot:latest
+    container_name: qq-maid-bot
+    restart: unless-stopped
+    working_dir: /app/runtime
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./runtime/config:/app/runtime/config
+      - ./runtime/data:/app/runtime/data
+    environment:
+      LLM_SERVER_HOST: 0.0.0.0
+      LLM_SERVER_PORT: "8787"
+      APP_DB_FILE: data/storage/app.db

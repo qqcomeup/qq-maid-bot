@@ -177,20 +177,59 @@ cp config/.env.example config/.env
 
 Fork 测试仓库可通过 GitHub Actions 构建并推送 GHCR 测试镜像。镜像构建使用多阶段 Dockerfile，最终镜像只保留运行目录所需文件；构建阶段会复用 `scripts/validate-release-runtime.sh` 校验 runtime payload，避免把真实 `.env`、数据库、日志、pid 或备份文件写入镜像。
 
-推送到 fork 的 `master`、推送 `v*` tag 或手动触发 `Container Image` workflow 后，会发布镜像：
+推送到 fork 的 `master`、推送 `v*` tag 或手动触发 `Container Image` workflow 后，会构建并发布镜像：
 
 ```text
 ghcr.io/qqcomeup/qq-maid-bot
 ```
 
-首次运行前，先从镜像中的 `.env.example` 准备本机私有 `config/.env`。运行容器时建议把配置和数据挂载到容器外部，避免升级镜像时覆盖私有配置或 SQLite 数据：
+常用标签：
+
+```text
+ghcr.io/qqcomeup/qq-maid-bot:latest
+ghcr.io/qqcomeup/qq-maid-bot:master
+ghcr.io/qqcomeup/qq-maid-bot:sha-<commit>
+ghcr.io/qqcomeup/qq-maid-bot:vX.Y.Z
+```
+
+如需在本地测试构建镜像，从仓库根目录执行：
+
+```bash
+docker build -t qq-maid-bot:test .
+```
+
+首次运行前，先准备本机私有配置文件：
+
+```bash
+cp runtime/config/.env.example runtime/config/.env
+```
+
+编辑 `runtime/config/.env`，填写 QQ 官方机器人、模型 provider、天气和 RSS 等必要配置。运行容器时建议把配置和数据挂载到容器外部，避免升级镜像时覆盖私有配置或 SQLite 数据：
 
 ```bash
 docker run -d --name qq-maid-bot \
-  -v /opt/qqbot/private/config:/app/runtime/config \
-  -v /opt/qqbot/data:/app/runtime/data \
+  -p 8787:8787 \
+  -v "$PWD/runtime/config:/app/runtime/config" \
+  -v "$PWD/runtime/data:/app/runtime/data" \
   ghcr.io/qqcomeup/qq-maid-bot:latest
 ```
+
+仓库根目录提供 `compose.yaml` 测试部署样例，默认使用 `ghcr.io/qqcomeup/qq-maid-bot:latest`，并挂载 `./runtime/config` 和 `./runtime/data`：
+
+```bash
+docker compose up -d
+docker compose logs -f qq-maid-bot
+docker compose down
+```
+
+更新测试镜像后，重新拉取并启动：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+如果只想测试本地构建出的镜像，可以临时改 `compose.yaml` 中的 `image` 为 `qq-maid-bot:test`，或使用覆盖文件指定测试标签。
 
 ## 控制脚本和诊断
 
